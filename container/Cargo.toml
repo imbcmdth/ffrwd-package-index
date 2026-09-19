@@ -1,0 +1,12 @@
+[package]
+name = "ffrwd-index-container"
+version = "0.1.0"
+edition = "2021"
+description = "Reading the samples and the file index of MP4 and Matroska, natively, for ffrwd-index-core"
+license = "Apache-2.0"
+
+# No dependencies, for the reason `core` has none and one of its own:
+# this parses files nobody here wrote, and every byte it touches should
+# be answerable to a test in this workspace.
+[dependencies]
+ffrwd-index-core = { path = "../core" }
