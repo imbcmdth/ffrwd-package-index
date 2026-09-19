@@ -559,15 +559,20 @@ fn records_over_an_unwoven_file_answers_nothing() {
 // spaces.
 // ------------------------------------------------------------------ //
 
-/// One row per space, from the keyframes, whatever else is fed.
+/// One row per space, from the packet that declared it.
 ///
-/// Not from the FIRST packet: section 3 has a writer declare on the
-/// first carrier it writes to, which under the `keyframe` policy is
-/// the first keyframe a record rides and not the first packet of the
-/// file. The fixtures here are exactly that shape, so the first packet
-/// alone says nothing.
+/// `spaces` asks for `first`, and this is what a host honouring that
+/// exactly would hand it: section 3 has a writer declare on the first
+/// carrier it WRITES TO, which under the `keyframe` policy is the
+/// first keyframe a record rides and not the first packet of the file.
+/// These fixtures are that ordinary shape, so one packet declares
+/// nothing and the keyframes declare everything.
+///
+/// The assertion is a measurement, not a wish: if a writer starts
+/// declaring on the first carrier it sees, or the sink's `wants`
+/// becomes `keyframes`, this is the test that says so.
 #[test]
-fn spaces_answers_from_the_keyframes_and_not_the_first_packet() {
+fn spaces_answers_from_the_first_declaration() {
     let Some(_) = sidecar() else { return };
     for codec in Codec::every() {
         let name = codec.extension();
@@ -589,10 +594,10 @@ fn spaces_answers_from_the_keyframes_and_not_the_first_packet() {
         ]);
         assert!(
             sink_rows("spaces", &first).is_empty(),
-            "{name}: the first packet of this fixture declares nothing,              which is why the sink asks for the keyframes"
+            "{name}: the first packet of this fixture declares nothing, so a host honouring `first` to the letter answers nothing"
         );
 
-        // The keyframes, which is what it asks for.
+        // The keyframes, which is where section 3 promises they are.
         let keys = as_nut(&mp4, &format!("{name}-keys.nut"), true);
         let from_keys = sink_rows("spaces", &keys);
         assert_eq!(from_keys.len(), 1, "{name}: {from_keys:?}");
@@ -691,7 +696,7 @@ fn a_stream_neither_sink_can_read_is_refused_by_name() {
 #[test]
 fn the_sidecar_describes_both_sinks() {
     let Some(binary) = sidecar() else { return };
-    for (name, wants) in [("records", "keyframes"), ("spaces", "keyframes")] {
+    for (name, wants) in [("records", "keyframes"), ("spaces", "first")] {
         let output = Command::new(&binary)
             .args(["--describe", &text(&module(name))])
             .output()
@@ -740,4 +745,64 @@ fn the_harness_reads_a_row() {
     assert_eq!(read["planes"], "[0,1]");
     assert_eq!(read["vector"], "[0.5,-0.25]");
     assert_eq!(read["name"], "a, b");
+}
+
+/// The other way a keyframe copy is made, which is what the compiler
+/// reaches for where the demuxer has no `-discard nokey` of its own:
+/// the `noise=drop=not(key)` bitstream filter, over Matroska here.
+///
+/// Neither copy is exact. `-discard nokey` lets the occasional non-key
+/// packet through and a filter drops what it is told to, so a sink has
+/// to be right when it is handed more than it asked for. Both of these
+/// answer the same records as the whole file does.
+#[test]
+fn records_reads_a_keyframe_copy_made_with_the_bitstream_filter() {
+    let Some(_) = sidecar() else { return };
+    for codec in Codec::every() {
+        let name = codec.extension();
+        let mp4 = fixtures()[name].clone();
+        let wanted = sink_rows("records", &as_nut(&mp4, &format!("{name}-full.nut"), false));
+
+        let mkv = at(&format!("woven-{name}.mkv"));
+        ffmpeg(&["-i", &text(&mp4), "-c", "copy", &text(&mkv)]);
+        let keys = at(&format!("{name}-drop.nut"));
+        ffmpeg(&[
+            "-i",
+            &text(&mkv),
+            "-c",
+            "copy",
+            "-bsf:v",
+            "noise=drop=not(key)",
+            "-f",
+            "nut",
+            &text(&keys),
+        ]);
+        let found = sink_rows("records", &keys);
+        assert_eq!(
+            found.len(),
+            wanted.len(),
+            "{name}: the filtered copy gave {} of {} records",
+            found.len(),
+            wanted.len()
+        );
+        // Matroska will not write a negative timestamp, so this copy
+        // sits at a different place on the clock from the MP4's. Every
+        // record is the same record and every span the same length,
+        // one constant shift apart.
+        let shift: f64 = found[0]["start_t"].parse::<f64>().expect("a time")
+            - wanted[0]["start_t"].parse::<f64>().expect("a time");
+        for (row, want) in found.iter().zip(&wanted) {
+            assert_eq!(row["record_id"], want["record_id"], "{name}");
+            assert_eq!(row["planes"], want["planes"], "{name}");
+            assert_eq!(row["vector"], want["vector"], "{name}");
+            for field in ["start_t", "end_t"] {
+                let got: f64 = row[field].parse().expect("a time");
+                let expected: f64 = want[field].parse().expect("a time");
+                assert!(
+                    close(got - expected, shift, 0.002),
+                    "{name}: {field} is {got}, the whole file says {expected},                      and the first row was {shift} apart"
+                );
+            }
+        }
+    }
 }

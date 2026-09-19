@@ -10,19 +10,30 @@
 //! keyframe after it, so the keyframes of a stream answer this whole
 //! sink.
 //!
-//! It asks for `keyframes` and not `first`, which is a sharper
-//! distinction than it looks. "The first carrier the writer writes to"
-//! is not the first packet: a `keyframe` writer with nothing to say
-//! until its first record's span has ended declares its spaces on
-//! whichever keyframe that turns out to be, and in a file of
-//! two-second GOPs that is routinely the second or the third. A sink
-//! asking for `first` would be handed a packet that declares nothing
-//! and would answer an empty relation. The keyframes are exactly the
-//! packets section 3 promises the declarations are on.
+//! It asks for `first`, the least a sink can ask for, and reads
+//! whatever it is handed: a host may hand over more than was asked
+//! for and this one answers each space on the packet that first
+//! declared it, however many packets that takes.
 //!
-//! It is a request and not a promise either way: a host may hand over
-//! the whole stream, and this one reads whatever it gets, answering
-//! each space on the packet that first declared it.
+//! **A host that honours `first` exactly does not always get an
+//! answer, and that is measured rather than feared.** Section 3 puts
+//! the declarations on "the first carrier the writer writes to and on
+//! every keyframe after it", and under the `keyframe` policy the first
+//! carrier a writer writes to is the first keyframe a RECORD rides,
+//! not the first packet of the stream: a writer with nothing to say
+//! until its first record's span has ended declares nothing before
+//! then. Every fixture in `tool/tests/sinks.rs` is that ordinary
+//! shape, and `spaces_answers_from_the_first_declaration` pins it: one
+//! packet of a three-second file with a record every 0.7 seconds
+//! declares no space at all, and the keyframes do.
+//!
+//! Two ways to settle it, and both are somebody else's to choose: a
+//! writer that declares on the first carrier it SEES rather than the
+//! first it writes to (section 3 asks for a minimum and does not
+//! forbid declaring earlier), or this sink asking for `keyframes`,
+//! which is exactly the set section 3 promises. Until one of them
+//! lands, a host answering `first` with the keyframes - which it may,
+//! since more is always allowed - is what makes this sink right.
 //!
 //! The crate is a shim. The reading is `ffrwd_index_rows::read`, the
 //! bytes are `ffrwd_index_core`, and both are tested on the native
@@ -50,7 +61,7 @@ const ROWS_SCHEMA: &str = r#"{
   "type": "object",
   "required": ["space", "name", "dims", "encoding", "unit_length", "modality", "source", "model", "model_hash", "query", "query_hash", "producer"],
   "additionalProperties": false,
-  "description": "One row per distinct SPACE declaration in the stream, which is SPEC section 3 field for field. A writer repeats every space on every keyframe from the first one it writes to, which is why this sink asks for the keyframes and not for the first packet.",
+  "description": "One row per distinct SPACE declaration in the stream, which is SPEC section 3 field for field. A writer repeats every space on every keyframe from the first one it WRITES TO, which is not always the first packet of the stream.",
   "properties": {
     "space": {"type": "integer", "minimum": 0, "maximum": 255, "description": "The space id the stream's VECTOR messages name."},
     "name": {"type": "string", "description": "A label, not a field of the format: the producer where the writer gave one, else the model URI, else 'space <id>'."},
@@ -98,12 +109,11 @@ impl Guest for SpacesSink {
             audio_codecs: vec![],
             video: Arity::One,
             audio: Arity::Zero,
-            // Section 3 repeats every space on the first carrier a
-            // writer writes to and on every keyframe AFTER it, which is
-            // not the same as the first packet: a writer with nothing
-            // to say on frame one declares nothing there. The keyframes
-            // are what the declarations are promised to be on.
-            wants: Wants::Keyframes,
+            // The least a sink can ask for, and a request rather than
+            // a promise: a host may hand over more. See the note at
+            // the top of this file on what happens where one does not,
+            // which is a thing the writer or this line has to settle.
+            wants: Wants::First,
         }
     }
 

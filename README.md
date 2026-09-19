@@ -68,9 +68,16 @@ COPY (SELECT f.video[1] FROM input('film.indexed.mp4') f) TO ffrwd.index.records
 ```
 
 What they exist for is the other thing: reading a woven file at COMPILE time,
-so that `f.embeddings` is a relation a query can join and filter. Both declare
-that the keyframes are all they need to be handed, which is section 7's doing,
-and which is what makes that read cheap. Nothing in the dialect spells it yet.
+so that `f.embeddings` is a relation a query can join and filter. Nothing in
+the dialect spells it yet. Each says in its meta how much of a stream it has to
+be handed, which is what will make that read cheap: `records` asks for the
+keyframes, which is where section 7 puts every record of a file, and `spaces`
+asks for the first packet. That is a request and never a promise, and both read
+whatever they are given. One caveat, measured rather than assumed: section 3
+declares a space on the first carrier a writer WRITES TO, which under the
+`keyframe` policy is the first keyframe a record rides and not the first packet
+of the file, so a host that honours `first` to the letter can hand `spaces` a
+packet that declares nothing. `tool/tests/sinks.rs` pins it.
 
 The reading modules and the writing one are the same code: `rows/` holds both
 state machines over `core/`, and the wasm crates are shims.
