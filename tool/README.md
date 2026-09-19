@@ -12,7 +12,7 @@ ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                   [--placement keyframe|next|spread:BYTES]
                   [--escapes N] [--fps N] [--codec h264|h265|av1]
 
-ffrwd-index read  --video IN [--fps N] [--codec h264|h265|av1]
+ffrwd-index read  --video IN|- [--fps N] [--codec h264|h265|av1]
                   [--index OUT.ffix]
 
 ffrwd-index read  --mp4 IN.mp4 [--scan keyframes|all] [--index OUT.ffix]
@@ -21,6 +21,16 @@ ffrwd-index read  --mkv IN.mkv [--scan keyframes|all] [--index OUT.ffix]
 ffrwd-index read  --index IN.ffix | IN.mp4 | IN.mkv
 
 ffrwd-index index FILE [--scan all|keyframes] [--rewrite] [--out OUT]
+
+ffrwd-index search --mp4 IN.mp4 | --mkv IN.mkv | --video IN | --index IN
+                   | --rows ROWS.ndjson
+                   --query Q.json|- [--space ID|URI] [--top K]
+                   [--threshold T] [--coarse N] [--scan keyframes|all]
+                   [--fps N] [--codec h264|h265|av1]
+
+ffrwd-index watch --video - [--codec h264|h265|av1] [--fps N]
+                  --query NAME=FILE [--query NAME=FILE ...]
+                  --threshold T [--min-planes N]
 ```
 
 The format is [SPEC.md](../SPEC.md). Nothing here is specific to one
@@ -229,6 +239,114 @@ and signed: an MP4's edit list can put a carrier before the time the
 file starts at, and ffprobe prints a negative time for it too. It takes
 an index on its own, `file.ffix`, or the file carrying one, `file.mp4`
 or `file.mkv`, and works out which from the first bytes.
+
+### A stream on standard input
+
+`read --video -` takes the elementary stream from a pipe rather than a
+file. The bytes are cut into access units as they arrive and each one's
+units are taken off it and its bytes dropped, so a stream that never
+ends does not become a buffer that never stops growing. What `read`
+still waits for is the end: its output is the spaces first and then the
+records, and neither is known until the last carrier has gone by.
+`watch` is the command that says something while a stream runs.
+
+A pipe carries no file name, so `--codec` is what says which codec it
+is.
+
+## Searching
+
+`search` ranks the records of one space against a query vector and
+prints the spans, best first.
+
+```
+ffrwd-index search --mp4 film.mp4 --space xclip --query prompt.json --top 5
+{"rank":1,"score":0.247323,"start_t":41.167,"end_t":43.419,"space":1,"record_id":8,"planes":[0,1,2,3,4,5,6,7]}
+```
+
+**It does not embed text.** A space says which model turns a query into
+its own space, and `search` prints that model on stderr; getting a
+vector out of it is the caller's business.
+
+**The query** is a JSON file, or `-` for standard input. Any of these is
+read: an array of numbers, a base64 string of little-endian binary32,
+an object with a `vector` member, or a document of one such object a
+line, of which the first that holds a vector is the query. Those are
+the shapes a vector arrives in from a row, from a vector track and from
+a query written to a table destination.
+
+**The space** is `--space`, by id or by any part of the `model` URI,
+the `query` URI or the `producer` a SPACE message carries. A file with
+one space needs no flag. A name that matches two spaces is a refusal
+that lists them, because a search of the wrong space looks exactly like
+a search that found nothing.
+
+**Where the records come from**, in the order `search` prefers them:
+
+- `--mp4` and `--mkv` read the file's own index when it has one, which
+  is the read section 8 put it there for. `--scan keyframes` or
+  `--scan all` asks for the stream itself instead, which is the
+  authority the index is a copy of; `all` is what `next` and `spread`
+  need.
+- `--index` takes a bare `file.ffix` or the file carrying one.
+- `--video` is the elementary stream, with `--fps` for its clock.
+- `--rows` is the NDJSON a weave would take, scored as the binary32 it
+  holds with no encoding applied. That is the brute force
+  [MEASUREMENTS.md](../MEASUREMENTS.md) measures the encoding against,
+  and having it behind the same flags is how somebody asks what their
+  own file's encoding cost their own search.
+
+**The ranking is a cosine**, never a bare dot product: a record's scale
+is its own, so two reconstructions of few planes are not comparable by
+one. `--top K` keeps the best K, `--threshold T` keeps everything at or
+above T, and the two together keep the shorter of the two lists.
+Neither flag is the ten best.
+
+**`--coarse N`** scores the query against the sign planes alone, keeps
+the best N, and rescores those with every plane the records have. The
+scores printed are always the rescored ones, so a threshold means the
+same thing with the prefilter and without it. The query stays binary32
+against the sign bits rather than being quantized to match them, which
+is what MEASUREMENTS.md found beat Hamming distance at every candidate
+count in both of the spaces it measured. It is off by default.
+
+Each search says on stderr what it read, in bytes and seeks, how many
+records it scored, and what embeds a query into the space it searched.
+
+## Watching a stream
+
+`watch` reads an elementary stream from a pipe and prints a row the
+moment a record passes `--threshold`, before the frames after it have
+arrived.
+
+```
+ffmpeg ... -f h264 - | ffrwd-index watch --video - --codec h264 \
+  --query dog=dog.json --query siren=siren.json --threshold 0.25
+{"query":"dog","score":0.312,"start_t":12.4,"end_t":14.9,"carrier_t":14.9,"space":1,"record_id":37,"planes":[0,1]}
+```
+
+`--query NAME=FILE` may be given as often as there are things to watch
+for, and every match row names the query it matched. A query is scored
+against every space whose width it has, so one command watches a file's
+picture and sound spaces at once when its vectors are the same width in
+both, and is ignored by a space it does not fit.
+
+A record is scored as soon as it has plane 0, and again on each later
+plane, because the layered encoding makes the first message of a record
+a coarse reading of it and the rest refinements. The first score that
+passes is printed and the record is not reported again for that query.
+`--min-planes N` is for a watcher that would rather wait: it scores
+nothing until a record holds a run of N planes from plane 0.
+
+**Joining mid-stream** works because section 3 has every keyframe repeat
+every space declaration. Records that arrive before one are held and
+scored when it comes. What is held is bounded: a few thousand records,
+a few dozen reassemblies, and a wait after which a record whose space
+never arrived is dropped. The stream reader holds one access unit and
+gives up on one that grows past a limit rather than buffering it.
+
+Each row is flushed as it is written. At the end, stderr says how many
+carriers went by, how many matched, how many records are still held and
+how many messages were dropped.
 
 ## The file index
 

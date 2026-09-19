@@ -12,6 +12,13 @@
 //! the sample tables say where every sample is and when it is shown,
 //! and only the front of each sample is read, because that is where
 //! section 7 puts a unit.
+//!
+//! Two of the commands live in their own files, because each of them
+//! is a decision rather than a translation: [`search`] ranks, and
+//! [`watch`] keeps up with a stream that is still being written.
+
+mod search;
+mod watch;
 
 use std::collections::BTreeMap;
 
@@ -22,6 +29,7 @@ use ffrwd_index_container::{mkv, mp4, write, Kind, Source, Tally, VideoTrack};
 use ffrwd_index_core::assemble::{Assembler, Limits, Record};
 use ffrwd_index_core::avc::{self, Codec};
 use ffrwd_index_core::index::{FileIndex, MATROSKA_FILE_NAME, MATROSKA_MIME};
+use ffrwd_index_core::live::{Feed, StreamKind};
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody, VectorRecord};
 use ffrwd_index_core::obu;
 use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
@@ -37,7 +45,7 @@ ffrwd-index: embedding vectors in a video's own stream.
                       [--placement keyframe|next|spread:BYTES]
                       [--escapes N] [--fps N] [--codec h264|h265|av1]
 
-    ffrwd-index read  --video IN [--fps N] [--codec h264|h265|av1]
+    ffrwd-index read  --video IN|- [--fps N] [--codec h264|h265|av1]
                       [--index OUT.ffix]
 
     ffrwd-index read  --mp4 IN.mp4 [--scan keyframes|all] [--index OUT.ffix]
@@ -47,10 +55,20 @@ ffrwd-index: embedding vectors in a video's own stream.
 
     ffrwd-index index FILE [--scan all|keyframes] [--rewrite] [--out OUT]
 
+    ffrwd-index search --mp4 IN.mp4 | --mkv IN.mkv | --video IN | --index IN
+                       | --rows ROWS.ndjson
+                       --query Q.json|- [--space ID|URI] [--top K]
+                       [--threshold T] [--coarse N] [--scan keyframes|all]
+
+    ffrwd-index watch --video - [--codec h264|h265|av1] [--fps N]
+                      --query NAME=FILE [--query NAME=FILE ...]
+                      --threshold T [--min-planes N]
+
 --video is an H.264 or HEVC Annex B elementary stream or a raw AV1 OBU
 stream; the codec is taken from the file name unless --codec says
-otherwise. Such a stream carries no timestamps, so --fps (30 by
-default) is what gives each access unit a presentation time.
+otherwise, and - is standard input. Such a stream carries no
+timestamps, so --fps (30 by default) is what gives each access unit a
+presentation time.
 
 --mp4 and --mkv are read natively, with their own timestamps. --scan
 keyframes (the default for read) looks at sync samples alone, which is
@@ -62,6 +80,17 @@ index builds the file index of SPEC.md section 8 and puts it in the
 file: a uuid box appended to an MP4, or, for Matroska, an attachment
 written by ffmpeg into --out. It scans every sample by default so that
 no record is missed.
+
+search ranks one space's records against a query vector by cosine and
+prints the spans, best first. It reads a file's own index where there
+is one and --scan does not ask otherwise. It does not embed text: the
+vector comes from the model the space names, which search prints.
+--rows ranks the numbers in a weave's own rows instead, unencoded,
+which is what the same search would have found had nothing been
+quantized.
+
+watch reads a growing stream and prints a row the moment a record
+passes --threshold, before the frames after it have arrived.
 
 --escapes (2 by default, 16 at most) is how many of a vector's largest
 components an i8 space sends exactly rather than quantized.
@@ -81,6 +110,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("weave") => weave(&args[1..]),
         Some("read") => read(&args[1..]),
         Some("index") => index(&args[1..]),
+        Some("search") => search::search(&args[1..]),
+        Some("watch") => watch::watch(&args[1..]),
         None | Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())
@@ -96,12 +127,25 @@ fn run(args: &[String]) -> Result<(), String> {
 /// The flags of one command. Every flag this tool has takes a value.
 struct Flags {
     values: BTreeMap<String, String>,
+    /// Every value a repeatable flag was given, in order. A flag that
+    /// may not repeat has at most one here and is refused a second.
+    repeats: BTreeMap<String, Vec<String>>,
 }
 
 impl Flags {
-    /// Reads `--name value` pairs.
+    /// Reads `--name value` pairs, none of them twice.
     fn parse(args: &[String]) -> Result<Flags, String> {
+        Flags::parse_repeating(args, &[])
+    }
+
+    /// The same, with the flags in `repeatable` allowed more than once.
+    ///
+    /// `watch` takes several queries at a time, and a flag given twice
+    /// is a mistake everywhere else, so the exception is named by the
+    /// command that has it rather than made the rule.
+    fn parse_repeating(args: &[String], repeatable: &[&str]) -> Result<Flags, String> {
         let mut values = BTreeMap::new();
+        let mut repeats: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut at = 0usize;
         while at < args.len() {
             let name = args[at]
@@ -114,15 +158,25 @@ impl Flags {
                 .ok_or_else(|| format!("--{name} wants a value"))?
                 .clone();
             at += 1;
-            if values.insert(name.clone(), value).is_some() {
+            let seen = values.insert(name.clone(), value.clone()).is_some();
+            if seen && !repeatable.contains(&name.as_str()) {
                 return Err(format!("--{name} was given twice"));
             }
+            repeats.entry(name).or_default().push(value);
         }
-        Ok(Flags { values })
+        Ok(Flags { values, repeats })
     }
 
     fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
+    }
+
+    /// Every value a flag was given, in the order they were given.
+    fn every(&self, name: &str) -> Vec<&str> {
+        self.repeats
+            .get(name)
+            .map(|values| values.iter().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
     fn need(&self, name: &str) -> Result<&str, String> {
@@ -480,18 +534,67 @@ struct Carried {
 }
 
 fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), String> {
+    let carried = stream_carriers(flags, video)?;
+    report(&carried, video, index)
+}
+
+/// The carriers of an elementary stream, from a file or from standard
+/// input.
+///
+/// A pipe is cut into carriers as its bytes arrive, which is what
+/// `watch` is built on, but `read` still prints nothing until the
+/// stream ends: its output is the spaces first and then the records,
+/// and neither is known until the last carrier has gone by. `watch` is
+/// the command that says something while a stream runs.
+fn stream_carriers(flags: &Flags, video: &str) -> Result<Vec<Carried>, String> {
     let kind = codec_of(video, flags.get("codec"))?;
     let fps = fps_of(flags)?;
+    if video == "-" {
+        return piped_carriers(kind, fps);
+    }
     let stream = std::fs::read(video).map_err(|err| format!("{video}: {err}"))?;
-    let carried: Vec<Carried> = spots(&stream, kind)?
+    Ok(spots(&stream, kind)?
         .iter()
         .enumerate()
         .map(|(index, spot)| Carried {
             time_ms: pts_ms(index, fps),
             units: units_in(&stream[spot.start..spot.end], kind),
         })
-        .collect();
-    report(&carried, video, index)
+        .collect())
+}
+
+/// The carriers of a stream on standard input, one chunk at a time, so
+/// the bytes of a picture are dropped as soon as the units in front of
+/// it have been taken off.
+fn piped_carriers(kind: Stream, fps: f64) -> Result<Vec<Carried>, String> {
+    use std::io::Read;
+    let mut feed = Feed::new(match kind {
+        Stream::Nal(codec) => StreamKind::Nal(codec),
+        Stream::Av1 => StreamKind::Av1,
+    });
+    let mut stdin = std::io::stdin();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut out = Vec::new();
+    loop {
+        let got = stdin
+            .read(&mut buffer)
+            .map_err(|err| format!("standard input: {err}"))?;
+        let carried = if got == 0 {
+            feed.finish().map_err(|err| err.to_string())?
+        } else {
+            feed.push(&buffer[..got]).map_err(|err| err.to_string())?
+        };
+        for carrier in carried {
+            out.push(Carried {
+                time_ms: pts_ms(carrier.index as usize, fps),
+                units: carrier.units,
+            });
+        }
+        if got == 0 {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn read_container(

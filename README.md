@@ -29,8 +29,10 @@ Working today, without ffrwd: the `ffrwd-index` tool weaves rows of vectors
 into H.264, HEVC and AV1 elementary streams, reads them back from a stream or
 straight out of an MP4 or Matroska file, and writes and reads the file index.
 On a 15 MB test file a search reads 0.06% of the bytes to get every vector from
-the keyframes, and 0.03% when the file has an index. See
-[tool/README.md](tool/README.md).
+the keyframes, and 0.03% when the file has an index. It also ranks: `search`
+scores a query vector against one space of a file by cosine and prints the
+spans, and `watch` reads a growing stream from a pipe and prints a match before
+the frames after it arrive. See [tool/README.md](tool/README.md).
 
 Working against an unreleased ffrwd: `weave`, the wasm module, runs under a
 sidecar built from ffrwd's `packet-filter` branch, which adds the packets-in,

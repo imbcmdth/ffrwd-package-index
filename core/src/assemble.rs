@@ -203,6 +203,32 @@ impl Assembler {
             .collect()
     }
 
+    /// The records of one space, in the order their first message
+    /// arrived, which is what a reader that has just seen that space
+    /// declared wants: the vectors that were waiting for it.
+    pub fn records_of(&self, space_id: u8) -> Vec<Record> {
+        self.order
+            .iter()
+            .filter(|(space, _)| *space == space_id)
+            .filter_map(|key| self.held.get(key))
+            .filter_map(|held| self.resolve(held).ok())
+            .collect()
+    }
+
+    /// One record, as far as the messages so far describe it.
+    ///
+    /// A live reader pushes a message and wants that record and no
+    /// other: rebuilding every record it holds, on every frame, to find
+    /// the one that just changed is the difference between a watcher
+    /// that keeps up with a stream and one that does not. The id is
+    /// expanded against the last seen for its space, exactly as
+    /// [`Assembler::push`] expanded it on the way in.
+    pub fn record(&self, space_id: u8, record_id: u16) -> Option<Record> {
+        let sequence = expand_record_id(self.sequence.get(&space_id).copied(), record_id);
+        let held = self.held.get(&(space_id, sequence))?;
+        self.resolve(held).ok()
+    }
+
     /// How many records are being held, resolvable or not.
     pub fn len(&self) -> usize {
         self.held.len()

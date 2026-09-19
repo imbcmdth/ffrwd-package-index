@@ -15,6 +15,8 @@
 //! - [`assemble`]: what a reader feeds messages to.
 //! - [`avc`]: H.264 and HEVC carriage, section 7.
 //! - [`obu`]: AV1 carriage, section 7.
+//! - [`live`]: the same carriage read a chunk at a time, for a stream
+//!   that is still being written.
 //! - [`placement`]: where a writer puts what, section 7.
 //! - [`index`]: the file index, section 8.
 //!
@@ -28,6 +30,7 @@ pub mod assemble;
 pub mod avc;
 pub mod fragment;
 pub mod index;
+pub mod live;
 pub mod message;
 pub mod obu;
 pub mod placement;
