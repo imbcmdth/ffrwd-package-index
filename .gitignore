@@ -9,3 +9,4 @@ wit/
 # committed fixtures live in core/tests/data, so the re-inclusion has
 # to say so.
 !**/tests/data/**
+measure/

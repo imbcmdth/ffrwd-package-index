@@ -177,7 +177,8 @@ needs none. An index at or above `dims` costs the message (section 9).
 
 A vector whose components are all zero has scale zero and magnitudes zero. A
 vector whose largest component is past binary16's range takes binary16's
-largest finite value as its scale, and the clamp does the rest.
+largest finite value as its scale, and the clamp does the rest. A record whose
+every component is an escape has scale zero: nothing is left to set one.
 
 Reading: with planes 0 to K present, a component's magnitude is the bits known
 so far, with the unknown low bits replaced by a one followed by zeros (`1 << (6
