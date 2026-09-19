@@ -1,0 +1,8 @@
+target/
+wit/
+*.mp4
+*.mkv
+*.h264
+*.h265
+*.ivf
+!tests/data/**
