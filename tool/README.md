@@ -1,7 +1,10 @@
 # ffrwd-index
 
-A command line over `ffrwd-index-core`: it puts vectors into a video's
-own elementary stream and takes them back out.
+A command line over `ffrwd-index-core` and `ffrwd-index-rows`: it puts
+vectors into a video's own elementary stream and takes them back out.
+The rows below are read by the same code the `weave` module reads its
+spaces and vectors with, so a space declared to one means the same thing
+to the other.
 
 ```
 ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
@@ -89,12 +92,14 @@ Everything but `id` and `dims` may be left out.
 | --- | --- |
 | `space_id` | the space this vector is in |
 | `start_ms`, `end_ms` | the span it describes, in milliseconds from the start of the stream |
-| `vector` | `dims` numbers |
+| `vector` | `dims` numbers, as a JSON array or as base64 of little-endian binary32 |
 | `record_id` | optional; counts up per space from 0, wrapping at 65536 |
 | `available_ms` | optional; when the writer had the record, for the `next` and `spread` policies. Defaults to `end_ms` |
 
 The vector is quantized on the way in for an `i8` space, and narrowed
-for an `f16` one. An `f32` space carries the numbers as they are.
+for an `f16` one. An `f32` space carries the numbers as they are. A
+component that is not a finite number costs its row, whatever the
+encoding: there is nothing to write for it and nothing to read back.
 
 ### Escapes
 

@@ -47,6 +47,10 @@ impl Json {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Number(value) => Some(*value),
+            // A number this crate already formatted is still a number:
+            // a row built in memory and read back without going through
+            // text reads the same as one that did.
+            Json::Written(text) => text.parse().ok(),
             _ => None,
         }
     }
@@ -412,6 +416,8 @@ mod tests {
         assert_eq!(float(f32::NAN).write(), "null");
         let back = Json::parse(&float(0.1).write()).expect("a number");
         assert_eq!(back.as_f64().expect("a number") as f32, 0.1f32);
+        // And without going through text at all.
+        assert_eq!(float(0.1).as_f64().expect("a number") as f32, 0.1f32);
     }
 
     #[test]

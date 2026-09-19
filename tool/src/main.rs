@@ -8,21 +8,18 @@
 //! are the next pass; ffmpeg converts either way with `-c copy` and the
 //! bitstream filters, which `README.md` spells out.
 
-mod json;
-
 use std::collections::BTreeMap;
 use std::path::Path;
-
-use json::{float, number, object, string, Json};
 
 use ffrwd_index_core::assemble::{Assembler, Limits, Record};
 use ffrwd_index_core::avc::{self, Codec};
 use ffrwd_index_core::index::FileIndex;
-use ffrwd_index_core::message::{
-    Encoding, Message, Modality, Space, Unit, VectorBody, VectorRecord,
-};
+use ffrwd_index_core::message::{Message, Space, Unit, VectorBody, VectorRecord};
 use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
-use ffrwd_index_core::quant::{f16_to_f32, f32_to_f16, Planes};
+use ffrwd_index_core::quant::{f16_to_f32, Planes};
+use ffrwd_index_rows::json::{float, number, object, Json};
+use ffrwd_index_rows::space::{read_space, space_row};
+use ffrwd_index_rows::vector::{bodies, plane_numbers, read_values};
 
 const USAGE: &str = "\
 ffrwd-index: embedding vectors in a video's own elementary stream.
@@ -296,100 +293,6 @@ fn read_rows(text: &str, escapes: usize) -> Result<(Vec<Space>, Vec<Pending>), S
     Ok((spaces.into_values().collect(), records))
 }
 
-/// A space descriptor row.
-fn read_space(row: &Json) -> Result<Space, String> {
-    let id = row
-        .get("id")
-        .or_else(|| row.get("space_id"))
-        .and_then(Json::as_i64)
-        .ok_or("a space with no id")?;
-    let space_id = u8::try_from(id).map_err(|_| "a space id outside 0 to 255")?;
-    let dims = row
-        .get("dims")
-        .and_then(Json::as_i64)
-        .ok_or("a space with no dims")?;
-    let dims = u32::try_from(dims).map_err(|_| "dims that are not a count")?;
-    let encoding = match row.get("encoding").and_then(Json::as_str).unwrap_or("i8") {
-        "f32" => Encoding::F32,
-        "f16" => Encoding::F16,
-        "i8" => Encoding::I8,
-        other => return Err(format!("{other} is not f32, f16 or i8")),
-    };
-    let mut space = Space::new(space_id, dims, encoding);
-    if row.get("unit_length").and_then(Json::as_bool) == Some(true) {
-        space.flags |= ffrwd_index_core::message::FLAG_UNIT_LENGTH;
-    }
-    space.modality = match row.get("modality") {
-        None | Some(Json::Null) => Modality::Unspecified,
-        Some(Json::Number(_)) => Modality::from_u8(
-            u8::try_from(row.get("modality").and_then(Json::as_i64).unwrap_or(0))
-                .map_err(|_| "a modality outside 0 to 255")?,
-        ),
-        Some(value) => modality_of(value.as_str().ok_or("a modality that is not a name")?)?,
-    };
-    if let Some(source) = row.get("source").and_then(Json::as_i64) {
-        space.source = u8::try_from(source).map_err(|_| "a source outside 0 to 255")?;
-    }
-    space.model = row
-        .get("model")
-        .and_then(Json::as_str)
-        .unwrap_or_default()
-        .to_string();
-    space.query = row
-        .get("query")
-        .and_then(Json::as_str)
-        .unwrap_or_default()
-        .to_string();
-    space.producer = row
-        .get("producer")
-        .and_then(Json::as_str)
-        .unwrap_or_default()
-        .to_string();
-    space.model_hash = hash_of(row.get("model_hash"))?;
-    space.query_hash = hash_of(row.get("query_hash"))?;
-    if space.dims == 0 || space.dims > ffrwd_index_core::MAX_DIMS {
-        return Err(format!("{} dimensions is outside the format", space.dims));
-    }
-    Ok(space)
-}
-
-/// The first sixteen bytes of a SHA-256, as hex, or all zero.
-fn hash_of(value: Option<&Json>) -> Result<[u8; 16], String> {
-    let Some(text) = value.and_then(Json::as_str) else {
-        return Ok([0; 16]);
-    };
-    if text.is_empty() {
-        return Ok([0; 16]);
-    }
-    let digits: Vec<u8> = text
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    if digits.len() < 32 {
-        return Err("a hash shorter than sixteen bytes of hex".into());
-    }
-    let mut out = [0u8; 16];
-    for (index, byte) in out.iter_mut().enumerate() {
-        let pair = std::str::from_utf8(&digits[index * 2..index * 2 + 2])
-            .map_err(|_| "a hash that is not hex")?;
-        *byte = u8::from_str_radix(pair, 16).map_err(|_| "a hash that is not hex")?;
-    }
-    Ok(out)
-}
-
-fn modality_of(name: &str) -> Result<Modality, String> {
-    match name {
-        "unspecified" => Ok(Modality::Unspecified),
-        "picture" => Ok(Modality::Picture),
-        "sound" => Ok(Modality::Sound),
-        "speech" => Ok(Modality::Speech),
-        "sound-text" => Ok(Modality::SoundText),
-        "scene-text" => Ok(Modality::SceneText),
-        "description" => Ok(Modality::Description),
-        other => Err(format!("{other} is not a modality this format names")),
-    }
-}
-
 /// A vector row, in its space's encoding.
 fn read_vector(
     row: &Json,
@@ -397,25 +300,7 @@ fn read_vector(
     escapes: usize,
     next_id: &mut u32,
 ) -> Result<Pending, String> {
-    let values: Vec<f32> = row
-        .get("vector")
-        .and_then(Json::as_array)
-        .ok_or("a row with no vector")?
-        .iter()
-        .map(|value| {
-            value
-                .as_f64()
-                .map(|number| number as f32)
-                .ok_or("a vector component that is not a number")
-        })
-        .collect::<Result<_, _>>()?;
-    if values.len() as u32 != space.dims {
-        return Err(format!(
-            "a vector of {} components in a space of {}",
-            values.len(),
-            space.dims
-        ));
-    }
+    let values = read_values(row.get("vector"), space.dims)?;
     let start_ms = row
         .get("start_ms")
         .and_then(Json::as_i64)
@@ -440,29 +325,17 @@ fn read_vector(
         .and_then(Json::as_i64)
         .unwrap_or(end_ms);
 
-    let mut pending = match space.encoding {
-        Encoding::I8 => {
-            let planes = Planes::quantize(&values, escapes).map_err(|err| err.to_string())?;
-            Pending::layered(space.space_id, record_id, start_ms, end_ms, &planes)
-        }
-        Encoding::F32 => {
-            let body = values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            Pending::whole(space.space_id, record_id, start_ms, end_ms, body)
-        }
-        Encoding::F16 => {
-            let body = values
-                .iter()
-                .flat_map(|value| f32_to_f16(*value).to_le_bytes())
-                .collect();
-            Pending::whole(space.space_id, record_id, start_ms, end_ms, body)
-        }
-        Encoding::Other(other) => return Err(format!("encoding {other} cannot be written")),
-    };
-    pending.available_ms = available_ms;
-    Ok(pending)
+    // The tool writes one message per plane whatever the policy: it has
+    // the whole file in hand, so a `spread` budget can still dole the
+    // planes out, and the other policies put them on one carrier anyway.
+    Ok(Pending {
+        space_id: space.space_id,
+        record_id,
+        start_ms,
+        end_ms,
+        available_ms,
+        bodies: bodies(space, &values, escapes, None, true)?,
+    })
 }
 
 // ---------------------------------------------------------------- //
@@ -639,22 +512,6 @@ fn offset(value: i64) -> Result<i32, String> {
     i32::try_from(value).map_err(|_| "a span too far from its carrier to write".to_string())
 }
 
-fn space_row(space: &Space) -> Json {
-    object(vec![
-        ("id", number(space.space_id)),
-        ("dims", number(space.dims)),
-        ("encoding", string(space.encoding.name())),
-        ("unit_length", Json::Bool(space.unit_length())),
-        ("modality", string(space.modality.name())),
-        ("source", number(space.source)),
-        ("model", string(space.model.clone())),
-        ("model_hash", string(hex(&space.model_hash))),
-        ("query", string(space.query.clone())),
-        ("query_hash", string(hex(&space.query_hash))),
-        ("producer", string(space.producer.clone())),
-    ])
-}
-
 fn record_row(record: &Record) -> Result<Json, String> {
     let values = record.values().map_err(|err| err.to_string())?;
     let mut members = vec![
@@ -690,73 +547,16 @@ fn escapes_row(planes: &Planes) -> Json {
 
 /// Which planes arrived, as their numbers.
 fn planes_row(present: u8) -> Json {
-    Json::Array(
-        (0..8)
-            .filter(|plane| present >> plane & 1 == 1)
-            .map(number)
-            .collect(),
-    )
+    Json::Array(plane_numbers(present).into_iter().map(number).collect())
 }
 
 fn vector_row(values: &[f32]) -> Json {
     Json::Array(values.iter().copied().map(float).collect())
 }
 
-fn hex(bytes: &[u8; 16]) -> String {
-    if bytes.iter().all(|byte| *byte == 0) {
-        return String::new();
-    }
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_space_row_reads_every_field() {
-        let row = Json::parse(
-            r#"{"space":{"id":3,"dims":4,"encoding":"f32","unit_length":true,
-                "modality":"speech","source":2,"model":"hf:a/b@c/d.safetensors",
-                "model_hash":"000102030405060708090a0b0c0d0e0f","query":"hf:q",
-                "query_hash":"","producer":"a test"}}"#,
-        )
-        .expect("a row");
-        let space = read_space(row.get("space").expect("a space")).expect("a descriptor");
-        assert_eq!(space.space_id, 3);
-        assert_eq!(space.dims, 4);
-        assert_eq!(space.encoding, Encoding::F32);
-        assert!(space.unit_length());
-        assert_eq!(space.modality, Modality::Speech);
-        assert_eq!(space.source, 2);
-        assert_eq!(space.model, "hf:a/b@c/d.safetensors");
-        assert_eq!(space.model_hash[..4], [0, 1, 2, 3]);
-        assert_eq!(space.query_model(), "hf:q");
-        assert_eq!(space.query_hash, [0; 16]);
-        assert_eq!(space.producer, "a test");
-        // And back out again as the same row.
-        let written = space_row(&space);
-        assert_eq!(
-            read_space(&written).expect("a descriptor again"),
-            space,
-            "{}",
-            written.write()
-        );
-    }
-
-    #[test]
-    fn a_modality_may_be_a_name_or_a_number() {
-        let by_name = Json::parse(r#"{"id":1,"dims":2,"modality":"scene-text"}"#).expect("a row");
-        assert_eq!(
-            read_space(&by_name).expect("a space").modality,
-            Modality::SceneText
-        );
-        let by_number = Json::parse(r#"{"id":1,"dims":2,"modality":9}"#).expect("a row");
-        assert_eq!(
-            read_space(&by_number).expect("a space").modality,
-            Modality::Other(9)
-        );
-    }
 
     #[test]
     fn rows_become_spaces_and_records() {
@@ -816,19 +616,6 @@ mod tests {
             let err = read_rows(text, 0).expect_err("a refusal");
             assert!(err.contains(wanted), "{text} gave {err}");
         }
-    }
-
-    #[test]
-    fn a_hash_reads_from_hex_and_writes_back() {
-        assert_eq!(hash_of(None).expect("zeroes"), [0; 16]);
-        assert_eq!(hash_of(Some(&string(""))).expect("zeroes"), [0; 16]);
-        let text = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
-        let bytes = hash_of(Some(&string(text))).expect("a hash");
-        assert_eq!(bytes[0], 0x0f);
-        assert_eq!(hex(&bytes), text);
-        assert_eq!(hex(&[0; 16]), "");
-        assert!(hash_of(Some(&string("00"))).is_err());
-        assert!(hash_of(Some(&string("zz1e2d3c4b5a69788796a5b4c3d2e1f0"))).is_err());
     }
 
     #[test]

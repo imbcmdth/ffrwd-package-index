@@ -1,10 +1,11 @@
 [workspace]
-# `core` is the codec: plain Rust, no I/O, no dependencies, and the
-# only crate the future packet filter compiles in. `tool` is the
-# native command line over it, which reads and writes files and so is
-# never part of a wasm build.
+# `core` is the codec: plain Rust, no I/O, no dependencies. `rows` is
+# the JSON both callers of it speak, which is theirs and not the
+# format's. `tool` is the native command line over the two, which reads
+# and writes files and so is never part of a wasm build.
 members = [
     "core",
+    "rows",
     "tool",
 ]
 resolver = "2"

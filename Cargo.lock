@@ -7,8 +7,16 @@ name = "ffrwd-index"
 version = "0.1.0"
 dependencies = [
  "ffrwd-index-core",
+ "ffrwd-index-rows",
 ]
 
 [[package]]
 name = "ffrwd-index-core"
 version = "0.1.0"
+
+[[package]]
+name = "ffrwd-index-rows"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-index-core",
+]

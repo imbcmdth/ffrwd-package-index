@@ -1,0 +1,9 @@
+[package]
+name = "ffrwd-index-rows"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The JSON rows the tool and the weave module read and write, over ffrwd-index-core."
+
+[dependencies]
+ffrwd-index-core = { path = "../core" }

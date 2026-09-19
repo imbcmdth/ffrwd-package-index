@@ -9,7 +9,8 @@ license = "Apache-2.0"
 name = "ffrwd-index"
 path = "src/main.rs"
 
-# The argument reading and the JSON are a page each and are written out
-# in the crate, so the tool builds with nothing fetched.
+# Nothing fetched: `core` is the codec and `rows` is the JSON, and both
+# are in this workspace.
 [dependencies]
 ffrwd-index-core = { path = "../core" }
+ffrwd-index-rows = { path = "../rows" }
