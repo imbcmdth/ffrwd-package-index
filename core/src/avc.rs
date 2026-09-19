@@ -103,13 +103,29 @@ impl Codec {
         }
     }
 
-    /// The NAL header of an SEI this format writes.
-    pub fn sei_header(self) -> &'static [u8] {
+    /// The NAL header of an SEI this format writes, for an access unit
+    /// at `temporal_id_plus1`.
+    ///
+    /// HEVC requires a prefix SEI to carry the temporal id of the
+    /// access unit it sits in, so the header is not a constant: a
+    /// stream with temporal sub-layers would be non-conforming with one
+    /// that always said zero. H.264 keeps its temporal id somewhere
+    /// else entirely and its header is the same byte every time.
+    pub fn sei_header(self, temporal_id_plus1: u8) -> Vec<u8> {
         match self {
             // nal_ref_idc 0, type 6.
-            Codec::H264 => &[0x06],
-            // type 39, layer 0, temporal id plus one 1.
-            Codec::H265 => &[0x4e, 0x01],
+            Codec::H264 => vec![0x06],
+            // type 39, layer 0, and the access unit's temporal id.
+            Codec::H265 => vec![H265_PREFIX_SEI << 1, temporal_id_plus1.max(1) & 0x07],
+        }
+    }
+
+    /// The `nuh_temporal_id_plus1` of a NAL, which is 1 for H.264,
+    /// where the field does not exist.
+    pub fn temporal_id_plus1(self, nal: &[u8]) -> u8 {
+        match self {
+            Codec::H264 => 1,
+            Codec::H265 => nal.get(1).map_or(1, |byte| (byte & 0x07).max(1)),
         }
     }
 
@@ -195,6 +211,9 @@ pub struct AccessUnit {
     pub insert_at: usize,
     /// Whether the access unit is a random access point.
     pub keyframe: bool,
+    /// The `nuh_temporal_id_plus1` of its first coded slice, which an
+    /// SEI put in this access unit has to repeat.
+    pub temporal_id_plus1: u8,
 }
 
 /// The access units of an Annex B stream.
@@ -227,6 +246,7 @@ pub fn access_units(annexb: &[u8], codec: Codec) -> Vec<AccessUnit> {
                 end: annexb.len(),
                 insert_at: usize::MAX,
                 keyframe: false,
+                temporal_id_plus1: 1,
             });
             seen_slice = false;
         }
@@ -234,6 +254,7 @@ pub fn access_units(annexb: &[u8], codec: Codec) -> Vec<AccessUnit> {
             if slice {
                 if unit.insert_at == usize::MAX {
                     unit.insert_at = nal.code;
+                    unit.temporal_id_plus1 = codec.temporal_id_plus1(nal.bytes);
                 }
                 unit.keyframe |= codec.is_keyframe_type(kind);
                 seen_slice = true;
@@ -379,8 +400,8 @@ fn put_ff(out: &mut Vec<u8>, mut value: u32) {
 }
 
 /// An SEI NAL unit carrying `messages`, escapes and trailing bits and
-/// all.
-pub fn write_sei(messages: &[SeiMessage], codec: Codec) -> Vec<u8> {
+/// all, for an access unit at `temporal_id_plus1`.
+pub fn write_sei(messages: &[SeiMessage], codec: Codec, temporal_id_plus1: u8) -> Vec<u8> {
     let mut rbsp = Vec::new();
     for message in messages {
         put_ff(&mut rbsp, message.payload_type);
@@ -389,20 +410,28 @@ pub fn write_sei(messages: &[SeiMessage], codec: Codec) -> Vec<u8> {
     }
     // rbsp_trailing_bits: a one bit, then zeroes to the byte.
     rbsp.push(0x80);
-    let mut nal = codec.sei_header().to_vec();
+    let mut nal = codec.sei_header(temporal_id_plus1);
     nal.extend_from_slice(&insert_emulation_prevention(&rbsp));
     nal
 }
 
-/// A unit as an SEI NAL unit, ready to splice into an access unit.
-pub fn wrap_unit(unit: &[u8], codec: Codec) -> Vec<u8> {
+/// A unit as an SEI NAL unit, ready to splice into an access unit at
+/// `temporal_id_plus1`, which [`AccessUnit`] carries.
+pub fn wrap_unit_at(unit: &[u8], codec: Codec, temporal_id_plus1: u8) -> Vec<u8> {
     write_sei(
         &[SeiMessage {
             payload_type: PAYLOAD_TYPE_USER_DATA_UNREGISTERED,
             payload: unit.to_vec(),
         }],
         codec,
+        temporal_id_plus1,
     )
+}
+
+/// A unit as an SEI NAL unit for an access unit of the base temporal
+/// layer, which is every access unit of a stream without sub-layers.
+pub fn wrap_unit(unit: &[u8], codec: Codec) -> Vec<u8> {
+    wrap_unit_at(unit, codec, 1)
 }
 
 /// The units in one SEI NAL unit: the `user_data_unregistered`
@@ -600,6 +629,7 @@ mod tests {
                 payload,
             }],
             Codec::H264,
+            1,
         )
     }
 
@@ -695,6 +725,7 @@ mod tests {
                 },
             ],
             Codec::H264,
+            1,
         );
         let messages = parse_sei(&nal, Codec::H264).expect("messages");
         assert_eq!(
@@ -713,6 +744,30 @@ mod tests {
         // The same bytes read as H.264 are a different type entirely,
         // so a reader that has the codec wrong finds nothing.
         assert!(units_in_nal(&nal, Codec::H264).is_empty());
+    }
+
+    #[test]
+    fn an_hevc_sei_repeats_its_access_units_temporal_id() {
+        // A stream of two HEVC pictures, the second on temporal
+        // sub-layer 2, which its slice header says in the NAL header's
+        // second byte.
+        let mut stream = Vec::new();
+        for (kind, temporal_id_plus1) in [(19u8, 1u8), (1, 3)] {
+            stream.extend_from_slice(&[0, 0, 0, 1]);
+            stream.extend_from_slice(&[kind << 1, temporal_id_plus1, 0x80, 0x00]);
+        }
+        let units = access_units(&stream, Codec::H265);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].temporal_id_plus1, 1);
+        assert_eq!(units[1].temporal_id_plus1, 3);
+        assert!(units[0].keyframe, "type 19 is an IDR");
+
+        let sei = wrap_unit_at(&a_unit(), Codec::H265, units[1].temporal_id_plus1);
+        assert_eq!(sei[0] >> 1 & 0x3f, H265_PREFIX_SEI);
+        assert_eq!(sei[1] & 0x07, 3, "the SEI is on the same sub-layer");
+        assert_eq!(units_in_nal(&sei, Codec::H265), vec![a_unit()]);
+        // The base layer is what a stream without sub-layers gets.
+        assert_eq!(wrap_unit(&a_unit(), Codec::H265)[1], 1);
     }
 
     #[test]

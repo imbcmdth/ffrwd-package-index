@@ -237,7 +237,7 @@ fn weave(args: &[String]) -> Result<(), String> {
         let bytes = Unit::new(messages.clone()).encode();
         woven.extend_from_slice(&stream[at..unit.insert_at]);
         woven.extend_from_slice(&[0, 0, 0, 1]);
-        woven.extend_from_slice(&avc::wrap_unit(&bytes, codec));
+        woven.extend_from_slice(&avc::wrap_unit_at(&bytes, codec, unit.temporal_id_plus1));
         at = unit.insert_at;
         written += 1;
     }

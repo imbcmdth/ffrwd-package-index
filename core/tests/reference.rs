@@ -123,6 +123,7 @@ impl Stream {
                     end: unit.end,
                     insert_at: unit.insert_at,
                     keyframe: unit.keyframe,
+                    temporal_id_plus1: unit.temporal_id_plus1,
                     pts_ms: index as i64 * 1000 / FPS,
                 })
                 .collect(),
@@ -138,6 +139,7 @@ impl Stream {
                     // each key frame, which is as close to a sync
                     // sample as a reader gets without decoding.
                     keyframe: unit.has_sequence_header,
+                    temporal_id_plus1: 1,
                     pts_ms: index as i64 * 1000 / FPS,
                 })
                 .collect(),
@@ -156,7 +158,7 @@ impl Stream {
             match self.codec() {
                 Some(codec) => {
                     out.extend_from_slice(&[0, 0, 0, 1]);
-                    out.extend_from_slice(&avc::wrap_unit(unit, codec));
+                    out.extend_from_slice(&avc::wrap_unit_at(unit, codec, spot.temporal_id_plus1));
                 }
                 None => out.extend_from_slice(&obu::write_metadata_obu(unit)),
             }
@@ -188,6 +190,7 @@ struct Spot {
     end: usize,
     insert_at: usize,
     keyframe: bool,
+    temporal_id_plus1: u8,
     pts_ms: i64,
 }
 
