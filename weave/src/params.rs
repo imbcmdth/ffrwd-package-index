@@ -6,6 +6,15 @@
 //! the front of it: a space here has a `name`, because the rows a query
 //! writes name spaces and have no reason to know what a `space_id` is.
 //! The wire ids are handed out in declaration order.
+//!
+//! Every param here is a SCALAR as far as a host is concerned, because
+//! a wasm function's value arguments in ffrwd's dialect are text,
+//! number, boolean or vector, and nothing else. `spaces` is the one
+//! that wanted to be an array of objects, so it is declared as text
+//! holding that array's JSON and a query passes a literal. The array
+//! itself is still read where it turns up, for `-params` and
+//! `-params-from` on the sidecar's own command line and for the tests
+//! and tools that write params by hand.
 
 use ffrwd_index_core::placement::Placement;
 use ffrwd_index_core::{MAX_ESCAPES, UNIT_SOFT_LIMIT};
@@ -16,39 +25,47 @@ use ffrwd_index_rows::weave::Config;
 /// The JSON Schema `describe` publishes. It is what a caller is
 /// checked against before this module ever runs, so it says the same
 /// things the reader below does.
+///
+/// `spaces` is declared as a STRING, and the array of objects it holds
+/// is under `$defs`. A host reads `properties` to decide what a query
+/// may write, and a query writes values: an array of objects is not
+/// one, so a `spaces` declared as an array is a param no SQL could ever
+/// fill. The text is the array's own JSON, which a producer package
+/// passes as a literal.
 pub const PARAMS_SCHEMA: &str = r#"{
   "type": "object",
   "required": ["spaces"],
   "additionalProperties": false,
   "properties": {
     "spaces": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 256,
-      "description": "The embedding spaces this run carries. A row names one by its name; the wire ids are handed out in this order.",
-      "items": {
-        "type": "object",
-        "required": ["name", "dims"],
-        "additionalProperties": false,
-        "properties": {
-          "name": {"type": "string", "minLength": 1},
-          "dims": {"type": "integer", "minimum": 1, "maximum": 65536},
-          "encoding": {"enum": ["i8", "f16", "f32"], "default": "i8"},
-          "unit_length": {"type": "boolean", "default": false},
-          "modality": {"oneOf": [{"enum": ["unspecified", "picture", "sound", "speech", "sound-text", "scene-text", "description"]}, {"type": "integer", "minimum": 0, "maximum": 255}]},
-          "source": {"type": "integer", "minimum": 0, "maximum": 255},
-          "model": {"type": "string"},
-          "model_hash": {"type": "string"},
-          "query": {"type": "string"},
-          "query_hash": {"type": "string"},
-          "producer": {"type": "string"}
-        }
-      }
+      "type": "string",
+      "minLength": 1,
+      "description": "The embedding spaces this run carries, as the JSON text of an array of 1 to 256 of the objects under $defs/space: '[{\"name\":\"clip\",\"dims\":512}]'. A row names one by its name, or the rows argument it arrived on does; the wire ids are handed out in this order. The array itself is taken too, for a caller writing params by hand rather than from SQL."
     },
-    "placement": {"enum": ["keyframe", "next", "spread"], "default": "keyframe"},
+    "placement": {"type": "string", "enum": ["keyframe", "next", "spread"], "default": "keyframe"},
     "budget": {"type": "integer", "minimum": 1, "description": "Bytes of messages per access unit, for placement 'spread' and nowhere else."},
     "escapes": {"type": "integer", "minimum": 0, "maximum": 16, "default": 2},
     "planes": {"type": "integer", "minimum": 1, "maximum": 8, "description": "How many of an i8 record's eight bit-planes are sent at all. All eight by default."}
+  },
+  "$defs": {
+    "space": {
+      "type": "object",
+      "required": ["name", "dims"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "dims": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "encoding": {"enum": ["i8", "f16", "f32"], "default": "i8"},
+        "unit_length": {"type": "boolean", "default": false},
+        "modality": {"oneOf": [{"enum": ["unspecified", "picture", "sound", "speech", "sound-text", "scene-text", "description"]}, {"type": "integer", "minimum": 0, "maximum": 255}]},
+        "source": {"type": "integer", "minimum": 0, "maximum": 255},
+        "model": {"type": "string"},
+        "model_hash": {"type": "string"},
+        "query": {"type": "string"},
+        "query_hash": {"type": "string"},
+        "producer": {"type": "string"}
+      }
+    }
   }
 }"#;
 
@@ -88,10 +105,23 @@ pub fn read(params: &str) -> Result<Config, String> {
         }
     }
 
-    let declared = row
-        .get("spaces")
-        .and_then(Json::as_array)
-        .ok_or("params with no spaces")?;
+    let held;
+    let declared = match row.get("spaces") {
+        // The SQL form: one text value holding the array's own JSON,
+        // which is the only shape a query can write.
+        Some(Json::String(text)) => {
+            let parsed = Json::parse(text.trim())
+                .map_err(|err| format!("spaces is text that is not JSON: {err}"))?;
+            held = parsed;
+            held.as_array()
+                .ok_or("spaces is text that is not a JSON array of spaces")?
+        }
+        // And the array itself, for params written by hand.
+        Some(value) => value
+            .as_array()
+            .ok_or("spaces is neither an array of spaces nor the text of one")?,
+        None => return Err("params with no spaces".into()),
+    };
     if declared.is_empty() {
         return Err("weave needs at least one space".into());
     }
@@ -206,6 +236,49 @@ mod tests {
     }
 
     #[test]
+    fn spaces_read_the_same_as_an_array_and_as_the_text_of_one() {
+        let array = read(
+            r#"{"spaces":[{"name":"clip","dims":512,"modality":"picture"},
+                          {"name":"speech","dims":384,"encoding":"f16"}]}"#,
+        )
+        .expect("params");
+        let text = read(
+            r#"{"spaces":"[{\"name\":\"clip\",\"dims\":512,\"modality\":\"picture\"},
+                           {\"name\":\"speech\",\"dims\":384,\"encoding\":\"f16\"}]"}"#,
+        )
+        .expect("params");
+        assert_eq!(array.spaces, text.spaces);
+        assert_eq!(text.spaces[0].0, "clip");
+        assert_eq!(text.spaces[1].1.space_id, 1);
+        assert_eq!(text.spaces[1].1.encoding, Encoding::F16);
+    }
+
+    #[test]
+    fn the_schema_declares_spaces_as_a_value_a_query_can_write() {
+        // A host reads this to decide what SQL may pass, and SQL passes
+        // text, numbers, booleans and vectors. Every param has to be one
+        // of those or no query could configure this module at all.
+        let schema = Json::parse(PARAMS_SCHEMA).expect("a schema");
+        let properties = schema.get("properties").expect("properties");
+        for (name, wanted) in [
+            ("spaces", "string"),
+            ("placement", "string"),
+            ("budget", "integer"),
+            ("escapes", "integer"),
+            ("planes", "integer"),
+        ] {
+            assert_eq!(
+                properties
+                    .get(name)
+                    .and_then(|member| member.get("type"))
+                    .and_then(Json::as_str),
+                Some(wanted),
+                "the schema's '{name}'"
+            );
+        }
+    }
+
+    #[test]
     fn ids_are_handed_out_in_declaration_order() {
         let config = read(
             r#"{"spaces":[
@@ -245,6 +318,10 @@ mod tests {
             ("", "empty"),
             ("not json", "not one JSON object"),
             (r#"{"spaces":[]}"#, "at least one space"),
+            (r#"{"spaces":"[]"}"#, "at least one space"),
+            (r#"{"spaces":"not json"}"#, "text that is not JSON"),
+            (r#"{"spaces":"{\"name\":\"c\"}"}"#, "not a JSON array"),
+            (r#"{"spaces":7}"#, "neither an array"),
             (r#"{"placement":"next"}"#, "no spaces"),
             (
                 r#"{"spaces":[{"name":"c","dims":8}],"placemant":"next"}"#,
