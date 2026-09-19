@@ -620,6 +620,31 @@ mod tests {
     }
 
     #[test]
+    fn a_space_this_version_cannot_read_is_still_reported() {
+        // Section 3: a reader that does not know an encoding keeps the
+        // declaration, so it can still name the space's models, and
+        // ignores that space's vectors without calling them an error.
+        let mut space = i8_space();
+        space.encoding = Encoding::Other(9);
+        assert_eq!(
+            Space::decode(&space.encode()).expect("the declaration survives"),
+            space
+        );
+
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::default();
+        assembler.push(0, &Message::Space(space)).expect("a space");
+        assembler
+            .push(0, &Message::Vector(record(1, 1, &planes, 0xff, 0, 10)))
+            .expect("a vector");
+        let held = assembler.space(1).expect("the space is still there");
+        assert_eq!(held.encoding, Encoding::Other(9));
+        assert_eq!(held.model, "test:model");
+        assert!(assembler.records().is_empty(), "its vectors are ignored");
+        assert_eq!(assembler.dropped(), 0, "and are not an error");
+    }
+
+    #[test]
     fn a_unit_of_mixed_messages_counts_what_it_cannot_use() {
         let planes = Planes::quantize(&vector(16)).expect("quantized");
         let mut assembler = Assembler::default();
