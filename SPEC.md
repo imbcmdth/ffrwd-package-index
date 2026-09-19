@@ -69,8 +69,9 @@ Everything else is reserved.
 space_id    u8        the name VECTOR messages use for this space
 dims        varint    components per vector, at least 1
 encoding    u8        0 = F32, 1 = F16, 2 = I8 (section 5)
-flags       u8        bit 0: vectors are unit length; other bits are reserved:
-                      a writer sets them to zero and a reader ignores them
+flags       u8        bit 0: the vectors were unit length before they were
+                      encoded; other bits are reserved: a writer sets them to
+                      zero and a reader ignores them
 modality    u8        what was embedded (table below)
 source      u8        0 = the stream carrying this message; n = the n-th audio
                       stream of the program as the writer saw it (a hint only:
@@ -145,37 +146,56 @@ can be reused once 32768 newer records of that space have been written.
 first.
 
 **I8.** Each component is a sign and a 7-bit magnitude, with one scale for the
-vector, sent as up to eight bit-planes, most significant first:
+vector, sent as up to eight bit-planes, most significant first. A few components
+may be sent exactly instead, as escapes:
 
 ```
-scale       f16       the largest absolute component, rounded up to the next
-                      representable binary16 value
+scale       f16       the largest absolute component that is not an escape,
+                      rounded up to the next representable binary16 value
 planes      u8        bit k set: plane k is present
+escapes     u8        how many escapes follow, at most 16
+escape      for each: index varint, value f16
 plane data  for each present plane, in ascending k: ceil(dims / 8) bytes
 ```
 
 Quantizing: `m = round(|x| / scale * 127)`, clamped to 0..127, and `sign = 1`
-when `x` is negative. Plane 0 holds the sign bits. Plane k, for k from 1 to 7,
-holds bit `7 - k` of each magnitude, so plane 1 is the magnitude's most
-significant bit. Within a plane, component `i` is bit `7 - (i mod 8)` of byte
-`i div 8`; unused bits of the last byte are zero.
+when `x` is negative. An escaped component has magnitude 0 in the planes and
+keeps its sign bit, so plane 0 is the same with or without escapes. Plane 0
+holds the sign bits. Plane k, for k from 1 to 7, holds bit `7 - k` of each
+magnitude, so plane 1 is the magnitude's most significant bit. Within a plane,
+component `i` is bit `7 - (i mod 8)` of byte `i div 8`; unused bits of the last
+byte are zero.
+
+Escapes exist because one scale per vector is set by the vector's largest
+component, and some models have one that dwarfs the rest: measured on a
+video-text model, a single component held 30% of each vector's energy, and
+sending the two largest components exactly brought agreement with the original
+ranking from 80% to 99%, for 8 bytes. A writer sends a record's escapes in the
+message that carries plane 0, in ascending index order with no index twice, and
+an empty list in the record's other messages. A model without such components
+needs none. An index at or above `dims` costs the message (section 9).
 
 A vector whose components are all zero has scale zero and magnitudes zero. A
 vector whose largest component is past binary16's range takes binary16's
 largest finite value as its scale, and the clamp does the rest.
 
 Reading: with planes 0 to K present, a component's magnitude is the bits known
-so far, with the unknown low bits replaced by their midpoint (`1 << (6 - K)`
-when K is less than 7, nothing when K is 7), and its value is
-`sign * magnitude / 127 * scale`. With plane 0 alone every component has the
-same magnitude and differs only in sign: a binary embedding up to a scale,
+so far, with the unknown low bits replaced by a one followed by zeros (`1 << (6
+- K)` when K is less than 7, nothing when K is 7: the middle of the range they
+could hold, rounded up), and its value is `sign * magnitude / 127 * scale`. An
+escaped component's value is the one the escape gives, whatever planes are
+present. With plane 0 alone every component that is not an escape has the same
+magnitude and differs only in sign: a binary embedding up to a scale,
 comparable by Hamming distance with no arithmetic, which is what a coarse
-search over many records wants. Each further
-plane halves the uncertainty, and all eight are the full 8-bit vector. A reader
-uses the longest run of planes it has starting at plane 0 and ignores any plane
-above the first one missing; a record without plane 0 cannot be read. A writer
-must send plane 0 before or with any
-other plane of a record, and should send planes in order.
+search over many records wants. The scale differs from record to record, so a
+reader comparing reconstructions of few planes uses cosine or Hamming distance
+and not a bare dot product, and a reader that needs unit vectors normalizes
+what it reconstructs: bit 0 of the space's `flags` describes the originals.
+Each further plane halves the uncertainty, and all eight are the full 8-bit
+vector. A reader uses the longest run of planes it has starting at plane 0 and
+ignores any plane above the first one missing; a record without plane 0 cannot
+be read. A writer must send plane 0 before or with any other plane of a record,
+and should send planes in order.
 
 A writer with room sends all planes in one message. A writer with a byte budget
 per carrier sends plane 0 first and the rest in later messages for the same
@@ -276,7 +296,8 @@ A live writer produces no index.
 ## 9. What a reader must not trust
 
 Every length is checked against the bytes that remain before it is used. `dims`
-above 65536, a `record_id` at or above 65536, a string longer than its message,
+above 65536, a `record_id` at or above 65536, more than 16 escapes or an escape
+index at or above `dims`, a string longer than its message,
 a plane set whose data runs past the message, and a FRAGMENT whose `offset`
 plus length exceeds `total` each cost the message they are in: it is dropped,
 and the messages after it in the unit, whose framing is unaffected, are still
