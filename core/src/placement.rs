@@ -1,11 +1,12 @@
 //! Section 7's placement policies, as a state machine with no I/O.
 //!
 //! A writer sees access units go by and records turn up, and has to
-//! decide which carrier each record rides on, repeat the SPACE messages
-//! often enough for a reader that joined late, and turn absolute spans
-//! into offsets from whichever carrier it picked. That decision is the
-//! whole of this module, so the packet filter that will do the weaving
-//! inside a pipeline is left with nothing but moving bytes.
+//! decide which carrier each record rides on, declare its spaces on
+//! every keyframe so a reader that joined late has them, and turn
+//! absolute spans into offsets from whichever carrier it picked. That
+//! decision is the whole of this module, so the packet filter that will
+//! do the weaving inside a pipeline is left with nothing but moving
+//! bytes.
 //!
 //! Feed it [`Planner::carrier`] for every access unit in presentation
 //! order and it hands back the messages for that access unit's unit.
@@ -17,9 +18,6 @@ use crate::message::{Message, Space, VectorRecord};
 use crate::quant::Planes;
 use crate::{Error, Result};
 
-/// How often a writer repeats its SPACE messages once it has started.
-pub const SPACE_REPEAT_MS: i64 = 10_000;
-
 /// Where records go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -27,22 +25,12 @@ pub enum Placement {
     /// or after the end of its span. The policy for files.
     Keyframe,
     /// A record rides on the first carrier after it exists. The policy
-    /// for live streams.
+    /// for live streams, where a watcher should hear of a match at once
+    /// and the next keyframe may be seconds away.
     Next,
     /// As `Next`, with a byte budget per carrier, filled with planes
     /// and fragments, most significant first.
     Spread { budget_bytes: usize },
-}
-
-/// Whether the stream being written is a file or a live one.
-///
-/// The difference is only how often SPACE messages repeat: a live or
-/// segmented stream puts them on every keyframe, because a watcher can
-/// join at any of them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    File,
-    Live,
 }
 
 /// One access unit, as much of it as placement cares about.
@@ -121,38 +109,26 @@ struct Job {
 #[derive(Clone, Debug)]
 pub struct Planner {
     policy: Placement,
-    mode: Mode,
     spaces: BTreeMap<u8, Space>,
     jobs: VecDeque<Job>,
     started: bool,
-    last_space_ms: i64,
-    /// The last keyframe seen, and the widest gap between two of them.
-    /// Section 3 asks for a SPACE at least every ten seconds, and a
-    /// writer can only put one on a keyframe, so it has to know how
-    /// long the next one is likely to be away before it skips this one.
-    last_keyframe_ms: Option<i64>,
-    keyframe_gap_ms: i64,
     skipped: usize,
 }
 
 impl Planner {
     /// A planner for one policy.
-    pub fn new(policy: Placement, mode: Mode) -> Self {
+    pub fn new(policy: Placement) -> Self {
         Self {
             policy,
-            mode,
             spaces: BTreeMap::new(),
             jobs: VecDeque::new(),
             started: false,
-            last_space_ms: i64::MIN,
-            last_keyframe_ms: None,
-            keyframe_gap_ms: 0,
             skipped: 0,
         }
     }
 
     /// Declares a space. Its SPACE message goes out on the first
-    /// carrier the planner writes to, and repeats from there.
+    /// carrier the planner writes to and on every keyframe after it.
     pub fn declare(&mut self, space: Space) {
         self.spaces.insert(space.space_id, space);
     }
@@ -168,12 +144,6 @@ impl Planner {
 
     /// The messages for one access unit's unit, which may be empty.
     pub fn carrier(&mut self, carrier: Carrier) -> Vec<Message> {
-        if carrier.keyframe {
-            if let Some(previous) = self.last_keyframe_ms {
-                self.keyframe_gap_ms = self.keyframe_gap_ms.max(carrier.pts_ms - previous);
-            }
-            self.last_keyframe_ms = Some(carrier.pts_ms);
-        }
         let mut out = Vec::new();
         let mut room = match self.policy {
             Placement::Spread { budget_bytes } => budget_bytes,
@@ -188,7 +158,6 @@ impl Planner {
                 out.push(message);
             }
             self.started = true;
-            self.last_space_ms = carrier.pts_ms;
         }
         if !writing {
             return out;
@@ -234,7 +203,6 @@ impl Planner {
                 out.push(Message::Space(space.clone()));
             }
             self.started = true;
-            self.last_space_ms = carrier.pts_ms;
         }
         out.extend(vectors);
         out
@@ -269,6 +237,11 @@ impl Planner {
     }
 
     /// Whether the SPACE messages go on this carrier.
+    ///
+    /// Section 3: the first carrier the writer writes to, and every
+    /// keyframe after it. A cut or a segment begins at a keyframe, so
+    /// declaring on all of them is what makes whatever begins there
+    /// readable, and it costs one message per keyframe per space.
     fn spaces_due(&self, carrier: Carrier, writing: bool) -> bool {
         if self.spaces.is_empty() {
             return false;
@@ -277,18 +250,7 @@ impl Planner {
             // The first carrier the writer writes to, and not before.
             return writing;
         }
-        if !carrier.keyframe {
-            return false;
-        }
-        match self.mode {
-            Mode::Live => true,
-            // Repeat once waiting for the keyframe after this one would
-            // take the gap past ten seconds.
-            Mode::File => {
-                let due = self.last_space_ms.saturating_add(SPACE_REPEAT_MS);
-                carrier.pts_ms.saturating_add(self.keyframe_gap_ms) >= due
-            }
-        }
+        carrier.keyframe
     }
 
     /// Puts as much of one job on this carrier as the room allows, and
@@ -387,12 +349,11 @@ fn offset(at_ms: i64, carrier_ms: i64) -> Result<i32> {
 /// all the records already, which is every test and the file tool.
 pub fn plan(
     policy: Placement,
-    mode: Mode,
     spaces: &[Space],
     records: &[Pending],
     carriers: &[Carrier],
 ) -> Vec<Vec<Message>> {
-    let mut planner = Planner::new(policy, mode);
+    let mut planner = Planner::new(policy);
     for space in spaces {
         planner.declare(space.clone());
     }
@@ -477,13 +438,7 @@ mod tests {
     #[test]
     fn keyframe_placement_waits_for_the_first_keyframe_past_the_span() {
         let carriers = carriers(60, 15);
-        let plan = plan(
-            Placement::Keyframe,
-            Mode::File,
-            &[space(1)],
-            &records(4),
-            &carriers,
-        );
+        let plan = plan(Placement::Keyframe, &[space(1)], &records(4), &carriers);
         for (pts, record) in placed(&plan, &carriers) {
             let end = pts + i64::from(record.end_off);
             assert!(pts >= end, "a record rode a carrier before its span ended");
@@ -507,13 +462,7 @@ mod tests {
     #[test]
     fn next_placement_takes_the_first_carrier_at_all() {
         let carriers = carriers(60, 15);
-        let plan = plan(
-            Placement::Next,
-            Mode::Live,
-            &[space(1)],
-            &records(4),
-            &carriers,
-        );
+        let plan = plan(Placement::Next, &[space(1)], &records(4), &carriers);
         for (pts, record) in placed(&plan, &carriers) {
             let end = pts + i64::from(record.end_off);
             assert!(
@@ -537,7 +486,7 @@ mod tests {
             Placement::Next,
             Placement::Spread { budget_bytes: 64 },
         ] {
-            let plan = plan(policy, Mode::File, &[space(1)], &wanted, &carriers);
+            let plan = plan(policy, &[space(1)], &wanted, &carriers);
             for (pts, record) in placed(&plan, &carriers) {
                 let want = &wanted[usize::from(record.record_id)];
                 assert_eq!(pts + i64::from(record.start_off), want.start_ms);
@@ -556,7 +505,7 @@ mod tests {
             Placement::Spread { budget_bytes: 40 },
             Placement::Spread { budget_bytes: 24 },
         ] {
-            let plan = plan(policy, Mode::File, &[space(1)], &wanted, &carriers);
+            let plan = plan(policy, &[space(1)], &wanted, &carriers);
             let mut assembler = crate::assemble::Assembler::default();
             for (messages, carrier) in plan.iter().zip(&carriers) {
                 assembler.push_unit(carrier.pts_ms, &Unit::new(messages.clone()));
@@ -586,7 +535,6 @@ mod tests {
             Placement::Spread {
                 budget_bytes: budget,
             },
-            Mode::File,
             &[space(1)],
             &records(6),
             &carriers,
@@ -610,7 +558,6 @@ mod tests {
         let record = Pending::whole(2, 1, 0, 500, body.clone());
         let plan = plan(
             Placement::Spread { budget_bytes: 64 },
-            Mode::Live,
             &[big.clone()],
             &[record],
             &carriers,
@@ -633,21 +580,23 @@ mod tests {
     }
 
     #[test]
-    fn spaces_go_on_the_first_carrier_written_to_and_repeat() {
+    fn spaces_go_on_the_first_carrier_written_to_and_on_every_keyframe() {
         // Nothing to write until the first record's span ends, so the
-        // spaces wait with it.
+        // spaces wait with it, and from there they go on every keyframe
+        // whether or not a record does.
         let carriers = carriers(400, 30);
         let plan = plan(
             Placement::Keyframe,
-            Mode::File,
             &[space(1), space(2)],
             &[Pending::layered(1, 0, 5000, 6000, &planes(16))],
             &carriers,
         );
+        let has_spaces =
+            |messages: &Vec<Message>| messages.iter().any(|m| matches!(m, Message::Space(_)));
         let space_carriers: Vec<i64> = plan
             .iter()
             .zip(&carriers)
-            .filter(|(messages, _)| messages.iter().any(|m| matches!(m, Message::Space(_))))
+            .filter(|(messages, _)| has_spaces(messages))
             .map(|(_, carrier)| carrier.pts_ms)
             .collect();
         assert!(!space_carriers.is_empty());
@@ -655,13 +604,15 @@ mod tests {
             space_carriers[0] >= 6000,
             "spaces went out before any record"
         );
-        for pair in space_carriers.windows(2) {
-            assert!(
-                pair[1] - pair[0] <= SPACE_REPEAT_MS,
-                "spaces went {} ms without repeating",
-                pair[1] - pair[0]
-            );
-        }
+        // Every keyframe from that one on, and no carrier that is not
+        // one, so a cut beginning at any keyframe can read what it
+        // keeps.
+        let wanted: Vec<i64> = carriers
+            .iter()
+            .filter(|carrier| carrier.keyframe && carrier.pts_ms >= space_carriers[0])
+            .map(|carrier| carrier.pts_ms)
+            .collect();
+        assert_eq!(space_carriers, wanted);
         // Both spaces, every time.
         for (messages, _) in plan.iter().zip(&carriers) {
             let spaces = messages
@@ -673,35 +624,41 @@ mod tests {
     }
 
     #[test]
-    fn a_live_writer_repeats_the_spaces_on_every_keyframe() {
+    fn a_reader_joining_at_any_keyframe_has_the_spaces_for_what_follows() {
+        // Every keyframe of the stream, as the place a cut or a segment
+        // would begin: from there on, every record that goes out can be
+        // read, because its space was declared at that keyframe.
         let carriers = carriers(120, 10);
-        let plan = plan(
-            Placement::Next,
-            Mode::Live,
-            &[space(1)],
-            &[Pending::layered(1, 0, 0, 100, &planes(16))],
-            &carriers,
-        );
-        let keyframes = carriers.iter().filter(|carrier| carrier.keyframe).count();
-        let with_spaces = plan
-            .iter()
-            .filter(|messages| messages.iter().any(|m| matches!(m, Message::Space(_))))
-            .count();
-        // Every keyframe from the first written carrier on, which is
-        // the second keyframe here.
-        assert!(with_spaces >= keyframes - 1, "{with_spaces} of {keyframes}");
+        let wanted = records(4);
+        let plan = plan(Placement::Next, &[space(1)], &wanted, &carriers);
+        for (start, carrier) in carriers.iter().enumerate() {
+            if !carrier.keyframe {
+                continue;
+            }
+            let mut assembler = crate::assemble::Assembler::default();
+            for (messages, carrier) in plan.iter().zip(&carriers).skip(start) {
+                assembler.push_unit(carrier.pts_ms, &Unit::new(messages.clone()));
+            }
+            let read = assembler.records();
+            let sent = plan
+                .iter()
+                .skip(start)
+                .flatten()
+                .filter(|m| matches!(m, Message::Vector(_)))
+                .count();
+            assert_eq!(
+                read.len() * 8,
+                sent,
+                "a reader joining at {} ms could not read what followed",
+                carrier.pts_ms
+            );
+        }
     }
 
     #[test]
     fn a_record_that_never_meets_a_keyframe_still_goes_out_at_the_end() {
         let carriers = carriers(10, 20); // one keyframe, at the start
-        let plan = plan(
-            Placement::Keyframe,
-            Mode::File,
-            &[space(1)],
-            &records(2),
-            &carriers,
-        );
+        let plan = plan(Placement::Keyframe, &[space(1)], &records(2), &carriers);
         let vectors = plan
             .iter()
             .flatten()
@@ -721,7 +678,7 @@ mod tests {
             pts_ms: 0,
             keyframe: true,
         }];
-        let mut planner = Planner::new(Placement::Next, Mode::File);
+        let mut planner = Planner::new(Placement::Next);
         planner.declare(space(1));
         // A span so far behind the carrier that no svarint of the
         // offsets could say where it was.
@@ -745,7 +702,7 @@ mod tests {
     #[test]
     fn nothing_is_written_when_there_is_nothing_to_say() {
         let carriers = carriers(10, 5);
-        let plan = plan(Placement::Keyframe, Mode::File, &[space(1)], &[], &carriers);
+        let plan = plan(Placement::Keyframe, &[space(1)], &[], &carriers);
         assert!(plan.iter().all(|messages| messages.is_empty()));
     }
 }

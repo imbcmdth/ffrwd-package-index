@@ -358,6 +358,115 @@ fn the_tool_says_what_it_will_not_do() {
 }
 
 #[test]
+fn a_cut_of_a_woven_file_reads_from_its_first_frame() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+    {
+        println!("skipping the cut: ffmpeg is not on the PATH");
+        return;
+    }
+    let dir = scratch("cut");
+    let rows_path = dir.join("rows.ndjson");
+    let woven = dir.join("woven.h264");
+    std::fs::write(&rows_path, rows()).expect("the rows");
+    // The `next` policy puts records on ordinary frames, so a cut at
+    // the keyframe one second in leaves some of them behind and keeps
+    // the rest. Nothing else is asked for: the spaces go on every
+    // keyframe whatever the policy is.
+    let (code, _, told) = tool(&[
+        "weave",
+        "--video",
+        fixture("ref.h264").to_str().expect("a path"),
+        "--vectors",
+        rows_path.to_str().expect("a path"),
+        "--out",
+        woven.to_str().expect("a path"),
+        "--placement",
+        "next",
+    ]);
+    assert_eq!(code, 0, "{told}");
+
+    let ffmpeg = |args: &[&str]| {
+        let output = Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-y", "-loglevel", "error"])
+            .args(args)
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            output.status.success(),
+            "ffmpeg {} failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let whole = dir.join("whole.mp4");
+    let cut = dir.join("cut.mp4");
+    let back = dir.join("cut.h264");
+    ffmpeg(&[
+        "-i",
+        woven.to_str().expect("a path"),
+        "-c",
+        "copy",
+        "-f",
+        "mp4",
+        whole.to_str().expect("a path"),
+    ]);
+    ffmpeg(&[
+        "-ss",
+        "1",
+        "-i",
+        whole.to_str().expect("a path"),
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-f",
+        "mp4",
+        cut.to_str().expect("a path"),
+    ]);
+    ffmpeg(&[
+        "-i",
+        cut.to_str().expect("a path"),
+        "-c",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb",
+        "-f",
+        "h264",
+        back.to_str().expect("a path"),
+    ]);
+
+    let (code, printed, told) = tool(&["read", "--video", back.to_str().expect("a path")]);
+    assert_eq!(code, 0, "{told}");
+    assert!(!told.contains("dropped"), "{told}");
+    let spaces = printed
+        .lines()
+        .filter(|line| line.contains("\"space\":"))
+        .count();
+    let records = printed
+        .lines()
+        .filter(|line| line.contains("\"vector\":"))
+        .count();
+    assert_eq!(spaces, 2, "the cut lost a space declaration:\n{printed}");
+    assert!(records > 0, "the cut kept no records");
+    assert!(
+        records < 7,
+        "the cut kept all seven records, so it cut nothing"
+    );
+    // The records the cut kept are the ones whose carriers it kept, and
+    // their spans have moved with the file's own zero.
+    for line in printed.lines().filter(|line| line.contains("\"vector\":")) {
+        let start: i64 = field(line, "start_ms")
+            .and_then(|value| value.parse().ok())
+            .expect("a start");
+        assert!(start < 500, "a span was not moved by the cut: {line}");
+    }
+}
+
+#[test]
 fn a_frame_rate_moves_every_span_with_it() {
     // The stream carries no timestamps, so reading at a rate other than
     // the one that was woven moves the spans by that ratio. The tool

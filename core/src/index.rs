@@ -45,7 +45,7 @@ impl FileIndex {
     ///
     /// Two things are folded away, as section 8 asks. A SPACE message
     /// appears once, at the time its definition first applied, so a
-    /// writer repeating it every ten seconds costs the index nothing; a
+    /// writer declaring it on every keyframe costs the index nothing; a
     /// writer that redefines an id, which section 3 tells it not to do,
     /// gets a second entry at the time the new definition started. And
     /// the several messages of one record become one entry, at the time

@@ -41,7 +41,7 @@ use ffrwd_index_core::avc::{self, Codec};
 use ffrwd_index_core::index::FileIndex;
 use ffrwd_index_core::message::{Encoding, Message, Modality, Space, Unit, VectorRecord};
 use ffrwd_index_core::obu;
-use ffrwd_index_core::placement::{plan, Carrier, Mode, Pending, Placement};
+use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
 use ffrwd_index_core::quant::Planes;
 use ffrwd_index_core::UUID;
 
@@ -286,7 +286,7 @@ fn weave(stream: Stream, policy: Placement) -> Woven {
         })
         .collect();
     let (pending, want) = records();
-    let planned = plan(policy, Mode::File, &spaces(), &pending, &carriers);
+    let planned = plan(policy, &spaces(), &pending, &carriers);
     let units: Vec<Option<Vec<u8>>> = planned
         .iter()
         .map(|messages| {
@@ -991,6 +991,35 @@ fn a_cut_at_a_keyframe_keeps_the_spans_of_what_survives() {
         first.0 <= -900,
         "the cut was supposed to drop about a second, not {} ms",
         -first.0
+    );
+
+    // And what the cut kept is readable from its first frame: that
+    // frame is a keyframe, and section 3 has every keyframe declare the
+    // spaces, so no record survives with nothing to read it in.
+    let annexb = std::fs::read(cut.with_extension("h264")).expect("the cut as Annex B");
+    let mut carried: Vec<(u8, u16)> = Vec::new();
+    for units in stream.units(&annexb) {
+        for unit in units {
+            for message in Unit::decode(&unit).expect("a unit").messages {
+                if let Message::Vector(record) = message {
+                    carried.push((record.space_id, record.record_id));
+                }
+            }
+        }
+    }
+    carried.sort();
+    carried.dedup();
+    assert!(!carried.is_empty(), "the cut carries no VECTOR message");
+    let carriers: Vec<i64> = (0..stream.carriers(&annexb).len())
+        .map(|index| index as i64 * 1000 / FPS)
+        .collect();
+    let ids: Vec<(u8, u16)> = read_records(stream, &annexb, &carriers)
+        .iter()
+        .map(|want| (want.space_id, want.record_id))
+        .collect();
+    assert_eq!(
+        ids, carried,
+        "a record survived the cut with no space to read it in"
     );
 }
 

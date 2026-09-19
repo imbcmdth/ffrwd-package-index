@@ -21,7 +21,7 @@ use ffrwd_index_core::index::FileIndex;
 use ffrwd_index_core::message::{
     Encoding, Message, Modality, Space, Unit, VectorBody, VectorRecord,
 };
-use ffrwd_index_core::placement::{plan, Carrier, Mode, Pending, Placement};
+use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
 use ffrwd_index_core::quant::{f32_to_f16, Planes};
 
 const USAGE: &str = "\
@@ -29,7 +29,7 @@ ffrwd-index: embedding vectors in a video's own elementary stream.
 
     ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                       [--placement keyframe|next|spread:BYTES]
-                      [--fps N] [--codec h264|h265] [--live]
+                      [--fps N] [--codec h264|h265]
 
     ffrwd-index read  --video IN [--fps N] [--codec h264|h265]
                       [--index OUT.ffix]
@@ -67,17 +67,15 @@ fn run(args: &[String]) -> Result<(), String> {
 // Arguments.
 // ---------------------------------------------------------------- //
 
-/// The flags of one command.
+/// The flags of one command. Every flag this tool has takes a value.
 struct Flags {
     values: BTreeMap<String, String>,
-    switches: Vec<String>,
 }
 
 impl Flags {
-    /// Reads `--name value` pairs, and the switches that take none.
-    fn parse(args: &[String], switches: &[&str]) -> Result<Flags, String> {
+    /// Reads `--name value` pairs.
+    fn parse(args: &[String]) -> Result<Flags, String> {
         let mut values = BTreeMap::new();
-        let mut set = Vec::new();
         let mut at = 0usize;
         while at < args.len() {
             let name = args[at]
@@ -85,10 +83,6 @@ impl Flags {
                 .ok_or_else(|| format!("{} is not a flag", args[at]))?
                 .to_string();
             at += 1;
-            if switches.contains(&name.as_str()) {
-                set.push(name);
-                continue;
-            }
             let value = args
                 .get(at)
                 .ok_or_else(|| format!("--{name} wants a value"))?
@@ -98,10 +92,7 @@ impl Flags {
                 return Err(format!("--{name} was given twice"));
             }
         }
-        Ok(Flags {
-            values,
-            switches: set,
-        })
+        Ok(Flags { values })
     }
 
     fn get(&self, name: &str) -> Option<&str> {
@@ -112,14 +103,10 @@ impl Flags {
         self.get(name).ok_or_else(|| format!("--{name} is needed"))
     }
 
-    fn has(&self, name: &str) -> bool {
-        self.switches.iter().any(|switch| switch == name)
-    }
-
     /// Refuses a flag this command does not know, rather than ignoring
     /// it and doing something else than was asked.
     fn only(&self, known: &[&str]) -> Result<(), String> {
-        for name in self.values.keys().chain(self.switches.iter()) {
+        for name in self.values.keys() {
             if !known.contains(&name.as_str()) {
                 return Err(format!("--{name} is not a flag of this command"));
             }
@@ -187,27 +174,14 @@ fn placement_of(text: &str) -> Result<Placement, String> {
 // ---------------------------------------------------------------- //
 
 fn weave(args: &[String]) -> Result<(), String> {
-    let flags = Flags::parse(args, &["live"])?;
-    flags.only(&[
-        "video",
-        "vectors",
-        "out",
-        "placement",
-        "fps",
-        "codec",
-        "live",
-    ])?;
+    let flags = Flags::parse(args)?;
+    flags.only(&["video", "vectors", "out", "placement", "fps", "codec"])?;
     let video = flags.need("video")?;
     let vectors = flags.need("vectors")?;
     let out = flags.need("out")?;
     let codec = codec_of(video, flags.get("codec"))?;
     let fps = fps_of(&flags)?;
     let policy = placement_of(flags.get("placement").unwrap_or("keyframe"))?;
-    let mode = if flags.has("live") {
-        Mode::Live
-    } else {
-        Mode::File
-    };
 
     let stream = std::fs::read(video).map_err(|err| format!("{video}: {err}"))?;
     let rows = std::fs::read_to_string(vectors).map_err(|err| format!("{vectors}: {err}"))?;
@@ -226,7 +200,7 @@ fn weave(args: &[String]) -> Result<(), String> {
         })
         .collect();
 
-    let planned = plan(policy, mode, &spaces, &records, &carriers);
+    let planned = plan(policy, &spaces, &records, &carriers);
     let mut woven = Vec::with_capacity(stream.len() + 4096);
     let mut at = 0usize;
     let mut written = 0usize;
@@ -459,7 +433,7 @@ fn read_vector(row: &Json, space: &Space, next_id: &mut u32) -> Result<Pending, 
 // ---------------------------------------------------------------- //
 
 fn read(args: &[String]) -> Result<(), String> {
-    let flags = Flags::parse(args, &[])?;
+    let flags = Flags::parse(args)?;
     flags.only(&["video", "fps", "codec", "index"])?;
     match (flags.get("video"), flags.get("index")) {
         (None, Some(path)) => dump_index(path),
@@ -786,26 +760,26 @@ mod tests {
 
     #[test]
     fn the_flags_of_a_command_are_checked() {
-        let args: Vec<String> = ["--video", "a.h264", "--live"]
+        let args: Vec<String> = ["--video", "a.h264", "--placement", "next"]
             .iter()
             .map(|value| value.to_string())
             .collect();
-        let flags = Flags::parse(&args, &["live"]).expect("flags");
+        let flags = Flags::parse(&args).expect("flags");
         assert_eq!(flags.get("video"), Some("a.h264"));
-        assert!(flags.has("live"));
-        assert!(flags.only(&["video", "live"]).is_ok());
+        assert_eq!(flags.get("placement"), Some("next"));
+        assert!(flags.only(&["video", "placement"]).is_ok());
         assert!(flags.only(&["video"]).is_err());
         assert!(flags.need("out").is_err());
 
         let dangling: Vec<String> = vec!["--video".into()];
-        assert!(Flags::parse(&dangling, &[]).is_err());
+        assert!(Flags::parse(&dangling).is_err());
         let bare: Vec<String> = vec!["video".into()];
-        assert!(Flags::parse(&bare, &[]).is_err());
+        assert!(Flags::parse(&bare).is_err());
         let twice: Vec<String> = ["--fps", "30", "--fps", "60"]
             .iter()
             .map(|value| value.to_string())
             .collect();
-        assert!(Flags::parse(&twice, &[]).is_err());
+        assert!(Flags::parse(&twice).is_err());
     }
 
     #[test]
@@ -840,7 +814,7 @@ mod tests {
         assert_eq!(pts_ms(0, 30.0), 0);
         assert_eq!(pts_ms(30, 30.0), 1000);
         assert_eq!(pts_ms(30, 29.97), 1001);
-        let flags = Flags::parse(&["--fps".to_string(), "0".to_string()], &[]).expect("flags");
+        let flags = Flags::parse(&["--fps".to_string(), "0".to_string()]).expect("flags");
         assert!(fps_of(&flags).is_err());
     }
 }

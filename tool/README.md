@@ -6,7 +6,7 @@ own elementary stream and takes them back out.
 ```
 ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                   [--placement keyframe|next|spread:BYTES]
-                  [--fps N] [--codec h264|h265] [--live]
+                  [--fps N] [--codec h264|h265]
 
 ffrwd-index read  --video IN [--fps N] [--codec h264|h265] [--index OUT.ffix]
 ffrwd-index read  --index IN.ffix
@@ -125,16 +125,13 @@ which is the index's own record of the carrier's time.
   planes and then with fragments, most significant first, so the added
   bitrate stays level.
 
-`--live` repeats the space declarations on every keyframe instead of
-every ten seconds, which is what a viewer who joins at any keyframe
-needs.
-
-Use `--live` for a file that may be cut as well. A cut made with
-`ffmpeg -ss ... -c copy` starts at a keyframe and keeps the records of
-the frames it keeps, but a reader of the cut can only read a record
-whose space was declared at or after that keyframe. Ten seconds between
-declarations means a cut can land up to ten seconds of records after
-the last one, and they come out as bytes nobody can read.
+The policy is the only difference between writing a file and writing a
+live stream, that and whether an index is built beside it. The space
+declarations go on the first frame the tool writes to and on every
+keyframe after it whatever the policy is, so a cut made with
+`ffmpeg -ss ... -c copy`, a segment of a ladder, or a viewer joining a
+live stream can read from its first frame: that frame is a keyframe and
+it carries the declarations.
 
 Records that never meet a carrier the policy would choose, a record
 whose span ends after the last keyframe for instance, go on the last
