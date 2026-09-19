@@ -159,27 +159,32 @@ ffmpeg -discard nokey -i SRC -map 0:v:0 -c copy <pipe format> -  |  scanner
   tier 3 is one small read and no ffmpeg. The index does not survive a remux,
   so the pipe is the path that always works and the index is the shortcut.
 
-### The scanner, and the one open detail
+### The scanner is a packet sink in `ffrwd/index`
 
-The scanner is the SEI and OBU reader plus the message decoder: `core`'s
-`avc`, `obu`, `assemble`. Two homes, in order:
+Decided 2026-09-19: the scanner is a wasm packet sink (`records`, and `spaces`
+for the shape), shipped in the `ffrwd/index` package and run by the sidecar at
+compile time. The sidecar is the wasm host; it already reads coded NUT with
+each packet's pts and hands packets to a sink, so nothing native is added to
+it, nothing is published to crates.io, and ffrwd needs no extra binary. `core`
+has no dependencies and compiles to wasm as it is.
 
-- **Now:** the `ffrwd-index` tool, which already reads a growing stream on
-  standard input (`read --video -`). One more external binary, found through
-  the discovery chain `binaries.py` already has, with a typed refusal and an
-  install hint when it is missing.
-- **When the crates publish:** the same code inside the sidecar binary, which
-  already has a NUT reader. The switch is invisible above one function,
-  `embeddings_of(path, tier) -> rows`, beside `probe.probe`.
+The pipe format is NUT for the same reason it is everywhere else in ffrwd: it
+carries timestamps. A raw elementary stream (`-f h264`) has none, and a reader
+of one falls back on a frame-rate clock: wrong for variable frame rate, and off
+by the reorder delay on B-frame streams (the 83 ms seen in `examples/describe`).
 
-The pipe format is NUT, which is what ffrwd uses between every other pair of
-processes and which carries each packet's pts. A raw elementary stream
-(`-f h264`) has none, and a reader of one falls back on a frame-rate clock:
-wrong for variable frame rate, and off by the reorder delay on B-frame streams
-(the 83 ms seen in `examples/describe`). The sidecar already has a NUT reader
-with timestamps; the tool does not, so the interim home needs a small NUT
-demuxer in this repository (coded streams only: main and stream headers,
-syncpoints, frames with pts), and the end state needs none.
+This makes the read a package function and not a core column: a core
+`f.embeddings` would depend on a package being installed. `find.sql` reads
+`FROM input(:'src') f, ffrwd.index.records(f.video[1]) v`. What core gains is
+generic: a packet sink called in FROM over an input's stream is evaluated while
+compiling (the same two-process pipe ffrwd builds at run time for any sink),
+with a hint in the sink's meta, `wants: all | keyframes | first`, that the
+compiler turns into `-discard nokey` or `-frames:v 1`. The earlier objection to
+this route, that it needs ffmpeg at compile time, does not hold:
+`probe.track_cues()` already runs ffmpeg at compile time.
+
+The full plan is `vectors-in-stream-replace-vector-tracks.md` in the owner's
+plans directory.
 
 ### What the seam has to get right
 
@@ -243,8 +248,8 @@ compared against it.
 
 The rule is that `find.sql` always has something to read.
 
-0. **A scanner that reads NUT from a pipe**: in the sidecar if the crates
-   are published, otherwise a small NUT reader in the tool (section (b)).
+0. **A packet sink can be read at compile time**, and `records` and `spaces`
+   exist in `ffrwd/index` (section (b)).
 1. **The read path first.** `f.embeddings` (or `f.vectors`, if the
    column is renamed with the record) reads woven records through
    ffmpeg's keyframe copy and the scanner of section (b), beside the existing track reader rather than instead of it. A
