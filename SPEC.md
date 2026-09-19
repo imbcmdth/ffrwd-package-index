@@ -141,8 +141,11 @@ and a stream's first frame is often not at zero.
 
 Two VECTOR messages with the same `space_id` and `record_id` are the same
 record. For the layered encoding they may carry different layers, and a reader
-merges them; each carries its own offsets from its own carrier. A record's id
-can be reused once 32768 newer records of that space have been written.
+merges them; each carries its own offsets from its own carrier, and the
+record's span is the one its first message gives. A reader does not require the
+others to agree with it: clocks are rescaled between a writer and a reader, and
+a millisecond of difference is no reason to refuse a plane. A record's id can
+be reused once 32768 newer records of that space have been written.
 
 ## 5. Encodings
 
@@ -265,7 +268,9 @@ all of them the same way:
 
 - `keyframe`: whole records ride on keyframes, each on the first keyframe at or
   after the end of its span. A reader of a file then needs only the start of
-  each sync sample. This is the policy for files.
+  each sync sample. A record whose span ends after the last keyframe rides on
+  the last access unit, so such a reader reads the last sample as well. This is
+  the policy for files.
 - `next`: a record rides on the first carrier after it exists. This is the
   policy for live streams, where a watcher should hear of a match at once and
   the next keyframe may be seconds away.
@@ -286,21 +291,36 @@ index    = "FFIX" version count entry*
 version  = u8, 1
 count    = varint
 entry    = time message
-time     = varint, milliseconds of presentation time from the start of the
-           file, of the carrier the message came from
+time     = svarint, the presentation time in milliseconds of the carrier the
+           message came from, on the container's own clock
 message  = a SPACE or VECTOR message exactly as it appears in a unit
 ```
 
-Entries are in time order. Each distinct SPACE definition appears once, at the
-time it first applied. VECTOR messages of one record are merged into one entry,
-which takes the time and the offsets of the record's first message; the later
-messages name the same span from their own carriers and add only planes.
+The container's own clock is the time a reader gets for a sample once the
+container's timestamps and, in an MP4, its edit list have been applied: the time
+a player shows. A file whose first picture is not at zero has an index whose
+first entry is not at zero, and a carrier the edit list puts before zero has a
+negative time.
+
+Entries are in time order, and where two have the same time a SPACE comes
+before a VECTOR. Each distinct SPACE definition appears once, at the time it
+first applied. VECTOR messages of one record are merged into one entry, which
+takes the time and the offsets of the record's first message; the later
+messages add only planes.
+
+The index holds absolute times where the stream holds offsets, so a cut or a
+join made without re-encoding leaves the stream's records right and the index
+wrong. Whatever cuts or joins a file drops the index or rebuilds it from the
+stream.
 
 - **MP4 and its relatives:** a top-level `uuid` box whose extended type is this
   format's UUID and whose content is the index. Players ignore boxes they do
-  not know. Placing it at the end of the file moves nothing else.
-- **Matroska:** an attachment with the MIME type `application/x-ffrwd-index`
-  and the file name `ffrwd-index.bin`.
+  not know. Placing it at the end of the file moves nothing else. In a
+  fragmented file that ends with an `mfra` box it goes before the `mfra`, whose
+  last four bytes have to stay the file's last.
+- **Matroska:** an attachment with the MIME type `application/x-ffrwd-index`,
+  which is what a reader looks for, taking the first if there are several. A
+  writer names it `ffrwd-index.bin`.
 
 A live writer produces no index.
 
