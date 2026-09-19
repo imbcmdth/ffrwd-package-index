@@ -163,24 +163,8 @@ impl<'a> Bytes<'a> {
         Self { data, at: 0 }
     }
 
-    /// A walk over part of what is in hand.
-    pub fn at(data: &'a [u8], at: usize) -> Self {
-        Self {
-            data,
-            at: at.min(data.len()),
-        }
-    }
-
-    pub fn position(&self) -> usize {
-        self.at
-    }
-
     pub fn left(&self) -> usize {
         self.data.len().saturating_sub(self.at)
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.left() == 0
     }
 
     pub fn take(&mut self, count: usize) -> Result<&'a [u8]> {
@@ -208,11 +192,6 @@ impl<'a> Bytes<'a> {
 
     pub fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
-    }
-
-    pub fn u16(&mut self) -> Result<u16> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
     pub fn u32(&mut self) -> Result<u32> {

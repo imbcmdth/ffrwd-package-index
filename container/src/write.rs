@@ -76,14 +76,6 @@ pub enum Placed {
     BeforeMfra { at: u64, moved: u64 },
 }
 
-impl Placed {
-    pub fn at(self) -> u64 {
-        match self {
-            Placed::Appended { at } | Placed::Replaced { at } | Placed::BeforeMfra { at, .. } => at,
-        }
-    }
-}
-
 /// How much of an `mfra` this will hold in memory to write it again.
 const MAX_MFRA: u64 = 16 << 20;
 

@@ -95,11 +95,6 @@ impl BoxHeader {
     pub fn body_len(&self) -> u64 {
         self.end.saturating_sub(self.body)
     }
-
-    /// The four characters, for a message a person reads.
-    pub fn name(&self) -> String {
-        String::from_utf8_lossy(&self.kind).to_string()
-    }
 }
 
 /// The header of the box at `at`, or `None` when `limit` leaves no room
