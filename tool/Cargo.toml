@@ -9,8 +9,9 @@ license = "Apache-2.0"
 name = "ffrwd-index"
 path = "src/main.rs"
 
-# Nothing fetched: `core` is the codec and `rows` is the JSON, and both
-# are in this workspace.
+# Nothing fetched: `core` is the codec, `rows` is the JSON and
+# `container` is MP4 and Matroska, and all three are in this workspace.
 [dependencies]
+ffrwd-index-container = { path = "../container" }
 ffrwd-index-core = { path = "../core" }
 ffrwd-index-rows = { path = "../rows" }

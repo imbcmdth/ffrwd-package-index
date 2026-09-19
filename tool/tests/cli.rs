@@ -418,7 +418,7 @@ fn the_tool_says_what_it_will_not_do() {
             ],
             "nothing.h264",
         ),
-        (vec!["read"], "wants --video or --index"),
+        (vec!["read"], "wants --video, --mp4, --mkv or --index"),
         (vec!["read", "--video", "a.mov"], "does not name its codec"),
         (vec!["read", "--index", "nothing.ffix"], "nothing.ffix"),
         (

@@ -1,18 +1,26 @@
 # ffrwd-index
 
-A command line over `ffrwd-index-core` and `ffrwd-index-rows`: it puts
-vectors into a video's own elementary stream and takes them back out.
-The rows below are read by the same code the `weave` module reads its
-spaces and vectors with, so a space declared to one means the same thing
-to the other.
+A command line over `ffrwd-index-core`, `ffrwd-index-rows` and
+`ffrwd-index-container`: it puts vectors into a video's own elementary
+stream and takes them back out, out of a file as well as out of a
+stream. The rows below are read by the same code the `weave` module
+reads its spaces and vectors with, so a space declared to one means the
+same thing to the other.
 
 ```
 ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                   [--placement keyframe|next|spread:BYTES]
-                  [--escapes N] [--fps N] [--codec h264|h265]
+                  [--escapes N] [--fps N] [--codec h264|h265|av1]
 
-ffrwd-index read  --video IN [--fps N] [--codec h264|h265] [--index OUT.ffix]
-ffrwd-index read  --index IN.ffix
+ffrwd-index read  --video IN [--fps N] [--codec h264|h265|av1]
+                  [--index OUT.ffix]
+
+ffrwd-index read  --mp4 IN.mp4 [--scan keyframes|all] [--index OUT.ffix]
+ffrwd-index read  --mkv IN.mkv [--scan keyframes|all] [--index OUT.ffix]
+
+ffrwd-index read  --index IN.ffix | IN.mp4 | IN.mkv
+
+ffrwd-index index FILE [--scan all|keyframes] [--rewrite] [--out OUT]
 ```
 
 The format is [SPEC.md](../SPEC.md). Nothing here is specific to one
@@ -22,15 +30,41 @@ whatever it is given.
 
 ## What it takes
 
-H.264 and HEVC **Annex B elementary streams**, in and out. MP4 and
-Matroska are the next pass, not this one; ffmpeg converts either way
-without touching the picture:
+**Writing** is elementary streams: H.264 and HEVC Annex B, and AV1 as
+low-overhead OBUs. ffmpeg converts either way without touching the
+picture, so weaving into a file is three commands:
 
 ```
-ffmpeg -i in.mp4  -c copy -bsf:v h264_mp4toannexb -f h264 in.h264
-ffmpeg -i in.mkv  -c copy -bsf:v hevc_mp4toannexb -f hevc in.h265
+ffmpeg -i in.mp4 -c copy -bsf:v h264_mp4toannexb -f h264 in.h264
+ffrwd-index weave --video in.h264 --vectors rows.ndjson --out out.h264
 ffmpeg -i out.h264 -c copy -f mp4 out.mp4
 ```
+
+`hevc_mp4toannexb` is the filter for HEVC and AV1 needs none: its
+samples are the same OBUs in a file and out of one. `-f obu` is the
+elementary stream.
+
+**Reading** is those, and MP4 and Matroska natively. `read --mp4` and
+`read --mkv` open the file themselves: they find the video track, work
+out where every sample is and when it is shown, and read the front of
+the samples they need. ISO base media files work fragmented and not,
+`+faststart` or not; Matroska and WebM work with or without `Cues` and
+with a segment whose length was never written, which is what a live
+writer leaves behind.
+
+**MPEG-TS is out of scope.** A transport stream is a different problem
+from a file: it has no sample table to read, the elementary stream is
+cut into 188-byte packets with headers through the middle of every NAL,
+and the PCR is a clock rather than a timestamp per picture. The records
+survive it, as section 10 of the spec says, and ffmpeg takes the stream
+back out in one line:
+
+```
+ffmpeg -i in.ts -c copy -bsf:v h264_mp4toannexb -f h264 in.h264
+ffrwd-index read --video in.h264
+```
+
+### Which clock a span is on
 
 An elementary stream carries no timestamps, so `--fps` (30 by default)
 is what gives each access unit a presentation time: the access unit at
@@ -40,7 +74,57 @@ B-frames that time is not the container's presentation time, which is
 another reason the spans in the stream are offsets from the frame they
 ride on and never absolute times.
 
-AV1 is in the library but not yet in the tool.
+A container does carry timestamps, and `read --mp4` and `read --mkv`
+use them: `carrier_ms` is the presentation time ffprobe prints for that
+packet, edit list and all, and the spans are that plus the offsets on
+the wire. So the same records read out of a file and out of the
+elementary stream inside it agree about every span's length and about
+where it sits relative to its picture, and may disagree about the
+absolute number, because one of the two readers knows what time it is
+and the other was told a frame rate.
+
+One case where that costs something. A record under `spread` is doled
+out over several carriers, and section 4 has each of its messages name
+the same span from its own carrier; a reader refuses two that disagree.
+Weaving `spread` into an elementary stream computes those offsets
+against `--fps` and decode order, so they only still agree in a file
+whose presentation times are a frame apart in decode order. H.264 and
+HEVC remuxed from Annex B are: ffmpeg hands such a stream exactly that
+clock. An AV1 stream is not, because an encoder codes several frames in
+one temporal unit and shows them later with `show_existing_frame`. The
+reader then keeps the planes that agreed, says on stderr how many
+messages it could not use, and the record comes back coarser rather
+than wrong. `keyframe` and `next` put a whole record on one carrier and
+have nothing to disagree with.
+
+### What a scan costs
+
+`--scan keyframes` (the default for `read`) looks at sync samples
+alone, which is where section 7's `keyframe` policy puts every record.
+`--scan all` looks at every sample, which `next` and `spread` need.
+Either way only the leading NAL units or OBUs of a sample are read, up
+to the first coded slice or frame OBU, because that is where a unit
+goes. Each read says on stderr what it cost:
+
+```
+big.mp4: scan keyframes: 14 of 300 samples, 9317 of 15564590 bytes read
+  (0.06% of the file), 18 seeks
+big.mp4: scan all: 300 of 300 samples, 82533 of 15564590 bytes read
+  (0.53% of the file), 304 seeks
+```
+
+Ten seconds of 640x360 with noise over it, fourteen sync samples, six
+records. A keyframe scan of it reads a sixteen-hundredth of the file,
+a full scan a two-hundredth, and reading the index instead is 4422
+bytes in three seeks. That ratio is the point of the `keyframe` policy,
+and printing it is how a claim about it stays a measurement.
+
+Matroska costs more seeks for the same bytes: an MP4 has a sample table
+that says where everything is, and a Matroska file has to be walked
+block by block, which is one small read at each. The same file as
+`big.mkv` is 8152 bytes in 96 seeks for the keyframe scan, since its
+`Cues` say which clusters to go to, and 89802 bytes in 653 seeks for
+the full one.
 
 ## The rows
 
@@ -140,8 +224,93 @@ A record whose sign plane never arrived, because the stream was cut
 before it, is counted on stderr rather than printed: there is nothing
 to reconstruct it from yet.
 
-`read --index file.ffix` prints the same rows with a `time_ms` on each,
-which is the index's own record of the carrier's time.
+`read --index` prints the same rows with a `time_ms` on each, which is
+the index's own record of the carrier's time. It takes an index on its
+own, `file.ffix`, or the file carrying one, `file.mp4` or `file.mkv`,
+and works out which from the first bytes.
+
+## The file index
+
+Section 8's copy of the messages at the container level, so that
+searching a file is one read instead of a scan. It is derived and never
+authoritative: a file without one loses nothing but speed, and
+`ffrwd-index index` builds it again whenever it is gone.
+
+```
+ffrwd-index index out.mp4
+ffrwd-index index out.mkv --out indexed.mkv
+ffrwd-index read  --index out.mp4
+```
+
+`index` scans every sample by default, not the sync samples alone: an
+index built from half a file would be an index that quietly lies, and
+the one command whose job is to be complete should be. `--scan
+keyframes` is allowed for a file written under the `keyframe` policy,
+where it is the same answer for a fiftieth of the reads.
+
+### MP4
+
+The index goes in a top-level `uuid` box with this format's extended
+type, appended to the end of the file. Nothing else moves: the `moov`
+and the `mdat` stay where they are, the pictures are the same bytes,
+and writing it costs one append whatever the file's size. Reading it
+back is one read near the end of the file, and only if that misses are
+the top-level boxes walked.
+
+Checked against real ffmpeg, on a plain file, a `+faststart` file and a
+fragmented one: `framemd5` is unchanged to the byte, `ffprobe` at
+warning level says exactly what it said before, and a seek into the
+fragmented file still works.
+
+- **A file that already has one.** When our box is last it is cut off
+  and written again, so a file does not grow an index a read. When it
+  is not last, the file has to be copied without it, and that is
+  refused until `--rewrite` asks for it, because a copy is not what
+  "in place" promised.
+- **A fragmented file.** Its last box is usually `mfra`, whose `mfro`
+  child is a copy of `mfra`'s own size, put last so that the last four
+  bytes of the file find it. Appending past the `mfra` leaves those
+  four bytes pointing at an index instead. ffmpeg 9 does not mind, as
+  it builds the fragment index by walking the file, but a reader that
+  uses `mfro` is not wrong to, so the box goes in **front of** the
+  `mfra` and the `mfra` is written again after it. That costs the
+  `mfra`'s own length, sixteen bytes a fragment, and moves nothing
+  anything points at: the offsets inside `tfra` name the `moof` boxes,
+  and those are all before the `mfra` already.
+- **A remux drops it.** `ffmpeg -i indexed.mp4 -c copy out.mp4` writes
+  the boxes it knows and ours is not one of them, so the box is gone
+  from the copy. That is expected and it costs nothing: the records
+  themselves rode inside the pictures' own access units and are still
+  there, and `ffrwd-index index out.mp4` builds the box again from
+  them. That is what section 8 means by derived.
+
+### Matroska
+
+Reading an attachment is native: `read --index file.mkv` finds the
+`AttachedFile` whose MIME type is `application/x-ffrwd-index` or whose
+name is `ffrwd-index.bin` and prints from it.
+
+**Writing one needs ffmpeg**, which is why `index file.mkv` wants an
+`--out`. A Matroska attachment is not an append. It lives inside the
+`Segment`, so the segment's own length changes; the `SeekHead` at the
+front of the file names its children by position, and every position
+after the attachment moves; and a file whose `Cues` sit at the end has
+those positions in it too. Writing one means rewriting the segment,
+which is a muxer, and ffmpeg is already a muxer this workspace tests
+against. So the tool builds the index natively, writes it to a
+temporary file and runs:
+
+```
+ffmpeg -i in.mkv -map 0 -c copy -attach idx \
+  -metadata:s:t mimetype=application/x-ffrwd-index \
+  -metadata:s:t filename=ffrwd-index.bin out.mkv
+```
+
+`-metadata:s:t` is the spelling that reaches the attachment stream, and
+it is what puts `FileMimeType` and `FileName` where section 8 says they
+go. The tests read the result back natively to prove it. ffmpeg not
+being on the PATH is a refusal saying so, and nothing else in the tool
+needs it.
 
 ## Placement
 
@@ -164,11 +333,17 @@ it carries the declarations.
 
 Records that never meet a carrier the policy would choose, a record
 whose span ends after the last keyframe for instance, go on the last
-access unit rather than being dropped.
+access unit rather than being dropped. That last access unit is usually
+not a sync sample, so `read --scan keyframes` will not find such a
+record and `--scan all` will. A file long enough for every record's
+span to end before its last keyframe has none of them.
 
 ## What it writes
 
-The output is the input with SEI NAL units added and nothing else
-moved: the picture is untouched, byte for byte, and a player that has
-never heard of this format plays the file exactly as before. The
-`core` tests prove that against ffmpeg with `-f framemd5`.
+`weave` writes the input with SEI NAL units or metadata OBUs added and
+nothing else moved: the picture is untouched, byte for byte, and a
+player that has never heard of this format plays the file exactly as
+before. The `core` tests prove that against ffmpeg with `-f framemd5`.
+
+`index` writes one box on the end of an MP4 and touches nothing else,
+which the container tests prove the same way.

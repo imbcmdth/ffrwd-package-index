@@ -1,20 +1,29 @@
-//! Weave vectors into an elementary stream, and read them back.
+//! Weave vectors into a video stream, and read them back out of one.
 //!
-//! The tool is a thin native shell over `ffrwd-index-core`: it reads
-//! files, turns rows of JSON into records, and prints records back as
-//! rows of JSON. Every decision about bytes is the library's.
+//! The tool is a thin native shell over `ffrwd-index-core`,
+//! `ffrwd-index-rows` and `ffrwd-index-container`: it reads files,
+//! turns rows of JSON into records, and prints records back as rows of
+//! JSON. Every decision about bytes is a library's.
 //!
-//! Only Annex B elementary streams are handled here. MP4 and Matroska
-//! are the next pass; ffmpeg converts either way with `-c copy` and the
-//! bitstream filters, which `README.md` spells out.
+//! Two ways in. `--video` is an Annex B elementary stream or a raw AV1
+//! OBU stream, which carries no timestamps, so `--fps` is what gives
+//! each access unit a presentation time. `--mp4` and `--mkv` are the
+//! containers, which carry their own, and which this reads natively:
+//! the sample tables say where every sample is and when it is shown,
+//! and only the front of each sample is read, because that is where
+//! section 7 puts a unit.
 
 use std::collections::BTreeMap;
+
 use std::path::Path;
 
+use ffrwd_index_container::scan::{carriages, Scan};
+use ffrwd_index_container::{mkv, mp4, write, Kind, Source, Tally, VideoTrack};
 use ffrwd_index_core::assemble::{Assembler, Limits, Record};
 use ffrwd_index_core::avc::{self, Codec};
-use ffrwd_index_core::index::FileIndex;
+use ffrwd_index_core::index::{FileIndex, MATROSKA_FILE_NAME, MATROSKA_MIME};
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody, VectorRecord};
+use ffrwd_index_core::obu;
 use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
 use ffrwd_index_core::quant::{f16_to_f32, Planes};
 use ffrwd_index_rows::json::{float, number, object, Json};
@@ -22,23 +31,40 @@ use ffrwd_index_rows::space::{read_space, space_row};
 use ffrwd_index_rows::vector::{bodies, plane_numbers, read_values};
 
 const USAGE: &str = "\
-ffrwd-index: embedding vectors in a video's own elementary stream.
+ffrwd-index: embedding vectors in a video's own stream.
 
     ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                       [--placement keyframe|next|spread:BYTES]
-                      [--escapes N] [--fps N] [--codec h264|h265]
+                      [--escapes N] [--fps N] [--codec h264|h265|av1]
 
-    ffrwd-index read  --video IN [--fps N] [--codec h264|h265]
+    ffrwd-index read  --video IN [--fps N] [--codec h264|h265|av1]
                       [--index OUT.ffix]
 
-    ffrwd-index read  --index IN.ffix
+    ffrwd-index read  --mp4 IN.mp4 [--scan keyframes|all] [--index OUT.ffix]
+    ffrwd-index read  --mkv IN.mkv [--scan keyframes|all] [--index OUT.ffix]
 
-IN and OUT are H.264 or HEVC Annex B elementary streams; the codec is
-taken from the file name unless --codec says otherwise. An elementary
-stream carries no timestamps, so --fps (30 by default) is what gives
-each access unit a presentation time. --escapes (2 by default, 16 at
-most) is how many of a vector's largest components an i8 space sends
-exactly rather than quantized.
+    ffrwd-index read  --index IN.ffix | IN.mp4 | IN.mkv
+
+    ffrwd-index index FILE [--scan all|keyframes] [--rewrite] [--out OUT]
+
+--video is an H.264 or HEVC Annex B elementary stream or a raw AV1 OBU
+stream; the codec is taken from the file name unless --codec says
+otherwise. Such a stream carries no timestamps, so --fps (30 by
+default) is what gives each access unit a presentation time.
+
+--mp4 and --mkv are read natively, with their own timestamps. --scan
+keyframes (the default for read) looks at sync samples alone, which is
+where the keyframe placement puts every record; --scan all looks at
+every sample, which next and spread need. How much of the file that
+cost is printed on stderr.
+
+index builds the file index of SPEC.md section 8 and puts it in the
+file: a uuid box appended to an MP4, or, for Matroska, an attachment
+written by ffmpeg into --out. It scans every sample by default so that
+no record is missed.
+
+--escapes (2 by default, 16 at most) is how many of a vector's largest
+components an i8 space sends exactly rather than quantized.
 
 The row shapes are in tool/README.md.";
 
@@ -54,6 +80,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("weave") => weave(&args[1..]),
         Some("read") => read(&args[1..]),
+        Some("index") => index(&args[1..]),
         None | Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())
@@ -114,13 +141,21 @@ impl Flags {
     }
 }
 
+/// Which elementary stream a `--video` file is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stream {
+    Nal(Codec),
+    Av1,
+}
+
 /// The codec of a file, by its name or by what the caller said.
-fn codec_of(path: &str, named: Option<&str>) -> Result<Codec, String> {
+fn codec_of(path: &str, named: Option<&str>) -> Result<Stream, String> {
     if let Some(named) = named {
         return match named {
-            "h264" | "avc" => Ok(Codec::H264),
-            "h265" | "hevc" => Ok(Codec::H265),
-            other => Err(format!("{other} is not h264 or h265")),
+            "h264" | "avc" => Ok(Stream::Nal(Codec::H264)),
+            "h265" | "hevc" => Ok(Stream::Nal(Codec::H265)),
+            "av1" | "obu" => Ok(Stream::Av1),
+            other => Err(format!("{other} is not h264, h265 or av1")),
         };
     }
     let extension = Path::new(path)
@@ -129,10 +164,11 @@ fn codec_of(path: &str, named: Option<&str>) -> Result<Codec, String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
-        "h264" | "264" | "avc" => Ok(Codec::H264),
-        "h265" | "265" | "hevc" => Ok(Codec::H265),
+        "h264" | "264" | "avc" => Ok(Stream::Nal(Codec::H264)),
+        "h265" | "265" | "hevc" => Ok(Stream::Nal(Codec::H265)),
+        "obu" | "av1" => Ok(Stream::Av1),
         _ => Err(format!(
-            "{path} does not name its codec. Pass --codec h264 or --codec h265"
+            "{path} does not name its codec. Pass --codec h264, --codec h265 or --codec av1"
         )),
     }
 }
@@ -169,6 +205,14 @@ fn escapes_of(flags: &Flags) -> Result<usize, String> {
     Ok(value)
 }
 
+/// Which samples a container read visits.
+fn scan_of(flags: &Flags, fallback: Scan) -> Result<Scan, String> {
+    match flags.get("scan") {
+        None => Ok(fallback),
+        Some(text) => Scan::parse(text).ok_or_else(|| format!("{text} is not keyframes or all")),
+    }
+}
+
 /// The presentation time of the carrier at `index`.
 fn pts_ms(index: usize, fps: f64) -> i64 {
     (index as f64 * 1000.0 / fps).round() as i64
@@ -185,6 +229,71 @@ fn placement_of(text: &str) -> Result<Placement, String> {
                 .map_err(|_| format!("{budget} is not a number of bytes")),
             None => Err(format!("{other} is not keyframe, next or spread:BYTES")),
         },
+    }
+}
+
+// ---------------------------------------------------------------- //
+// Elementary streams.
+// ---------------------------------------------------------------- //
+
+/// One access unit or temporal unit: where a unit of this format goes
+/// in it, what it holds already, and whether it is a random access
+/// point.
+struct Spot {
+    start: usize,
+    end: usize,
+    insert_at: usize,
+    keyframe: bool,
+    temporal_id_plus1: u8,
+}
+
+/// The carriers of an elementary stream.
+fn spots(stream: &[u8], kind: Stream) -> Result<Vec<Spot>, String> {
+    Ok(match kind {
+        Stream::Nal(codec) => avc::access_units(stream, codec)
+            .into_iter()
+            .map(|unit| Spot {
+                start: unit.start,
+                end: unit.end,
+                insert_at: unit.insert_at,
+                keyframe: unit.keyframe,
+                temporal_id_plus1: unit.temporal_id_plus1,
+            })
+            .collect(),
+        Stream::Av1 => obu::temporal_units(stream)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|unit| Spot {
+                start: unit.start,
+                end: unit.end,
+                insert_at: unit.insert_at,
+                // An AV1 writer repeats the sequence header before
+                // every key frame, which is as close to a sync sample
+                // as a reader gets without decoding a frame header.
+                keyframe: unit.has_sequence_header,
+                temporal_id_plus1: 1,
+            })
+            .collect(),
+    })
+}
+
+/// A unit framed for its codec, ready to splice in at a spot.
+fn framed(kind: Stream, unit: &[u8], temporal_id_plus1: u8) -> Vec<u8> {
+    match kind {
+        Stream::Nal(codec) => {
+            let mut out = vec![0, 0, 0, 1];
+            out.extend_from_slice(&avc::wrap_unit_at(unit, codec, temporal_id_plus1));
+            out
+        }
+        Stream::Av1 => obu::write_metadata_obu(unit),
+    }
+}
+
+/// Every unit of this format in one carrier's bytes.
+fn units_in(bytes: &[u8], kind: Stream) -> Vec<Vec<u8>> {
+    match kind {
+        Stream::Nal(codec) => avc::units_annexb(bytes, codec),
+        Stream::Av1 => obu::units_obu(bytes),
     }
 }
 
@@ -206,7 +315,7 @@ fn weave(args: &[String]) -> Result<(), String> {
     let video = flags.need("video")?;
     let vectors = flags.need("vectors")?;
     let out = flags.need("out")?;
-    let codec = codec_of(video, flags.get("codec"))?;
+    let kind = codec_of(video, flags.get("codec"))?;
     let fps = fps_of(&flags)?;
     let policy = placement_of(flags.get("placement").unwrap_or("keyframe"))?;
     let escapes = escapes_of(&flags)?;
@@ -215,7 +324,7 @@ fn weave(args: &[String]) -> Result<(), String> {
     let rows = std::fs::read_to_string(vectors).map_err(|err| format!("{vectors}: {err}"))?;
     let (spaces, records) = read_rows(&rows, escapes)?;
 
-    let units = avc::access_units(&stream, codec);
+    let units = spots(&stream, kind)?;
     if units.is_empty() {
         return Err(format!("{video} holds no access units"));
     }
@@ -238,8 +347,7 @@ fn weave(args: &[String]) -> Result<(), String> {
         }
         let bytes = Unit::new(messages.clone()).encode();
         woven.extend_from_slice(&stream[at..unit.insert_at]);
-        woven.extend_from_slice(&[0, 0, 0, 1]);
-        woven.extend_from_slice(&avc::wrap_unit_at(&bytes, codec, unit.temporal_id_plus1));
+        woven.extend_from_slice(&framed(kind, &bytes, unit.temporal_id_plus1));
         at = unit.insert_at;
         written += 1;
     }
@@ -344,19 +452,123 @@ fn read_vector(
 
 fn read(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args)?;
-    flags.only(&["video", "fps", "codec", "index"])?;
-    match (flags.get("video"), flags.get("index")) {
-        (None, Some(path)) => dump_index(path),
-        (None, None) => Err("read wants --video or --index".into()),
-        (Some(video), index) => read_stream(&flags, video, index),
+    flags.only(&["video", "mp4", "mkv", "fps", "codec", "scan", "index"])?;
+    let named = ["video", "mp4", "mkv"]
+        .iter()
+        .filter(|name| flags.get(name).is_some())
+        .count();
+    if named > 1 {
+        return Err("read takes one of --video, --mp4 and --mkv".into());
+    }
+    let sidecar = flags.get("index");
+    match (flags.get("video"), flags.get("mp4"), flags.get("mkv")) {
+        (Some(video), _, _) => read_stream(&flags, video, sidecar),
+        (_, Some(file), _) => read_container(&flags, file, Some(Kind::Mp4), sidecar),
+        (_, _, Some(file)) => read_container(&flags, file, Some(Kind::Matroska), sidecar),
+        (None, None, None) => match sidecar {
+            Some(path) => dump_index(path),
+            None => Err("read wants --video, --mp4, --mkv or --index".into()),
+        },
     }
 }
 
+/// One carrier of whatever kind: when it was shown, and the units of
+/// this format that rode on it.
+struct Carried {
+    time_ms: i64,
+    units: Vec<Vec<u8>>,
+}
+
 fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), String> {
-    let codec = codec_of(video, flags.get("codec"))?;
+    let kind = codec_of(video, flags.get("codec"))?;
     let fps = fps_of(flags)?;
     let stream = std::fs::read(video).map_err(|err| format!("{video}: {err}"))?;
+    let carried: Vec<Carried> = spots(&stream, kind)?
+        .iter()
+        .enumerate()
+        .map(|(index, spot)| Carried {
+            time_ms: pts_ms(index, fps),
+            units: units_in(&stream[spot.start..spot.end], kind),
+        })
+        .collect();
+    report(&carried, video, index)
+}
 
+fn read_container(
+    flags: &Flags,
+    path: &str,
+    kind: Option<Kind>,
+    index: Option<&str>,
+) -> Result<(), String> {
+    let scan = scan_of(flags, Scan::Keyframes)?;
+    let file = std::fs::File::open(path).map_err(|err| format!("{path}: {err}"))?;
+    let mut src = Source::new(file).map_err(|err| format!("{path}: {err}"))?;
+    let (track, carried) = walk(&mut src, kind, scan).map_err(|err| format!("{path}: {err}"))?;
+    let tally = src.tally();
+    report(&carried, path, index)?;
+    eprintln!("{path}: {}", accounting(&track, &carried, scan, tally));
+    Ok(())
+}
+
+/// The track and its carriers, whichever container the file is.
+fn walk<R: std::io::Read + std::io::Seek>(
+    src: &mut Source<R>,
+    kind: Option<Kind>,
+    scan: Scan,
+) -> Result<(VideoTrack, Vec<Carried>), ffrwd_index_container::Error> {
+    // What the file says it is decides, even when a flag named a
+    // container: a `--mp4` pointed at an elementary stream should hear
+    // that rather than a complaint about a box.
+    let found = ffrwd_index_container::kind_of(src)?;
+    if kind.is_some_and(|wanted| wanted != found) {
+        return Err(ffrwd_index_container::Error::Unsupported(format!(
+            "the file is {}, not {}",
+            name_of(found),
+            name_of(kind.unwrap_or(found))
+        )));
+    }
+    let kind = found;
+    let track = match kind {
+        Kind::Mp4 => mp4::read(src)?,
+        Kind::Matroska => mkv::read(src, scan)?,
+    };
+    let carried = carriages(src, &track, scan)?
+        .into_iter()
+        .map(|carriage| Carried {
+            time_ms: carriage.pts_ms,
+            units: carriage.units,
+        })
+        .collect();
+    Ok((track, carried))
+}
+
+fn name_of(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Mp4 => "an ISO base media file",
+        Kind::Matroska => "a Matroska file",
+    }
+}
+
+/// The line a container read prints on stderr.
+///
+/// The ratio is the point: section 7's `keyframe` policy exists so that
+/// reading a file's records is not reading the file.
+fn accounting(track: &VideoTrack, carried: &[Carried], scan: Scan, tally: Tally) -> String {
+    format!(
+        "scan {}: {} of {} samples, {} of {} bytes read ({:.2}% of the file), {} seeks",
+        scan.name(),
+        carried.len(),
+        track.samples.len(),
+        tally.bytes_read,
+        tally.len,
+        tally.share(),
+        tally.seeks,
+    )
+}
+
+/// The spaces and records of a set of carriers, printed, and the index
+/// written beside them if one was asked for.
+fn report(carried: &[Carried], name: &str, index: Option<&str>) -> Result<(), String> {
     let mut assembler = Assembler::new(Limits {
         // A file is read whole, so the ceilings are the ones a file
         // reader wants rather than a live reader's.
@@ -365,10 +577,9 @@ fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), St
         orphan_wait_ms: i64::MAX,
     });
     let mut spaces: Vec<(u32, Space)> = Vec::new();
-    for (index, unit) in avc::access_units(&stream, codec).iter().enumerate() {
-        let time = pts_ms(index, fps);
-        for bytes in avc::units_annexb(&stream[unit.start..unit.end], codec) {
-            let unit = match Unit::decode(&bytes) {
+    for carrier in carried {
+        for bytes in &carrier.units {
+            let unit = match Unit::decode(bytes) {
                 Ok(unit) => unit,
                 // A unit of a version this build does not know is not
                 // an error: it is somebody ahead of us.
@@ -376,10 +587,10 @@ fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), St
             };
             for message in &unit.messages {
                 if let Message::Space(space) = message {
-                    spaces.push((time as u32, space.clone()));
+                    spaces.push((carrier.time_ms.max(0) as u32, space.clone()));
                 }
             }
-            assembler.push_unit(time, &unit);
+            assembler.push_unit(carrier.time_ms, &unit);
         }
     }
 
@@ -409,48 +620,94 @@ fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), St
     print!("{out}");
 
     if let Some(path) = index {
-        // Section 8 holds SPACE and VECTOR messages only, so what goes
-        // in is the records as the assembler put them back together,
-        // each against the carrier its first message rode.
-        let mut pairs: Vec<(u32, Message)> = spaces
-            .into_iter()
-            .map(|(time, space)| (time, Message::Space(space)))
-            .collect();
-        for record in &records {
-            if record.values().is_err() {
-                continue;
-            }
-            pairs.push((
-                record.carrier_ms.max(0) as u32,
-                Message::Vector(VectorRecord {
-                    space_id: record.space.space_id,
-                    record_id: record.record_id,
-                    start_off: offset(record.start_ms - record.carrier_ms)?,
-                    end_off: offset(record.end_ms - record.carrier_ms)?,
-                    body: record.body.encode(),
-                }),
-            ));
-        }
-        pairs.sort_by_key(|(time, message)| (*time, message.kind()));
-        let built = FileIndex::build(pairs);
+        let built = build_index(&spaces, &records)?;
         std::fs::write(path, built.encode()).map_err(|err| format!("{path}: {err}"))?;
         eprintln!("{path}: {} entries", built.entries.len());
     }
     if assembler.dropped() > 0 {
         eprintln!(
-            "{video}: {} messages were dropped as unreadable",
+            "{name}: {} messages were dropped as unreadable",
             assembler.dropped()
         );
     }
     if unreadable > 0 {
-        eprintln!("{video}: {unreadable} records never got their plane 0");
+        eprintln!("{name}: {unreadable} records never got their plane 0");
     }
     Ok(())
 }
 
+/// Section 8's index, from what a read found.
+///
+/// It holds SPACE and VECTOR messages only, so what goes in is the
+/// records as the assembler put them back together, each against the
+/// carrier its first message rode.
+fn build_index(spaces: &[(u32, Space)], records: &[Record]) -> Result<FileIndex, String> {
+    let mut pairs: Vec<(u32, Message)> = spaces
+        .iter()
+        .map(|(time, space)| (*time, Message::Space(space.clone())))
+        .collect();
+    for record in records {
+        if record.values().is_err() {
+            continue;
+        }
+        pairs.push((
+            record.carrier_ms.max(0) as u32,
+            Message::Vector(VectorRecord {
+                space_id: record.space.space_id,
+                record_id: record.record_id,
+                start_off: offset(record.start_ms - record.carrier_ms)?,
+                end_off: offset(record.end_ms - record.carrier_ms)?,
+                body: record.body.encode(),
+            }),
+        ));
+    }
+    pairs.sort_by_key(|(time, message)| (*time, message.kind()));
+    Ok(FileIndex::build(pairs))
+}
+
+/// `read --index`, which takes a bare index or a file carrying one.
+///
+/// An index of its own opens with `FFIX`; anything else is a container,
+/// and the first bytes say which.
 fn dump_index(path: &str) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|err| format!("{path}: {err}"))?;
-    let index = FileIndex::parse(&bytes).map_err(|err| format!("{path}: {err}"))?;
+    let head = read_head(path)?;
+    let bytes = if head.starts_with(&ffrwd_index_core::index::MAGIC) {
+        std::fs::read(path).map_err(|err| format!("{path}: {err}"))?
+    } else {
+        let file = std::fs::File::open(path).map_err(|err| format!("{path}: {err}"))?;
+        let mut src = Source::new(file).map_err(|err| format!("{path}: {err}"))?;
+        let kind =
+            ffrwd_index_container::kind_of(&mut src).map_err(|err| format!("{path}: {err}"))?;
+        let found = match kind {
+            Kind::Mp4 => mp4::read_index(&mut src),
+            Kind::Matroska => mkv::read_index(&mut src),
+        }
+        .map_err(|err| format!("{path}: {err}"))?;
+        let tally = src.tally();
+        eprintln!(
+            "{path}: the index came out of {} bytes read in {} seeks",
+            tally.bytes_read, tally.seeks
+        );
+        found.ok_or_else(|| format!("{path} carries no index of this format"))?
+    };
+    print_index(
+        path,
+        &FileIndex::parse(&bytes).map_err(|err| format!("{path}: {err}"))?,
+    )
+}
+
+fn read_head(path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| format!("{path}: {err}"))?;
+    let mut head = vec![0u8; 8];
+    let got = file
+        .read(&mut head)
+        .map_err(|err| format!("{path}: {err}"))?;
+    head.truncate(got);
+    Ok(head)
+}
+
+fn print_index(path: &str, index: &FileIndex) -> Result<(), String> {
     let mut spaces: BTreeMap<u8, Space> = BTreeMap::new();
     let mut out = String::new();
     for entry in &index.entries {
@@ -506,6 +763,177 @@ fn dump_index(path: &str) -> Result<(), String> {
     }
     print!("{out}");
     Ok(())
+}
+
+// ---------------------------------------------------------------- //
+// index.
+// ---------------------------------------------------------------- //
+
+/// `index FILE`: scan the file, build section 8's index, and put it in.
+///
+/// The default scan is every sample, not the sync samples alone: an
+/// index built from half a file would be an index that quietly lies,
+/// and the one command whose job is to be complete should be.
+fn index(args: &[String]) -> Result<(), String> {
+    let (file, rest) = match args.first() {
+        Some(first) if !first.starts_with("--") => (first.as_str(), &args[1..]),
+        _ => return Err("index wants a file to put an index into".into()),
+    };
+    // `--rewrite` is the one flag in this tool that takes no value, so
+    // it is taken out before the pairs are read rather than making
+    // every other flag's parsing answer for it.
+    let rewrite = rest.iter().any(|arg| arg == "--rewrite");
+    let rest: Vec<String> = rest
+        .iter()
+        .filter(|arg| *arg != "--rewrite")
+        .cloned()
+        .collect();
+    let flags = Flags::parse(&rest)?;
+    flags.only(&["scan", "out"])?;
+    let scan = scan_of(&flags, Scan::All)?;
+
+    let handle = std::fs::File::open(file).map_err(|err| format!("{file}: {err}"))?;
+    let mut src = Source::new(handle).map_err(|err| format!("{file}: {err}"))?;
+    let kind = ffrwd_index_container::kind_of(&mut src).map_err(|err| format!("{file}: {err}"))?;
+    let (track, carried) =
+        walk(&mut src, Some(kind), scan).map_err(|err| format!("{file}: {err}"))?;
+    let tally = src.tally();
+    drop(src);
+
+    let (spaces, records) = collect(&carried);
+    let built = build_index(&spaces, &records)?;
+    let bytes = built.encode();
+    eprintln!(
+        "{file}: {}, {} entries in {} bytes of index",
+        accounting(&track, &carried, scan, tally),
+        built.entries.len(),
+        bytes.len()
+    );
+    if built.entries.is_empty() {
+        return Err(format!("{file} carries no records to index"));
+    }
+
+    match kind {
+        Kind::Mp4 => {
+            if flags.get("out").is_some() {
+                return Err("--out belongs to Matroska; an MP4 takes its index in place".into());
+            }
+            install_mp4(file, &bytes, rewrite)
+        }
+        Kind::Matroska => {
+            let out = flags.need("out").map_err(|_| {
+                "a Matroska index is written by ffmpeg into a new file, so --out is needed"
+                    .to_string()
+            })?;
+            if rewrite {
+                return Err(
+                    "--rewrite belongs to MP4; a Matroska index is always a new file".into(),
+                );
+            }
+            attach_mkv(file, out, &bytes)
+        }
+    }
+}
+
+fn install_mp4(file: &str, bytes: &[u8], rewrite: bool) -> Result<(), String> {
+    if rewrite {
+        // A copy without the box that is there, then the new one on the
+        // end of the copy, then the copy in the original's place.
+        let handle = std::fs::File::open(file).map_err(|err| format!("{file}: {err}"))?;
+        let mut src = Source::new(handle).map_err(|err| format!("{file}: {err}"))?;
+        let temporary = format!("{file}.ffrwd-index-rewrite");
+        let mut out =
+            std::fs::File::create(&temporary).map_err(|err| format!("{temporary}: {err}"))?;
+        let done = write::rewrite(&mut src, &mut out, bytes);
+        drop(out);
+        drop(src);
+        if let Err(err) = done {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("{file}: {err}"));
+        }
+        std::fs::rename(&temporary, file).map_err(|err| format!("{file}: {err}"))?;
+        eprintln!("{file}: the file was copied without its old index box and a new one appended");
+        return Ok(());
+    }
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file)
+        .map_err(|err| format!("{file}: {err}"))?;
+    let placed = write::install(handle, bytes).map_err(|err| format!("{file}: {err}"))?;
+    eprintln!(
+        "{file}: {}",
+        match placed {
+            write::Placed::Appended { at } => format!("the index box was appended at byte {at}"),
+            write::Placed::Replaced { at } =>
+                format!("the index box already there was written over, at byte {at}"),
+            write::Placed::BeforeMfra { at, moved } => format!(
+                "the index box went in at byte {at}, in front of the {moved}-byte mfra, \
+                 which was written again after it so that it stays last"
+            ),
+        }
+    );
+    Ok(())
+}
+
+/// Matroska's attachment, through ffmpeg.
+///
+/// Writing one natively means rewriting the segment: the `SeekHead` at
+/// the front names its children by position, every enclosing length
+/// changes, and a length written before the attachment existed has to
+/// be written again. That is a muxer, and ffmpeg is already one.
+fn attach_mkv(file: &str, out: &str, bytes: &[u8]) -> Result<(), String> {
+    let temporary = std::env::temp_dir().join(format!("ffrwd-index-{}.bin", std::process::id()));
+    std::fs::write(&temporary, bytes).map_err(|err| format!("{}: {err}", temporary.display()))?;
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-i"])
+        .arg(file)
+        .args(["-map", "0", "-c", "copy", "-attach"])
+        .arg(&temporary)
+        .args([
+            "-metadata:s:t",
+            &format!("mimetype={MATROSKA_MIME}"),
+            "-metadata:s:t",
+            &format!("filename={MATROSKA_FILE_NAME}"),
+        ])
+        .arg(out)
+        .status();
+    let _ = std::fs::remove_file(&temporary);
+    match status {
+        Ok(status) if status.success() => {
+            eprintln!("{out}: the index was attached by ffmpeg as {MATROSKA_FILE_NAME}");
+            Ok(())
+        }
+        Ok(status) => Err(format!("ffmpeg refused the attachment: {status}")),
+        Err(err) => Err(format!(
+            "a Matroska index needs ffmpeg on the PATH to write the attachment: {err}"
+        )),
+    }
+}
+
+/// The spaces and records a set of carriers holds, for the index.
+fn collect(carried: &[Carried]) -> (Vec<(u32, Space)>, Vec<Record>) {
+    let mut assembler = Assembler::new(Limits {
+        max_records: 1 << 20,
+        max_reassemblies: 4096,
+        orphan_wait_ms: i64::MAX,
+    });
+    let mut spaces: Vec<(u32, Space)> = Vec::new();
+    for carrier in carried {
+        for bytes in &carrier.units {
+            let Ok(unit) = Unit::decode(bytes) else {
+                continue;
+            };
+            for message in &unit.messages {
+                if let Message::Space(space) = message {
+                    spaces.push((carrier.time_ms.max(0) as u32, space.clone()));
+                }
+            }
+            assembler.push_unit(carrier.time_ms, &unit);
+        }
+    }
+    let records = assembler.records();
+    (spaces, records)
 }
 
 fn offset(value: i64) -> Result<i32, String> {
@@ -644,11 +1072,22 @@ mod tests {
 
     #[test]
     fn the_codec_comes_from_the_name_or_the_flag() {
-        assert_eq!(codec_of("a.h264", None).expect("a codec"), Codec::H264);
-        assert_eq!(codec_of("a.265", None).expect("a codec"), Codec::H265);
+        assert_eq!(
+            codec_of("a.h264", None).expect("a codec"),
+            Stream::Nal(Codec::H264)
+        );
+        assert_eq!(
+            codec_of("a.265", None).expect("a codec"),
+            Stream::Nal(Codec::H265)
+        );
+        assert_eq!(codec_of("a.obu", None).expect("a codec"), Stream::Av1);
         assert_eq!(
             codec_of("a.bin", Some("hevc")).expect("a codec"),
-            Codec::H265
+            Stream::Nal(Codec::H265)
+        );
+        assert_eq!(
+            codec_of("a.bin", Some("av1")).expect("a codec"),
+            Stream::Av1
         );
         assert!(codec_of("a.bin", None).is_err());
         assert!(codec_of("a.h264", Some("vp9")).is_err());
@@ -667,6 +1106,16 @@ mod tests {
         );
         assert!(placement_of("spread").is_err());
         assert!(placement_of("spread:lots").is_err());
+    }
+
+    #[test]
+    fn the_scan_flag_reads_its_two_shapes() {
+        let flags = Flags::parse(&["--scan".to_string(), "all".to_string()]).expect("flags");
+        assert_eq!(scan_of(&flags, Scan::Keyframes).expect("a scan"), Scan::All);
+        let none = Flags::parse(&[]).expect("flags");
+        assert_eq!(scan_of(&none, Scan::All).expect("a scan"), Scan::All);
+        let wrong = Flags::parse(&["--scan".to_string(), "some".to_string()]).expect("flags");
+        assert!(scan_of(&wrong, Scan::All).is_err());
     }
 
     #[test]
