@@ -215,9 +215,9 @@ bytes       the rest of the message
 
 The slices of one VECTOR value, reassembled in order, are that value, and its
 `start_off` and `end_off` are relative to the carrier of the slice whose offset
-is 0. A FRAGMENT repeats the record's `space_id` and `record_id`,
-which the sliced value also carries, so a reader can file slices that arrive
-out of order. A reader that misses any slice drops the record. A writer should prefer
+is 0. A FRAGMENT repeats the record's `space_id` and `record_id`, which the
+sliced value also carries, so a reader can file slices that arrive out of
+order. A reader that misses any slice drops the record. A writer should prefer
 whole planes in separate VECTOR messages (section 5) to fragments: a lost
 VECTOR message costs precision, a lost fragment costs the record.
 
@@ -297,12 +297,12 @@ A live writer produces no index.
 
 Every length is checked against the bytes that remain before it is used. `dims`
 above 65536, a `record_id` at or above 65536, more than 16 escapes or an escape
-index at or above `dims`, a string longer than its message,
-a plane set whose data runs past the message, and a FRAGMENT whose `offset`
-plus length exceeds `total` each cost the message they are in: it is dropped,
-and the messages after it in the unit, whose framing is unaffected, are still
-read. That is not the case of section 2, a length that runs past the end of the
-unit, where the framing itself is lost. A reader bounds what it holds for records that never
+index at or above `dims`, a string longer than its message, a plane set whose
+data runs past the message, and a FRAGMENT whose `offset` plus length exceeds
+`total` each cost the message they are in: it is dropped, and the messages
+after it in the unit, whose framing is unaffected, are still read. That is not
+the case of section 2, a length that runs past the end of the unit, where the
+framing itself is lost. A reader bounds what it holds for records that never
 complete and spaces that are never declared. Nothing in a unit is executable,
 and a URI in a SPACE message is a name, not an instruction to fetch.
 
