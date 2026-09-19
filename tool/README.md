@@ -129,6 +129,13 @@ which is the index's own record of the carrier's time.
 every ten seconds, which is what a viewer who joins at any keyframe
 needs.
 
+Use `--live` for a file that may be cut as well. A cut made with
+`ffmpeg -ss ... -c copy` starts at a keyframe and keeps the records of
+the frames it keeps, but a reader of the cut can only read a record
+whose space was declared at or after that keyframe. Ten seconds between
+declarations means a cut can land up to ten seconds of records after
+the last one, and they come out as bytes nobody can read.
+
 Records that never meet a carrier the policy would choose, a record
 whose span ends after the last keyframe for instance, go on the last
 access unit rather than being dropped.
