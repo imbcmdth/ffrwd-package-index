@@ -14,14 +14,14 @@
 //! refuses to do that unless it is asked, because a copy is not what
 //! "in place" promised.
 //!
-//! **A fragmented file.** Its last box is usually `mfra`, whose `mfro`
-//! child is a copy of `mfra`'s own size, placed last so that the last
-//! four bytes of the file find it. Appending past the `mfra` leaves
-//! those four bytes pointing at an index, and a reader that uses them
-//! loses its random access; ffmpeg 9 does not, because it builds the
-//! fragment index by walking the file, but a reader that does is not
-//! wrong to. So the box goes in front of the `mfra` and the `mfra` is
-//! written again after it. That costs the `mfra`'s own length, which is
+//! **A fragmented file.** Section 8 has the box go before an `mfra`,
+//! and the reason is `mfro`: it is a copy of `mfra`'s own size, placed
+//! last so that the last four bytes of the file find it. Appending past
+//! the `mfra` leaves those four bytes pointing at an index, and a reader
+//! that uses them loses its random access; ffmpeg 9 does not, because it
+//! builds the fragment index by walking the file, but a reader that does
+//! is not wrong to. So the box goes in front of the `mfra` and the
+//! `mfra` is written again after it. That costs the `mfra`'s own length, which is
 //! sixteen bytes a fragment, and moves nothing that anything points at:
 //! the offsets inside `tfra` name the `moof` boxes, and they are all
 //! before the `mfra` already.

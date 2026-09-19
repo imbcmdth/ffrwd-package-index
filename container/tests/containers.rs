@@ -437,15 +437,31 @@ fn a_matroska_keyframe_scan_finds_what_a_full_walk_would() {
     skip_without_ffmpeg!();
     for name in ["h264.mkv", "hevc.mkv", "av1.webm", "live.mkv", "big.mkv"] {
         let all = track_of(name, Scan::All);
-        let keys: Vec<i64> = all
+        // Section 7's fast path: the sync samples, and the last sample
+        // of the track, which is where a record with no keyframe left
+        // to ride ends up.
+        let mut wanted: Vec<i64> = all
             .samples
             .iter()
             .filter(|sample| sample.keyframe)
             .map(|sample| sample.pts)
             .collect();
+        let last = all.samples.last().expect("a sample");
+        if !last.keyframe {
+            wanted.push(last.pts);
+        }
         let fast = track_of(name, Scan::Keyframes);
-        let found: Vec<i64> = fast.samples.iter().map(|sample| sample.pts).collect();
-        assert_eq!(found, keys, "{name}: the cues and the walk disagree");
+        let found: Vec<i64> = fast
+            .scanned(Scan::Keyframes)
+            .iter()
+            .map(|sample| sample.pts)
+            .collect();
+        assert_eq!(found, wanted, "{name}: the cues and the walk disagree");
+        // And it really is the same block, not one that happens to be
+        // shown at the same time.
+        let taken = fast.scanned(Scan::Keyframes).pop().expect("a sample");
+        assert_eq!(taken.offset, last.offset, "{name}");
+        assert_eq!(taken.size, last.size, "{name}");
     }
 }
 

@@ -173,15 +173,31 @@ impl VideoTrack {
     }
 
     /// The samples a scan of this mode visits.
+    ///
+    /// The keyframe scan is the sync samples **and the last sample of
+    /// the track**. Section 7: a record whose span ends after the last
+    /// keyframe has no keyframe to ride, so it rides the last access
+    /// unit, and a reader taking the fast path reads that sample as
+    /// well. One sample is what it costs.
     pub fn scanned(&self, scan: Scan) -> Vec<Sample> {
         match scan {
             Scan::All => self.samples.clone(),
-            Scan::Keyframes => self
-                .samples
-                .iter()
-                .copied()
-                .filter(|sample| sample.keyframe)
-                .collect(),
+            Scan::Keyframes => {
+                let mut out: Vec<Sample> = self
+                    .samples
+                    .iter()
+                    .copied()
+                    .filter(|sample| sample.keyframe)
+                    .collect();
+                if let Some(last) = self.samples.last() {
+                    // The samples are in decode order, so the last one
+                    // goes on the end and the order holds.
+                    if out.last().map(|sample| sample.index) != Some(last.index) {
+                        out.push(*last);
+                    }
+                }
+                out
+            }
         }
     }
 }

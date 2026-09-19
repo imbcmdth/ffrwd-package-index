@@ -17,7 +17,10 @@
 //! **Keyframes.** A `SimpleBlock` says so in its flags. A `Block`
 //! inside a `BlockGroup` does not, and the rule there is the format's
 //! own: a block with no `ReferenceBlock` beside it references nothing,
-//! so it is a keyframe.
+//! so it is a keyframe. A keyframe scan's map also carries the track's
+//! last block, keyframe or not, because section 7 puts a record with no
+//! keyframe left to ride on the last access unit. Where `Cues` answered
+//! the rest, finding it is one more cluster walked.
 //!
 //! **Lacing** packs several frames into one block. Video never uses it,
 //! every muxer sets `FlagLacing` to zero for a video track, and
@@ -35,7 +38,7 @@
 use std::io::{Read, Seek};
 
 use ffrwd_index_core::avc::{avcc_length_size, hvcc_length_size};
-use ffrwd_index_core::index::{MATROSKA_FILE_NAME, MATROSKA_MIME};
+use ffrwd_index_core::index::MATROSKA_MIME;
 
 use crate::{Error, Result, Sample, Scan, Source, TrackCodec, VideoTrack};
 
@@ -65,7 +68,6 @@ pub const ID_CUE_TRACK: u32 = 0x0000_00F7;
 pub const ID_CUE_CLUSTER_POSITION: u32 = 0x0000_00F1;
 pub const ID_ATTACHMENTS: u32 = 0x1941_A469;
 pub const ID_ATTACHED_FILE: u32 = 0x0000_61A7;
-pub const ID_FILE_NAME: u32 = 0x0000_466E;
 pub const ID_FILE_MIME_TYPE: u32 = 0x0000_4660;
 pub const ID_FILE_DATA: u32 = 0x0000_465C;
 pub const ID_VOID: u32 = 0x0000_00EC;
@@ -478,6 +480,11 @@ fn block_header(bytes: &[u8]) -> Result<(u64, usize, i64, u8)> {
 /// `stop_after` is the keyframe fast path: once a block at or past that
 /// time has been taken, the rest of the cluster is left unread, because
 /// the cue that asked for it has been answered.
+///
+/// `last` is set to every block of the track the walk passes, whether
+/// or not the filter keeps it, so that a keyframe scan can still find
+/// the track's last sample: section 7 puts a record with no keyframe
+/// left to ride on the last access unit.
 fn walk_cluster<R: Read + Seek>(
     src: &mut Source<R>,
     cluster: Element,
@@ -485,6 +492,7 @@ fn walk_cluster<R: Read + Seek>(
     track: u64,
     keyframes_only: bool,
     stop_after: Option<i64>,
+    last: &mut Option<Sample>,
 ) -> Result<Vec<Sample>> {
     let end = cluster.end_or(limit);
     let mut at = cluster.body;
@@ -526,6 +534,7 @@ fn walk_cluster<R: Read + Seek>(
                         relative,
                         keyframe: flags & 0x80 != 0,
                     };
+                    *last = Some(sample_of(block, timestamp));
                     if !keyframes_only || block.keyframe {
                         out.push(sample_of(block, timestamp));
                     }
@@ -557,6 +566,7 @@ fn walk_cluster<R: Read + Seek>(
                         relative,
                         keyframe,
                     };
+                    *last = Some(sample_of(block, timestamp));
                     if !keyframes_only || keyframe {
                         out.push(sample_of(block, timestamp));
                     }
@@ -663,6 +673,7 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
     };
 
     let mut samples: Vec<Sample> = Vec::new();
+    let mut last: Option<Sample> = None;
     match cues {
         Some(cues) => {
             for (at, time) in cues {
@@ -679,7 +690,18 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
                     info.number,
                     true,
                     Some(time),
+                    &mut last,
                 )?);
+            }
+            // The cues name keyframes, and the last sample of the track
+            // is usually not one, so the last cluster is walked for it.
+            // That is one cluster of block headers, and it is what lets
+            // a keyframe scan find a record that had no keyframe left to
+            // ride. A cue that stopped this walk early leaves `last`
+            // pointing at the wrong block, so it is taken from here.
+            last = None;
+            if let Some(cluster) = map.clusters.last() {
+                walk_cluster(src, *cluster, seg.end, info.number, true, None, &mut last)?;
             }
         }
         None => {
@@ -691,6 +713,7 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
                     info.number,
                     keyframes_only,
                     None,
+                    &mut last,
                 )?);
                 if samples.len() > crate::mp4::MAX_SAMPLES {
                     return Err(Error::Format("more samples than this reader will hold"));
@@ -700,7 +723,14 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
     }
     // The blocks stay in the order the file has them, which is decode
     // order, the same order an MP4's sample tables are in and the order
-    // ffprobe lists packets in.
+    // ffprobe lists packets in. A keyframe scan's map ends with the
+    // track's last block whether or not it is a keyframe, which is what
+    // `VideoTrack::scanned` then puts on the end of the scan.
+    if let Some(last) = last {
+        if samples.last().map(|sample| sample.offset) != Some(last.offset) {
+            samples.push(last);
+        }
+    }
     for (index, sample) in samples.iter_mut().enumerate() {
         sample.index = index as u32;
         sample.pts *= multiplier;
@@ -723,9 +753,10 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
 
 /// The file index out of a Matroska attachment, if there is one.
 ///
-/// Section 8 names the attachment twice: by MIME type and by file name.
-/// Either one on its own identifies it, because a muxer that dropped
-/// one of the two still carried the bytes.
+/// Section 8: the MIME type is what a reader looks for, and the first
+/// attachment carrying it is the one taken. The file name is the
+/// writer's business and not the reader's, so an attachment renamed on
+/// its way through a muxer costs nothing here.
 pub fn read_index<R: Read + Seek>(src: &mut Source<R>) -> Result<Option<Vec<u8>>> {
     let seg = segment(src)?;
     let map = outline(src, seg)?;
@@ -738,16 +769,14 @@ pub fn read_index<R: Read + Seek>(src: &mut Source<R>) -> Result<Option<Vec<u8>>
             continue;
         }
         let fields = children(file)?;
-        let text = |wanted: u32| -> String {
-            field(&fields, wanted)
-                .map(|bytes| {
-                    String::from_utf8_lossy(bytes)
-                        .trim_end_matches('\0')
-                        .to_string()
-                })
-                .unwrap_or_default()
-        };
-        if text(ID_FILE_MIME_TYPE) != MATROSKA_MIME && text(ID_FILE_NAME) != MATROSKA_FILE_NAME {
+        let mime = field(&fields, ID_FILE_MIME_TYPE)
+            .map(|bytes| {
+                String::from_utf8_lossy(bytes)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if mime != MATROSKA_MIME {
             continue;
         }
         if let Some(data) = field(&fields, ID_FILE_DATA) {
@@ -813,11 +842,21 @@ mod tests {
     /// A file of two clusters, the second with an unknown length, which
     /// is what a live writer produces.
     fn file(segment_unknown: bool, cluster_unknown: bool) -> Vec<u8> {
+        file_with_tail(segment_unknown, cluster_unknown, false)
+    }
+
+    /// `trailing` adds a block after the last keyframe, so that the
+    /// track's last sample is not a sync sample, which is the case a
+    /// keyframe scan has to read anyway.
+    fn file_with_tail(segment_unknown: bool, cluster_unknown: bool, trailing: bool) -> Vec<u8> {
         let mut first = element(ID_TIMESTAMP, &[0]);
         first.extend_from_slice(&simple_block(1, 0, true, &[1, 2, 3, 4]));
         first.extend_from_slice(&simple_block(1, 33, false, &[5, 6]));
         let mut second = element(ID_TIMESTAMP, &[100]);
         second.extend_from_slice(&simple_block(1, 0, true, &[7, 8, 9]));
+        if trailing {
+            second.extend_from_slice(&simple_block(1, 33, false, &[10, 11, 12, 13, 14]));
+        }
 
         let mut body = element(ID_INFO, &element(ID_TIMESTAMP_SCALE, &[0x0f, 0x42, 0x40]));
         body.extend_from_slice(&tracks("V_MPEG4/ISO/AVC", &[1, 0x64, 0, 13, 0xff]));
@@ -881,6 +920,39 @@ mod tests {
             let mut src = source(file(segment_unknown, cluster_unknown));
             let only_keys = read(&mut src, Scan::Keyframes).expect("a track");
             assert_eq!(only_keys.samples.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_keyframe_scan_keeps_the_last_sample_of_the_track() {
+        // Section 7: a record whose span ends after the last keyframe
+        // rides the last access unit, so the fast path has to read it.
+        for (segment_unknown, cluster_unknown) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let bytes = file_with_tail(segment_unknown, cluster_unknown, true);
+            let mut src = source(bytes.clone());
+            let all = read(&mut src, Scan::All).expect("a track");
+            assert_eq!(all.samples.len(), 4);
+            assert!(!all.samples[3].keyframe, "the last block is not a keyframe");
+
+            let mut src = source(bytes);
+            let fast = read(&mut src, Scan::Keyframes).expect("a track");
+            let visited: Vec<i64> = fast
+                .scanned(Scan::Keyframes)
+                .iter()
+                .map(|sample| sample.pts)
+                .collect();
+            assert_eq!(
+                visited,
+                vec![0, 100, 133],
+                "two keyframes and the last sample, segment unknown {segment_unknown}, \
+                 cluster unknown {cluster_unknown}"
+            );
+            // And the last sample is the same bytes the full walk found.
+            let last = fast.scanned(Scan::Keyframes).pop().expect("a sample");
+            assert_eq!(last.offset, all.samples[3].offset);
+            assert_eq!(last.size, all.samples[3].size);
         }
     }
 
