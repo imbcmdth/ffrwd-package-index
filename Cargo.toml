@@ -1,9 +1,20 @@
 [workspace]
 # `core` is the codec: plain Rust, no I/O, no dependencies. `rows` is
 # the JSON both callers of it speak, which is theirs and not the
-# format's. `tool` is the native command line over the two, which reads
-# and writes files and so is never part of a wasm build.
+# format's. `weave` is the packet filter, a thin wasm32-wasip2 cdylib
+# over the two. `tool` is the native command line over the same two,
+# which reads and writes files and so is never part of a wasm build.
+#
+# `weave` builds for wasm32-wasip2 alone, so it is excluded from the
+# workspace default members: `cargo test` and `cargo clippy` over the
+# workspace are native, and wit-bindgen's generated code is not.
 members = [
+    "core",
+    "rows",
+    "tool",
+    "weave",
+]
+default-members = [
     "core",
     "rows",
     "tool",

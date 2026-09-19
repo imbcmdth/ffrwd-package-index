@@ -1,0 +1,19 @@
+[package]
+name = "weave"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The ffrwd/index packet filter: embedding vectors woven into an encoded video stream."
+
+[lib]
+name = "weave"
+crate-type = ["cdylib"]
+
+# wit-bindgen and the two crates of this workspace, and nothing else.
+# There is no serde here: `ffrwd-index-rows` already reads and writes
+# the JSON this module speaks, and a second reader of the same rows is
+# a second thing to keep in step.
+[dependencies]
+wit-bindgen = "0.57.1"
+ffrwd-index-core = { path = "../core" }
+ffrwd-index-rows = { path = "../rows" }
