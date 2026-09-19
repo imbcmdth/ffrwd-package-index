@@ -48,16 +48,23 @@ Working against an unreleased ffrwd: three wasm modules, all
 out, with the vectors woven into them and every timestamp untouched. Rows can
 arrive while packets flow, so the same module serves a live stream: a vector is
 woven onto the first frame after it exists, and a watcher reading the stream
-hears of it at once. A live stream gets no file index and needs none. The
-declaration is what the dialect accepts today, and a query that writes the call
-is refused by name, because nothing builds the shape a packet filter sits in:
+hears of it at once. A live stream gets no file index and needs none. A COPY
+whose destination places an encoder is where the call goes, and the compiler
+puts the filter between that encoder and the muxer:
 
 ```sql
 COPY (
-  SELECT ffrwd.index.weave(f.video[1], vecs) AS v, f.audio[1] AS a
+  SELECT ffrwd.index.weave(f.video[1],
+                           ffrwd.describe.clips(f.video[1]).shots,
+                           NULL,
+                           NULL,
+                           '[{"name":"clip","dims":512,"modality":"picture"}]') AS v,
+         f.audio[1] AS a
   FROM input('film.mp4') f
 ) TO 'film.indexed.mp4'
 ```
+
+The arguments and the params are their own section below.
 
 `records` and `spaces` read. They are packet sinks: `records` answers one row
 per record, with the span in seconds of the stream's own clock and the vector
@@ -78,6 +85,60 @@ That is a request and never a promise, and both read whatever they are given.
 
 The reading modules and the writing one are the same code: `rows/` holds both
 state machines over `core/`, and the wasm crates are shims.
+
+## What a query hands `weave`
+
+`clip`, `sound` and `speech` are rows arguments, one per producer. An encoder
+stands between a producer and this filter, so rows cannot ride the frames:
+each argument's rows go to a document of their own and reach the module as an
+input of its own, every row carrying `"_arg": "<argument>"`, which the host
+writes and a producer may not.
+
+That field is how a row gets a space. A producer hands over spans and vectors
+and knows nothing of embedding spaces, so the precedence is: the row's own
+`space` field; else `_arg`, when it names a declared space; else the single
+declared space, where a run declares exactly one; else the row is dropped and
+a row says so, naming the argument and the spaces it could have been. Rows the
+`ffrwd-index` tool reads name their own space and are untouched by any of
+this.
+
+A declaration is fixed arity, and these three are named for `ffrwd/describe`'s
+three spaces. A producer with other spaces, or more of them, writes its own
+`CREATE FUNCTION` over the same wasm file, naming the arguments after its own
+spaces. That has to be a query's declaration rather than another package's: a
+package's lib file may only name modules the package itself ships, so nothing
+outside this repository can declare a function over this `weave.wasm` in a lib
+of its own.
+
+Every value argument in the dialect is text, number, boolean or vector, so
+every one of the module's params is a scalar:
+
+| param | type | what it is |
+| --- | --- | --- |
+| `spaces` | text | The space table, as an array of objects in JSON. Required. |
+| `placement` | text | `keyframe` (the default), `next` or `spread`. |
+| `budget` | number | Bytes of messages an access unit, for `spread` alone. |
+| `escapes` | number | 0 to 16, 2 by default. |
+| `planes` | number | 1 to 8 of an `i8` record's bit-planes, all eight by default. |
+
+`spaces` is the one that wanted to be an array of objects. A query cannot
+write one, so the module declares it as text and a producer passes the array's
+own JSON as a literal:
+
+```json
+[{"name": "clip", "dims": 512, "encoding": "i8", "unit_length": false,
+  "modality": "picture", "source": 0,
+  "model": "hf:org/repo@rev/video_tower.onnx", "model_hash": "0f1e...",
+  "query": "hf:org/repo@rev/text_tower.onnx", "query_hash": "c14d...",
+  "producer": "ffrwd/describe 0.1.2"}]
+```
+
+`name` and `dims` are required and the rest have defaults; the fields are
+section 3's, the same ones the tool's own `{"space": {...}}` rows spell, and
+the wire ids are handed out in declaration order. The array itself is still
+read wherever it appears, so `ffrwd-wasm -params` and `-params-from` and the
+native tool go on passing the array, and nothing that already worked had to be
+rewritten.
 
 ## Layout
 

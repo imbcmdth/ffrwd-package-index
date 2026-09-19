@@ -427,7 +427,7 @@ fn weave(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
         dir,
         &text(input),
         Params::Inline(params),
-        &text(rows),
+        &[text(rows)],
         Feed::None,
     )
 }
@@ -440,7 +440,7 @@ fn weave_with_params_file(dir: &Path, input: &Path, params: &str, rows: &Path) -
         dir,
         &text(input),
         Params::File(&text(&path)),
-        &text(rows),
+        &[text(rows)],
         Feed::None,
     )
 }
@@ -453,36 +453,64 @@ fn weave_streaming(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
         dir,
         "-",
         Params::Inline(params),
-        &text(rows),
+        &[text(rows)],
         Feed::Packets(&bytes),
     )
 }
 
-fn run_weave(dir: &Path, input: &str, params: Params<'_>, rows_in: &str, feed: Feed<'_>) -> Run {
+/// The same, with one NAMED rows input per rows argument the call
+/// wrote, which is the shape a query compiles to: every row the host
+/// delivers from one of these carries the argument's name.
+fn weave_arguments(dir: &Path, input: &Path, params: &str, rows: &[(&str, &Path)]) -> Run {
+    let named: Vec<String> = rows
+        .iter()
+        .map(|(name, path)| format!("{name}={}", text(path)))
+        .collect();
+    run_weave(
+        dir,
+        &text(input),
+        Params::Inline(params),
+        &named,
+        Feed::None,
+    )
+}
+
+fn run_weave(
+    dir: &Path,
+    input: &str,
+    params: Params<'_>,
+    rows_in: &[String],
+    feed: Feed<'_>,
+) -> Run {
     let out = dir.join("woven.nut");
     let (flag, value) = match params {
         Params::Inline(text) => ("-params", text.to_string()),
         Params::File(path) => ("-params-from", path.to_string()),
     };
+    let mut args: Vec<String> = vec![
+        "-f".into(),
+        "nut".into(),
+        "-i".into(),
+        input.to_string(),
+        "-m".into(),
+        text(&module()),
+        flag.into(),
+        value,
+    ];
+    for written in rows_in {
+        args.push("-rows-in".into());
+        args.push(written.clone());
+    }
+    args.extend([
+        "-f".to_string(),
+        "nut".to_string(),
+        text(&out),
+        "-f".to_string(),
+        "ndjson".to_string(),
+        "-".to_string(),
+    ]);
     let mut child = Command::new(sidecar().expect("a sidecar"))
-        .args([
-            "-f",
-            "nut",
-            "-i",
-            input,
-            "-m",
-            &text(&module()),
-            flag,
-            &value,
-            "-rows-in",
-            rows_in,
-            "-f",
-            "nut",
-            &text(&out),
-            "-f",
-            "ndjson",
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -660,13 +688,64 @@ fn write_rows(path: &Path, space: &str, dims: usize, count: usize) -> Vec<Record
     records
 }
 
+/// A rows file whose rows name NO space, which is what a producer
+/// writes: it hands over spans and vectors and knows nothing about
+/// embedding spaces. `first_t` is the second the first span starts at.
+fn write_unnamed_rows(path: &Path, dims: usize, count: usize, first_t: f64) -> Vec<Record> {
+    let mut records = Vec::new();
+    let mut text = String::new();
+    for index in 0..count {
+        let step = index + first_t as usize;
+        let values: Vec<f32> = (0..dims)
+            .map(|c| ((c + step * 7) as f32 * 0.37).sin() * (1.0 + step as f32 * 0.25))
+            .collect();
+        let printed: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+        let start_t = first_t + index as f64;
+        let end_t = start_t + 1.0;
+        text.push_str(&format!(
+            r#"{{"start_t":{start_t},"end_t":{end_t},"vector":[{}]}}"#,
+            printed.join(",")
+        ));
+        text.push('\n');
+        records.push(Record {
+            start_t,
+            end_t,
+            values,
+        });
+    }
+    std::fs::write(path, text).expect("write the rows");
+    records
+}
+
 const ESCAPES: usize = 2;
+
+/// One i8 space of `dims`, as the params spell one.
+fn space_param(space: &str, dims: usize) -> String {
+    format!(
+        r#"{{"name":"{space}","dims":{dims},"encoding":"i8","unit_length":false,"modality":"picture","model":"test:model","producer":"the weave tests"}}"#
+    )
+}
 
 /// The params for one i8 space of `dims`.
 fn params(space: &str, dims: usize, placement: &str) -> String {
     format!(
-        r#"{{"spaces":[{{"name":"{space}","dims":{dims},"encoding":"i8","unit_length":false,"modality":"picture","model":"test:model","producer":"the weave tests"}}],"placement":"{placement}","escapes":{ESCAPES}}}"#
+        r#"{{"spaces":[{}],"placement":"{placement}","escapes":{ESCAPES}}}"#,
+        space_param(space, dims)
     )
+}
+
+/// The params for two spaces, with the list passed as the TEXT a query
+/// writes rather than as an array: a wasm function's value arguments
+/// are text, number, boolean or vector, so text is the only form a SQL
+/// caller has.
+fn params_as_text(spaces: &[&str], dims: usize, placement: &str) -> String {
+    let list: Vec<String> = spaces
+        .iter()
+        .map(|space| space_param(space, dims))
+        .collect();
+    let written = format!("[{}]", list.join(","));
+    let quoted = written.replace('"', "\\\"");
+    format!(r#"{{"spaces":"{quoted}","placement":"{placement}","escapes":{ESCAPES}}}"#)
 }
 
 /// What a reader rebuilds from the record this module would have
@@ -1073,7 +1152,7 @@ fn rows_arriving_after_the_packets_ride_the_next_carrier_looking_back() {
         &dir,
         &text(&input),
         Params::Inline(&params("clip", dims, "next")),
-        "-",
+        &["-".to_string()],
         Feed::Rows(&feed),
     );
 
@@ -1691,6 +1770,88 @@ fn a_record_past_the_last_keyframe_rides_that_keyframe() {
             1,
             "{codec}: a keyframe copy lost the record: {read:?}"
         );
+    }
+}
+
+// ------------------------------------------------------------------ //
+// Two rows arguments, and the space each one names.
+// ------------------------------------------------------------------ //
+
+/// The shape a query compiles to: one `-rows-in <argument>=<file>` per
+/// rows argument the call wrote, and rows that name no space at all.
+///
+/// The host writes `"_arg": "<argument>"` onto every row it delivers,
+/// so the argument a producer's rows were written into is what puts
+/// them in a space. Nothing here says `space` anywhere: the params
+/// declare `clip` and `speech`, the arguments are called `clip` and
+/// `speech`, and both spaces have to come back out of the file.
+#[test]
+fn rows_with_no_space_land_in_the_space_their_argument_is_named_for() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("rows_arguments");
+    let input = encode(&dir, "h264");
+    let dims = 16;
+    let clip_rows = dir.join("clip.ndjson");
+    let speech_rows = dir.join("speech.ndjson");
+    // Four seconds at a keyframe a second: the first two spans belong
+    // to one argument and the last two to the other.
+    let clip = write_unnamed_rows(&clip_rows, dims, 2, 0.0);
+    let speech = write_unnamed_rows(&speech_rows, dims, 2, 2.0);
+
+    let run = weave_arguments(
+        &dir,
+        &input,
+        &params_as_text(&["clip", "speech"], dims, "keyframe"),
+        &[("clip", &clip_rows), ("speech", &speech_rows)],
+    );
+    let woven = run.events("woven");
+    assert_eq!(woven.len(), 4, "{:?}", run.rows);
+    let named: Vec<&str> = woven.iter().map(|row| row["space"].as_str()).collect();
+    assert_eq!(
+        named.iter().filter(|space| **space == "clip").count(),
+        2,
+        "the clip argument's rows: {named:?}"
+    );
+    assert_eq!(
+        named.iter().filter(|space| **space == "speech").count(),
+        2,
+        "the speech argument's rows: {named:?}"
+    );
+    let summary = run.summary();
+    assert_eq!(summary["dropped"], "0", "{:?}", run.rows);
+    assert_eq!(summary["late"], "0", "{:?}", run.rows);
+    assert_eq!(summary["spaces"], "2");
+
+    // And out of the muxed file, which is where a reader meets them:
+    // two space ids, and each record with the span its own argument
+    // wrote.
+    let mp4 = dir.join("woven.mp4");
+    mux(&run.out, &mp4);
+    let read = read_container(&mp4);
+    assert_eq!(read.len(), 4, "{read:?}");
+    let ids: std::collections::BTreeSet<&str> =
+        read.iter().map(|row| row["space_id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        ["0", "1"].into_iter().collect(),
+        "both spaces did not come back: {read:?}"
+    );
+    for (space_id, wanted) in [("0", &clip), ("1", &speech)] {
+        let rows: Vec<&BTreeMap<String, String>> = read
+            .iter()
+            .filter(|row| row["space_id"] == space_id)
+            .collect();
+        assert_eq!(rows.len(), wanted.len(), "space {space_id}: {rows:?}");
+        for row in rows {
+            let record_id: usize = row["record_id"].parse().expect("a record id");
+            let record = &wanted[record_id];
+            let span = row["end_ms"].parse::<f64>().expect("an end")
+                - row["start_ms"].parse::<f64>().expect("a start");
+            assert!(
+                close(span, (record.end_t - record.start_t) * 1000.0),
+                "space {space_id} record {record_id} lost its span: {row:?}"
+            );
+        }
     }
 }
 
