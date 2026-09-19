@@ -18,345 +18,50 @@ back out of a sixteen hundredth of the file.
 
 The format is in [SPEC.md](SPEC.md). It is not tied to ffrwd.
 
-Status: the format, its codec and the command line tool are done. The `weave`
-module is done and tested against a real sidecar, and is **not yet runnable
-from a query**: the interface it is built on, `ffrwd:av@0.16.0`'s
-`packet-filter`, is unreleased, and no part of the dialect places a packet
-filter in a query yet. See [Using it from a query](#using-it-from-a-query).
+[MEASUREMENTS.md](MEASUREMENTS.md) is what the 8-bit encoding costs a search,
+measured on real vectors.
+
+## Status
+
+The format is a draft and nothing here is released.
+
+Working today, without ffrwd: the `ffrwd-index` tool weaves rows of vectors
+into H.264, HEVC and AV1 elementary streams, reads them back from a stream or
+straight out of an MP4 or Matroska file, and writes and reads the file index.
+On a 15 MB test file a search reads 0.06% of the bytes to get every vector from
+the keyframes, and 0.03% when the file has an index. See
+[tool/README.md](tool/README.md).
+
+Working against an unreleased ffrwd: `weave`, the wasm module, runs under a
+sidecar built from ffrwd's `packet-filter` branch, which adds the packets-in,
+packets-out interface (`ffrwd:av@0.16.0`). No query can place it yet. The
+intended use, not runnable today:
+
+```sql
+COPY (
+  SELECT ffrwd.index.weave(f.video[1], vecs) AS v, f.audio[1] AS a
+  FROM input('film.mp4') f
+) TO 'film.indexed.mp4'
+```
+
+Rows can arrive while packets flow, so the same module serves a live stream: a
+vector is woven onto the first frame after it exists, and a watcher reading the
+stream hears of it at once. A live stream gets no file index and needs none.
 
 ## Layout
 
 - `SPEC.md`: the format.
-- `core/`: the codec, plain Rust with no I/O and no dependencies: messages,
-  the layered 8-bit encoding, SEI and OBU wrapping, the placement policies,
-  and the file index.
-- `rows/`: the JSON both callers of the codec speak, and what a writer does
-  with it: reading a space and a vector, and deciding which access unit a
-  record rides. Plain Rust over `core`, tested natively.
-- `container/`: MP4 and Matroska, read natively over `Read + Seek`: the video
-  track, where every sample is and when it is shown, the front of the samples
-  a scan needs, and section 8's index box and attachment.
-- `tool/`: a native command line over the three, for weaving vectors into a
-  file, reading them back and putting an index in the file, without ffrwd.
-- `weave/`: the ffrwd module, a `wasm32-wasip2` cdylib and a thin one.
-- `ffrwd.json`, `src/index.sql`: the package.
-- `notes/`: what placing a packet filter in a query would take.
-
-Why `rows/` exists, and why it is not part of `core`: the tool and the module
-have to agree on how a row spells a space and a vector, because a row written
-for one means the same thing to the other, and a field renamed in one and not
-the other is a bug nobody sees until a file comes back empty. But the format
-does not care: `core` is the wire, and giving it an opinion about JSON would
-make every change to a row name a change to the codec. So the shapes live in
-one crate over `core` that both compile in. The same crate holds the weaving
-state machine, for the same reason turned around: it is the module's whole
-decision, and it belongs somewhere `cargo test` can reach it on the native
-target rather than inside a wasm cdylib.
-
-Why `container/` is its own crate: a packet filter never sees a file. It runs
-inside a pipeline, before the muxer, and the container it will end up in does
-not exist yet. Everything about MP4 and Matroska belongs to the programs that
-do have a file, and keeping it out of `core` keeps `core` what it says it is:
-the codec, with no I/O, no dependencies, and nothing a wasm build has to carry
-that it will never call. `container` reads through `Read + Seek` rather than a
-path, so every parser in it runs against a `Cursor<Vec<u8>>` and its fuzz tests
-can hand it any bytes at all.
-
-## The module
-
-One video pad, `h264`, `hevc` or `av1`, packets in and packets out, with rows
-of vectors arriving beside them. What it adds to a packet is one SEI NAL or
-metadata OBU before the first coded slice of the access units the placement
-policy chose. Nothing else moves: the pictures, the packet count, the
-timestamps and the keyframe flags are the encoder's own, and the stream's
-out-of-band header is handed back unchanged.
-
-### Params
-
-One JSON object, through `init` or `set-params`.
-
-```json
-{
-  "spaces": [
-    {
-      "name": "clip",
-      "dims": 512,
-      "encoding": "i8",
-      "unit_length": true,
-      "modality": "picture",
-      "source": 0,
-      "model": "hf:openai/clip-vit-large-patch14@refs/pr/4/model.safetensors",
-      "model_hash": "9f86d081884c7d659a2feaa0c55ad015",
-      "query": "hf:openai/clip-vit-large-patch14@refs/pr/4/text.safetensors",
-      "query_hash": "",
-      "producer": "my captioner 0.3"
-    }
-  ],
-  "placement": "keyframe",
-  "escapes": 2
-}
-```
-
-| param | meaning |
-| --- | --- |
-| `spaces` | the embedding spaces this run carries, 1 to 256. A row names one by its `name`; the wire's `space_id` is the position in this list |
-| `placement` | `keyframe` (the default), `next` or `spread` |
-| `budget` | bytes of messages per access unit. Belongs to `spread`, and `spread` needs one |
-| `escapes` | how many of a vector's largest components an `i8` space sends exactly rather than quantized. 2 by default, 16 at most |
-| `planes` | how many of an `i8` record's eight bit-planes are sent at all, 1 to 8. All eight by default. Section 5 lets a writer stop early where it knows the space does not need the rest; the measurements say four planes of a MiniLM space reconstruct to cosine 0.991 |
-
-A space's fields are section 3's, and they are the fields `tool/`'s own rows
-spell, read by the same code:
-
-| field | meaning |
-| --- | --- |
-| `name` | what the vector rows call this space |
-| `dims` | components per vector, 1 to 65536 |
-| `encoding` | `i8` (the default), `f16` or `f32` |
-| `unit_length` | whether the vectors were unit length before they were encoded. Default false |
-| `modality` | `unspecified`, `picture`, `sound`, `speech`, `sound-text`, `scene-text`, `description`, or a number for one this version does not name |
-| `source` | 0 for the stream itself, `n` for the n-th audio stream |
-| `model` | a URI for what made the vectors |
-| `model_hash` | the first sixteen bytes of the SHA-256 of the weights, as hex; empty for unknown |
-| `query` | a URI for what embeds a query into the same space; empty means the same as `model` |
-| `query_hash` | as `model_hash` |
-| `producer` | free text naming where the vectors came from |
-
-Everything but `name` and `dims` may be left out. A param or a space field this
-module does not know is refused rather than ignored, so a misspelled
-`placement` is heard about rather than silently defaulted.
-
-`set-params` between calls may change `escapes` and `planes`, which are what
-future records cost. It may not change `spaces` or `placement`: a record
-already submitted was built against those, and a half-written record cannot
-change its mind about how many planes it has. A refused change leaves the
-previous params in force, as the interface requires.
-
-### Rows in
-
-One JSON object per vector, in ffrwd's own row spelling: times are `start_t`
-and `end_t`, in seconds, the way a cue row, an embedding row and every
-`ffrwd/describe` row spell them.
-
-```json
-{"space": "clip", "start_t": 0.0, "end_t": 2.0, "vector": [0.12, -0.03, ...]}
-{"space": "clip", "start_t": 2.0, "end_t": 4.0, "vector": "AACAPwAAAMA=", "available_t": 4.2}
-```
-
-| field | meaning |
-| --- | --- |
-| `space` | which declared space this vector is in, by name. May be left out when exactly one space is declared |
-| `start_t`, `end_t` | the span it describes, in seconds on the stream's own presentation clock |
-| `vector` | `dims` numbers, as a JSON array or as base64 of little-endian binary32 - the form ffrwd's vector tracks carry, so a writer copying rows out of a file has them already |
-| `record_id` | optional; counts up per space from 0, wrapping at 65536 |
-| `available_t` | optional; when the writer had the record, in seconds. Defaults to the newest presentation time any packet has reached, which is what makes a live row's span land behind its carrier |
-
-Rows arrive whenever the host has them, which is not when their packets do.
-Both extremes work and neither is a special case: a file hands over every row
-before the first packet moves, and a live feed hands over a vector only after
-the span it describes has ended. The placement policy is what decides where
-each one goes, and it reads presentation time, so a record that arrives behind
-the stream rides a carrier ahead of its span with negative offsets - which is
-exactly what section 4 of the spec says offsets are for.
-
-A row this module cannot read is dropped and reported, one row out per row
-dropped. Nothing about a bad row stops the stream, the packets, or the rows
-after it.
-
-### Rows out
-
-One row per record put into the stream, one per record nothing could carry,
-one per row that could not be read, and one summary at the end.
-
-```json
-{"event":"woven","space":"clip","record_id":0,"carrier_pts":55296,"carrier_t":1.08,"start_t":0,"end_t":1,"start_off_ms":-1080,"end_off_ms":-80,"bytes":531,"planes":[0,1,2,3,4,5,6,7]}
-{"event":"dropped","reason":"a vector of 4 components in a space of 512","row":"{\"space\":\"clip\",..."}
-{"event":"late","space":"clip","record_id":7,"start_t":3,"end_t":4,"reason":"no carrier this placement would choose was left"}
-{"event":"summary","records":12,"late":1,"dropped":2,"bytes_added":6372,"spaces":1}
-```
-
-| field | on | meaning |
-| --- | --- | --- |
-| `space`, `record_id` | woven, late | which record |
-| `carrier_pts` | woven | the access unit that carried it, in the stream's own time base |
-| `carrier_t` | woven | the same, in seconds |
-| `start_t`, `end_t` | woven, late | the span, as the carrier and the offsets that went out say it |
-| `start_off_ms`, `end_off_ms` | woven | the offsets themselves, which are what the wire carries |
-| `bytes` | woven | this record's messages on that carrier, before the NAL or OBU framing around them |
-| `planes` | woven, `i8` | which bit-planes rode that carrier |
-| `reason`, `row` | dropped, late | why, and enough of the row to find who wrote it |
-| `records`, `late`, `dropped`, `bytes_added`, `spaces` | summary | records woven, records nothing carried, rows that could not be read, every byte the packets grew by (framing included), and spaces declared |
-
-A record goes out whole under `keyframe` and `next`, so there is one `woven`
-row per record. Under `spread` a record is doled out as the budget allows, and
-there is one `woven` row per group of messages that went somewhere; the summary
-counts the record once, and the record's own span is on its first row. The last
-access unit may take two of those groups, what the budget allowed and then
-whatever was left, since the budget does not apply to the sweep that puts the
-leftovers on the last carrier rather than losing them.
-
-### The budget, planes and slices
-
-Section 5 gives a writer with a budget two ways to send the layered encoding
-and section 6 gives it a third, and which is right depends on the budget.
-
-- **One message per bit-plane**, when a plane's message fits the budget. Eight
-  carriers take eight planes, plane 0 first, and a reader that has only the
-  first few reads a coarser vector rather than a wrong one.
-- **One message, cut into slices**, when it does not. A FRAGMENT names the
-  record it slices and not which of that record's values, so a record cut into
-  slices has to have exactly one value to cut: if it were split into planes
-  first, planes 1 to 7, whose messages are all the same length, could not be
-  told apart. That only shows up where slices reach a reader out of
-  presentation order, which is every elementary stream with B-frames in it,
-  and it shows up as a record that never completes. So a budget below one
-  plane's message sends the whole record as one value and lets the planner cut
-  it.
-
-Either way no access unit takes more than the budget, which is what the policy
-is for.
-
-**This module writes no index.** SPEC.md section 8's file index is a copy of
-the messages at the container level, and a module cannot write one: it has no
-filesystem, and it runs before the muxer, so the file it would sit in does not
-exist yet. The `woven` rows are what a later step builds one from - they name
-every record, its carrier and its span - and that step is a separate piece
-that reads a finished file and writes a `uuid` box or a Matroska attachment.
-[notes/packet-filter-placement.md](notes/packet-filter-placement.md) section 3
-is what it would take.
-
-### Which clock a span is on
-
-Section 4 says the format carries only offsets, and that however a writer is
-told a span, the span and the carrier's presentation time have to be on one
-clock before it subtracts. The clock here is the stream's own: a row's
-`start_t` is compared against `pts * time_base`, the presentation time the
-packets themselves carry. A stream's first picture is often not at zero -
-ffmpeg gives a four-second H.264 encode with two B-frames a first presented
-`pts` of 4096 in a time base of 1/51200, which is 0.08 seconds - so a producer
-whose rows count from the first picture and a stream that does not start there
-are 80 milliseconds apart. Either put the rows on the stream's clock, or offset
-them before handing them over.
-
-### Decode order, and what is held
-
-Packets arrive in decode order. The placement policies speak of presentation
-time, so something has to hold a packet until its place among its neighbours is
-settled, and two rules do it.
-
-The stream's **decode delay**, which `input-stream` carries, is how far decode
-order and presentation order can differ. Once that many more packets have
-arrived after a held one, nothing still to come can be shown before it. That
-works from the first packet, which is what the head of a reordering stream
-needs: the wire settles no `dts` for exactly those packets.
-
-After them **`dts`** says it more tightly. It never decreases and no packet is
-presented before it is decoded, so once a packet with `dts = T` has arrived,
-nothing still to come can be presented before `T`, and every held packet whose
-`pts` is at or below it is settled in ascending `pts`. Whichever rule fires
-first settles the packet.
-
-Packets are released in the order they arrived, which is the order they have to
-leave in, and the hold is a reorder depth deep: four packets for a delay of
-two. Nothing is held past its turn. The final call of an instance's life
-carries the last packets, so a record that no carrier the policy would choose
-ever came along for rides a real last access unit; a host that ended with no
-packets at all would leave nothing to put one on, and it is then reported
-`late` rather than quietly dropped.
-
-### What is bounded, and what happens at the cap
-
-- **Pending records: 4096.** A row arriving when that many records are already
-  waiting for a carrier is dropped, with a `dropped` row saying so. This is
-  what bounds a file run, where every row arrives before the first packet.
-- **Held packets: 256.** The backstop under both rules above. Past it the
-  packet earliest in presentation order is settled whether or not its order
-  was, one at a time, until the front of the hold can be released. A stream
-  whose header and timestamps say anything usable never reaches it.
-- **Units: 4096 bytes.** A carrier with more messages than that gets more than
-  one unit, each in its own NAL or OBU, splitting between messages, which is
-  what section 7 asks for.
-
-## Using it from a query
-
-**Not yet runnable.** What the declaration wants to say, from
-[notes/packet-filter-placement.md](notes/packet-filter-placement.md):
-
-```sql
-CREATE FUNCTION weave(v video_stream, vecs STRUCT(vector vector, t number)[])
-  RETURNS packets
-  AS 'target/wasm32-wasip2/release/weave.wasm', 'weave' LANGUAGE wasm;
-
-COPY (SELECT weave(f.video[1], embed(f.video[1]).vectors))
-  FROM input('in.mp4') f TO 'out.mp4';
-
-COPY (SELECT weave(f.video[1], embed(f.video[1]).vectors))
-  FROM input('in.mp4') f TO publish('relay', 'live');
-```
-
-`RETURNS packets` would be a new `wrtype` beside `sink`, for a call that hands
-back the stream it was given, still encoded, deferred past the encoder the
-COPY's destination already places. The grammar delta is one alternative:
-`wrtype := wstype | sink | packets | STRUCT(...)`. The note has the planner
-changes and the refusals.
-
-None of that exists today, so `RETURNS packets` does not parse, and
-[src/index.sql](src/index.sql) declares `video_stream` instead. The compiler
-then loads the module, recognises it as a packet filter and refuses it by name,
-which is the most useful thing it can do:
-
-```
-the module 'target/wasm32-wasip2/release/weave.wasm' is a packet filter,
-and no part of a query places one yet
-```
-
-What does work today: `ffrwd list ffrwd/index` reads the manifest and lists the
-export, and the sidecar's `--describe` reports the module, its schemas, its
-codecs and its arity. `ffrwd link` refuses the package, because it declares a
-dependency on `ffrwd/wasm` 0.16.0 and no such version is published; that is the
-same unreleased world the module is built against, and both land together.
-
-## Building and testing
-
-`core`, `rows`, `container` and `tool` are ordinary Rust and need nothing to
-build:
-
-```
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all --check
-```
-
-The container tests make their fixtures with ffmpeg when the tests run, so
-that nothing binary is committed and nothing is asserted about a file nobody
-has; each one skips with a message saying so when ffmpeg is not on the PATH.
-What is left running without it is every parser against truncations, random
-bytes and files made by hand, which is the part that has to hold whatever is
-installed.
-
-The module needs the `ffrwd:av` wit. `ffrwd:av@0.16.0` is in no released
-`ffrwd/wasm`, so point `FFRWD_WIT_DIR` at the `sidecar/wit` of an ffrwd
-checkout that carries the interface; without it the build asks
-`ffrwd path ffrwd/wasm` for an installed copy, the way the moq package's does.
-
-```
-FFRWD_WIT_DIR=/path/to/ffrwd-cli/sidecar/wit \
-  cargo build --release --target wasm32-wasip2 -p weave
-FFRWD_WIT_DIR=/path/to/ffrwd-cli/sidecar/wit cargo test -p weave
-```
-
-The end-to-end tests in `tool/tests/weave.rs` drive real ffmpeg through the
-real sidecar. `FFRWD_WASM` names the sidecar binary built from that same
-branch, and every one of them skips with a message saying so when it is
-absent:
-
-```
-FFRWD_WASM=/path/to/ffrwd-wasm \
-FFRWD_WIT_DIR=/path/to/ffrwd-cli/sidecar/wit \
-  cargo test -p ffrwd-index --test weave
-```
-
-`FFRWD_INDEX_WASM` names a `weave.wasm` already built, which skips the build.
+- `core/`: the codec, plain Rust with no dependencies and no I/O: messages, the
+  layered 8-bit encoding, SEI and OBU wrapping, inserting into and reading from
+  H.264, HEVC and AV1 streams, placement, and the file index.
+- `rows/`: the JSON rows a producer hands over (spaces and vectors), and the
+  weaving state machine, shared by the tool and the module.
+- `container/`: reading MP4 and Matroska far enough to find the samples that
+  carry vectors, and putting the index into a file.
+- `tool/`: `ffrwd-index`, a native command line over all of it.
+- `weave/`: the ffrwd module, a thin `wasm32-wasip2` layer over `rows/`.
+- `ffrwd.json`, `src/index.sql`: the ffrwd package.
+- `notes/`: design notes that belong to other repositories.
 
 ## License
 
