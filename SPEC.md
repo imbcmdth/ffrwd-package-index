@@ -69,7 +69,8 @@ Everything else is reserved.
 space_id    u8        the name VECTOR messages use for this space
 dims        varint    components per vector, at least 1
 encoding    u8        0 = F32, 1 = F16, 2 = I8 (section 5)
-flags       u8        bit 0: vectors are unit length; other bits zero
+flags       u8        bit 0: vectors are unit length; other bits are reserved:
+                      a writer sets them to zero and a reader ignores them
 modality    u8        what was embedded (table below)
 source      u8        0 = the stream carrying this message; n = the n-th audio
                       stream of the program as the writer saw it (a hint only:
@@ -83,7 +84,9 @@ query_hash  16 bytes  as model_hash, for the query model
 producer    str       free text naming the writer's source of vectors
 ```
 
-Bytes after `producer` are reserved for later versions and ignored.
+Bytes after `producer` are reserved for later versions and ignored. A reader
+that does not know a space's `encoding` keeps the declaration, so it can still
+name the space's models, and ignores that space's VECTOR messages.
 
 `model` and `query` are two things because they often are: a video-text model
 embeds the picture with one network and the words of a search with another. A
@@ -108,9 +111,9 @@ use a new id instead.
 
 **Repetition.** A reader may start anywhere: the middle of a file, a segment of
 a ladder, a live stream already running. So a writer repeats the SPACE message
-of every space it is using on the first carrier it writes to, and afterwards on
-keyframes, at least every 10 seconds of presentation time. A writer producing a
-live or segmented stream repeats them on every keyframe. A reader holds VECTOR
+of every space it is using on the first carrier it writes to and on every
+keyframe after it. A cut or a segment begins at a keyframe, so whatever begins
+there can be read. A reader holds VECTOR
 messages for a space it has not yet seen declared until the declaration
 arrives, and may drop them if it does not arrive within a bounded wait.
 
@@ -118,7 +121,7 @@ arrives, and may drop them if it does not arrive within a bounded wait.
 
 ```
 space_id    u8
-record_id   varint    a counter per space, wrapping at 65536
+record_id   varint    a counter per space, 0 to 65535, wrapping to 0
 start_off   svarint   milliseconds from the carrier's presentation time to the
                       start of the span
 end_off     svarint   the same, to the end of the span
@@ -145,7 +148,8 @@ first.
 vector, sent as up to eight bit-planes, most significant first:
 
 ```
-scale       f16       the largest absolute component, rounded up
+scale       f16       the largest absolute component, rounded up to the next
+                      representable binary16 value
 planes      u8        bit k set: plane k is present
 plane data  for each present plane, in ascending k: ceil(dims / 8) bytes
 ```
@@ -156,14 +160,21 @@ holds bit `7 - k` of each magnitude, so plane 1 is the magnitude's most
 significant bit. Within a plane, component `i` is bit `7 - (i mod 8)` of byte
 `i div 8`; unused bits of the last byte are zero.
 
+A vector whose components are all zero has scale zero and magnitudes zero. A
+vector whose largest component is past binary16's range takes binary16's
+largest finite value as its scale, and the clamp does the rest.
+
 Reading: with planes 0 to K present, a component's magnitude is the bits known
 so far, with the unknown low bits replaced by their midpoint (`1 << (6 - K)`
 when K is less than 7, nothing when K is 7), and its value is
-`sign * magnitude / 127 * scale`. With plane 0 alone every component is plus or
-minus one: a binary embedding, comparable by Hamming distance with no
-arithmetic, which is what a coarse search over many records wants. Each further
+`sign * magnitude / 127 * scale`. With plane 0 alone every component has the
+same magnitude and differs only in sign: a binary embedding up to a scale,
+comparable by Hamming distance with no arithmetic, which is what a coarse
+search over many records wants. Each further
 plane halves the uncertainty, and all eight are the full 8-bit vector. A reader
-uses whichever planes it has. A writer must send plane 0 before or with any
+uses the longest run of planes it has starting at plane 0 and ignores any plane
+above the first one missing; a record without plane 0 cannot be read. A writer
+must send plane 0 before or with any
 other plane of a record, and should send planes in order.
 
 A writer with room sends all planes in one message. A writer with a byte budget
@@ -184,7 +195,9 @@ bytes       the rest of the message
 
 The slices of one VECTOR value, reassembled in order, are that value, and its
 `start_off` and `end_off` are relative to the carrier of the slice whose offset
-is 0. A reader that misses any slice drops the record. A writer should prefer
+is 0. A FRAGMENT repeats the record's `space_id` and `record_id`,
+which the sliced value also carries, so a reader can file slices that arrive
+out of order. A reader that misses any slice drops the record. A writer should prefer
 whole planes in separate VECTOR messages (section 5) to fragments: a lost
 VECTOR message costs precision, a lost fragment costs the record.
 
@@ -199,11 +212,14 @@ the whole RBSP as for any NAL unit. The SEI NAL unit goes before the first VCL
 NAL unit of its access unit, after any access unit delimiter and parameter sets.
 
 **HEVC.** The same message in a prefix SEI NAL unit (`nal_unit_type` 39), with
-the two-byte NAL header, `payloadType` 5.
+the two-byte NAL header, `payloadType` 5. `nuh_layer_id` is zero and
+`nuh_temporal_id_plus1` is the access unit's own.
 
 **AV1.** A metadata OBU (`OBU_METADATA`) with `metadata_type` 25, from the range
 the specification leaves for unregistered private use, whose payload is the
 unit. The UUID at the start tells it from any other user of that type. The OBU
+ends with the trailing bits the specification gives every OBU of its kind (one
+`0x80` byte, counted in `obu_size`); a reader accepts one without. The OBU
 belongs to the temporal unit of its carrier and precedes its frame header.
 
 A decoder that does not know the UUID is required by each of these standards to
@@ -244,8 +260,10 @@ time     = varint, milliseconds of presentation time from the start of the
 message  = a SPACE or VECTOR message exactly as it appears in a unit
 ```
 
-Entries are in time order, each SPACE message appears once at the time it first
-applied, and VECTOR messages of one record are merged into one.
+Entries are in time order. Each distinct SPACE definition appears once, at the
+time it first applied. VECTOR messages of one record are merged into one entry,
+which takes the time and the offsets of the record's first message; the later
+messages name the same span from their own carriers and add only planes.
 
 - **MP4 and its relatives:** a top-level `uuid` box whose extended type is this
   format's UUID and whose content is the index. Players ignore boxes they do
@@ -258,9 +276,12 @@ A live writer produces no index.
 ## 9. What a reader must not trust
 
 Every length is checked against the bytes that remain before it is used. `dims`
-above 65536, a string longer than its message, a plane set whose data runs past
-the message, and a FRAGMENT whose `offset` plus length exceeds `total` end the
-message they are in. A reader bounds what it holds for records that never
+above 65536, a `record_id` at or above 65536, a string longer than its message,
+a plane set whose data runs past the message, and a FRAGMENT whose `offset`
+plus length exceeds `total` each cost the message they are in: it is dropped,
+and the messages after it in the unit, whose framing is unaffected, are still
+read. That is not the case of section 2, a length that runs past the end of the
+unit, where the framing itself is lost. A reader bounds what it holds for records that never
 complete and spaces that are never declared. Nothing in a unit is executable,
 and a URI in a SPACE message is a name, not an instruction to fetch.
 
@@ -268,7 +289,8 @@ and a URI in a SPACE message is a name, not an instruction to fetch.
 
 Remuxing between MP4, Matroska, MPEG-TS and fragmented MP4; HLS and DASH
 packaging; RTMP, SRT, WebRTC and Media over QUIC transport; and cuts and joins
-made without re-encoding, which keep the records of the frames they keep. A
+made without re-encoding, which keep the records of the frames they keep,
+readable from the first keyframe because every keyframe declares its spaces. A
 re-encode discards the messages along with every other SEI, as it does
 captions. A service that makes its own renditions copies the units onto each
 rendition, since they are tied to times and not to pixels.
