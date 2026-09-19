@@ -111,12 +111,15 @@ that point in the stream on. A writer that changes a space's definition should
 use a new id instead.
 
 **Repetition.** A reader may start anywhere: the middle of a file, a segment of
-a ladder, a live stream already running. So a writer repeats the SPACE message
-of every space it is using on the first carrier it writes to and on every
-keyframe after it. A cut or a segment begins at a keyframe, so whatever begins
-there can be read. A reader holds VECTOR messages for a space it has not yet
-seen declared until the declaration arrives, and may drop them if it does not
-arrive within a wait of its own choosing. Since every keyframe carries the
+a ladder, a live stream already running. So a writer puts the SPACE message of
+every space it is using on every keyframe, from the first keyframe of the
+stream, whether or not a record rides there: the first packet of a file then
+says what the file carries. A writer that learns of a space after the stream
+has begun declares it on the first carrier it writes for that space and on
+every keyframe after it. A cut or a segment begins at a keyframe, so whatever
+begins there can be read. A reader holds VECTOR messages for a space it has not
+yet seen declared until the declaration arrives, and may drop them if it does
+not arrive within a wait of its own choosing. Since every keyframe carries the
 declarations, the longest keyframe interval a reader expects is wait enough.
 
 ## 4. VECTOR
