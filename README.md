@@ -13,8 +13,9 @@ vectors arrive.
 
 Reading a file is native, without ffmpeg: MP4 and Matroska, fragmented or not,
 with the tool reading the front of the sync samples, which is where every
-record of a file is, and saying what that cost. Ten seconds of 640x360 comes
-back out of a sixteen hundredth of the file.
+record of a file is and where every keyframe says what spaces it carries, and
+saying what that cost. Ten seconds of 640x360 comes back out of a fifteen
+hundredth of the file, and its first packet alone says what is in it.
 
 The format is in [SPEC.md](SPEC.md). It is not tied to ffrwd.
 
@@ -28,7 +29,7 @@ The format is a draft and nothing here is released.
 Working today, without ffrwd: the `ffrwd-index` tool weaves rows of vectors
 into H.264, HEVC and AV1 elementary streams, reads them back from a stream or
 straight out of an MP4 or Matroska file, and writes and reads the file index.
-On a 15 MB test file a search reads 0.06% of the bytes to get every vector from
+On a 15 MB test file a search reads 0.07% of the bytes to get every vector from
 the keyframes, and 0.03% when the file has an index. It also ranks: `search`
 scores a query vector against one space of a file by cosine and prints the
 spans, and `watch` reads a growing stream from a pipe and prints a match before
@@ -72,12 +73,8 @@ so that `f.embeddings` is a relation a query can join and filter. Nothing in
 the dialect spells it yet. Each says in its meta how much of a stream it has to
 be handed, which is what will make that read cheap: `records` asks for the
 keyframes, which is where section 7 puts every record of a file, and `spaces`
-asks for the first packet. That is a request and never a promise, and both read
-whatever they are given. One caveat, measured rather than assumed: section 3
-declares a space on the first carrier a writer WRITES TO, which under the
-`keyframe` policy is the first keyframe a record rides and not the first packet
-of the file, so a host that honours `first` to the letter can hand `spaces` a
-packet that declares nothing. `tool/tests/sinks.rs` pins it.
+asks for the first packet, which section 3 now puts every space declaration on.
+That is a request and never a promise, and both read whatever they are given.
 
 The reading modules and the writing one are the same code: `rows/` holds both
 state machines over `core/`, and the wasm crates are shims.

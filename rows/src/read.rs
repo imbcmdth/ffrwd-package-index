@@ -51,11 +51,12 @@ pub const MAX_HELD_SLICES: usize = 1024;
 
 /// A reader that looks for SPACE declarations and nothing else.
 ///
-/// Section 3 has a writer repeat every space it is using on the first
-/// carrier it writes to and on every keyframe after it, so one keyframe
-/// is all this ever needs. It is kept apart from [`Reader`] because
-/// assembling records a caller did not ask for is work, and a stream
-/// written `next` puts a record on every frame.
+/// Section 3 has a writer put every space it is using on every keyframe
+/// from the first keyframe of the stream, so one packet is all this
+/// ever needs for a space the writer had before it started. It is kept
+/// apart from [`Reader`] because assembling records a caller did not
+/// ask for is work, and a stream written `next` puts a record on every
+/// frame.
 pub struct Spaces {
     framing: Framing,
     declared: BTreeMap<u8, Space>,

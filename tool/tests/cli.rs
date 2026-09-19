@@ -127,7 +127,8 @@ fn rows_woven_in_come_back_out() {
             placement,
         ]);
         assert_eq!(code, 0, "{placement}: {told}");
-        assert!(told.contains("7 records in 2 spaces"), "{told}");
+        assert!(told.contains("carrying 7 records"), "{told}");
+        assert!(told.contains("2 spaces alone"), "{told}");
 
         let (code, printed, told) = tool(&["read", "--video", woven.to_str().expect("a path")]);
         assert_eq!(code, 0, "{placement}: {told}");

@@ -92,16 +92,17 @@ the source has no audio track, so the sound and speech spaces are skipped
 out/rows.ndjson: 13 vectors in 1 spaces (space 1: 13)
 
 == 3. weave: the vectors into the pictures, audio untouched ==
-out/woven.h264: 1438 access units, 29 carrying 13 records in 1 spaces, 15203 bytes added
+out/woven.h264: 1438 access units, 12 carrying 13 records, 18 declaring 1 spaces alone, 15685 bytes added
 
 == 4. index: section 8's copy, so a search is one read ==
-out/indexed.mp4: scan all: 1438 of 1438 samples, 403159 of 44286234 bytes read (0.91% of the file), 1443 seeks, 14 entries in 7199 bytes of index
-out/indexed.mp4: the index box was appended at byte 44286234
+out/indexed.mp4: scan all: 1438 of 1438 samples, 404183 of 44286716 bytes read (0.91% of the file), 1443 seeks, 14 entries in 7200 bytes of index
+out/indexed.mp4: the index box was appended at byte 44286716
 ```
 
-Thirteen shots, 15203 bytes of records on a 44 MB file: 0.034% of it.
-Twenty-nine carriers for thirteen records, because the space
-declaration goes on every keyframe as well.
+Thirteen shots, 15685 bytes of records on a 44 MB file: 0.035% of it.
+Thirty carriers for thirteen records: twelve carry a record and
+eighteen carry nothing but the space declaration, which section 3 puts
+on every keyframe of the file whether a record rides there or not.
 
 The space the converter wrote, which is what makes the file searchable
 by somebody who did not write it:
@@ -126,7 +127,7 @@ by somebody who did not write it:
 {"rank":3,"score":0.240273,"start_t":46.338,"end_t":53.596,"space":1,"record_id":10,"planes":[0,1,2,3,4,5,6,7]}
 {"rank":4,"score":0.239000,"start_t":23.315,"end_t":25.276,"space":1,"record_id":4,"planes":[0,1,2,3,4,5,6,7]}
 {"rank":5,"score":0.236784,"start_t":-0.083,"end_t":3.838,"space":1,"record_id":0,"planes":[0,1,2,3,4,5,6,7]}
-out/indexed.mp4: the file's own index, 11363 bytes read in 6 seeks, taken at its word: a cut or a join since it was built would leave it wrong, and `ffrwd-index index` rebuilds it
+out/indexed.mp4: the file's own index, 11364 bytes read in 6 seeks, taken at its word: a cut or a join since it was built would leave it wrong, and `ffrwd-index index` rebuilds it
 space 1: 13 of 13 records scored, 5 printed
 space 1: a query for this space is embedded by hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/text_tower.onnx
 --- the same query over the binary32 the rows hold ---
@@ -154,9 +155,9 @@ version under "Which clock a span is on". Record 0 lands at -0.083
 because its span starts two frames before the first picture the
 container shows.
 
-The file index costs 11363 bytes in 6 seeks. A keyframe scan of the
-same file for the same answer is 42963 bytes in 37 seeks, and a full
-scan, which this file does not need, is 403159 in 1443.
+The file index costs 11364 bytes in 6 seeks. A keyframe scan of the
+same file for the same answer is 43731 bytes in 36 seeks, and a full
+scan, which this file does not need, is 404183 in 1443.
 
 ### The coarse stage, doing exactly what it was measured to do
 
@@ -195,9 +196,9 @@ audio:   1
     1 out/speech.ndjson
 
 out/rows.ndjson: 15 vectors in 3 spaces (space 1: 13, space 2: 1, space 3: 1)
-out/woven.h264: 1438 access units, 29 carrying 15 records in 3 spaces, 29172 bytes added
-audio: MD5=3c23bcbc2b61151212283234701d8e70 in, MD5=3c23bcbc2b61151212283234701d8e70 out
-out/indexed.mp4: 18 entries in 8478 bytes of index
+out/woven.h264: 1438 access units, 14 carrying 15 records, 16 declaring 3 spaces alone, 30581 bytes added
+audio: MD5=92e5c5ec0209799fafe817d269787cb2 in, MD5=92e5c5ec0209799fafe817d269787cb2 out
+out/indexed.mp4: 18 entries in 8480 bytes of index
 
 --- the sound space, out of the woven file ---
 {"rank":1,"score":0.111256,"start_t":-0.083,"end_t":9.917,"space":3,"record_id":0,"planes":[0,1,2,3,4,5,6,7]}

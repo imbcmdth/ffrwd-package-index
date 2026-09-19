@@ -559,66 +559,71 @@ fn records_over_an_unwoven_file_answers_nothing() {
 // spaces.
 // ------------------------------------------------------------------ //
 
-/// One row per space, from the packet that declared it.
+/// One packet of a woven file says what the file carries.
 ///
-/// `spaces` asks for `first`, and this is what a host honouring that
-/// exactly would hand it: section 3 has a writer declare on the first
-/// carrier it WRITES TO, which under the `keyframe` policy is the
-/// first keyframe a record rides and not the first packet of the file.
-/// These fixtures are that ordinary shape, so one packet declares
-/// nothing and the keyframes declare everything.
-///
-/// The assertion is a measurement, not a wish: if a writer starts
-/// declaring on the first carrier it sees, or the sink's `wants`
-/// becomes `keyframes`, this is the test that says so.
+/// This is `spaces`'s whole claim and section 3's: a writer puts every
+/// space it is using on every keyframe from the FIRST keyframe of the
+/// stream, whether or not a record rides there, so a reader that wants
+/// only the shape of a file names one packet in advance and reads it.
+/// Three codecs and two containers, because a demuxer is what decides
+/// which packet is first and they do not all agree.
 #[test]
-fn spaces_answers_from_the_first_declaration() {
+fn spaces_answers_from_the_first_packet_alone() {
     let Some(_) = sidecar() else { return };
     for codec in Codec::every() {
         let name = codec.extension();
         let mp4 = fixtures()[name].clone();
+        let mkv = at(&format!("first-{name}.mkv"));
+        ffmpeg(&["-i", &text(&mp4), "-c", "copy", &text(&mkv)]);
 
-        // One packet and no more says nothing, and that is the point:
-        // the writer had nothing to put on it.
-        let first = at(&format!("{name}-first.nut"));
-        ffmpeg(&[
-            "-i",
-            &text(&mp4),
-            "-c",
-            "copy",
-            "-frames:v",
-            "1",
-            "-f",
-            "nut",
-            &text(&first),
-        ]);
-        assert!(
-            sink_rows("spaces", &first).is_empty(),
-            "{name}: the first packet of this fixture declares nothing, so a host honouring `first` to the letter answers nothing"
-        );
+        let whole = sink_rows("spaces", &as_nut(&mp4, &format!("{name}-whole.nut"), false));
+        assert_eq!(whole.len(), 1, "{name}: the fixture is not what it was");
 
-        // The keyframes, which is where section 3 promises they are.
+        for (container, from) in [("mp4", &mp4), ("mkv", &mkv)] {
+            let first = at(&format!("{name}-first-{container}.nut"));
+            ffmpeg(&[
+                "-i",
+                &text(from),
+                "-c",
+                "copy",
+                "-frames:v",
+                "1",
+                "-f",
+                "nut",
+                &text(&first),
+            ]);
+            // One packet, and it is the whole answer.
+            let rows = sink_rows("spaces", &first);
+            assert_eq!(
+                rows, whole,
+                "{name}, {container}: the first packet did not say what the file carries"
+            );
+
+            let row = &rows[0];
+            assert_eq!(row["space"], "1", "{name}, {container}");
+            assert_eq!(row["dims"], "16", "{name}, {container}");
+            assert_eq!(row["encoding"], "i8", "{name}, {container}");
+            assert_eq!(row["unit_length"], "true", "{name}, {container}");
+            assert_eq!(row["modality"], "picture", "{name}, {container}");
+            assert_eq!(row["source"], "0", "{name}, {container}");
+            assert_eq!(
+                row["model"], "hf:test/tower@main/model.safetensors",
+                "{name}, {container}"
+            );
+            assert_eq!(
+                row["query"], "hf:test/tower@main/text.safetensors",
+                "{name}, {container}"
+            );
+            assert_eq!(row["producer"], "the sink tests", "{name}, {container}");
+            // The format carries no name, so this is a label made from
+            // what it does carry: the producer, where there is one.
+            assert_eq!(row["name"], "the sink tests", "{name}, {container}");
+        }
+
+        // And the space is answered once however many keyframes repeat
+        // it, which is every one of them.
         let keys = as_nut(&mp4, &format!("{name}-keys.nut"), true);
-        let from_keys = sink_rows("spaces", &keys);
-        assert_eq!(from_keys.len(), 1, "{name}: {from_keys:?}");
-        let row = &from_keys[0];
-        assert_eq!(row["space"], "1");
-        assert_eq!(row["dims"], "16");
-        assert_eq!(row["encoding"], "i8");
-        assert_eq!(row["unit_length"], "true");
-        assert_eq!(row["modality"], "picture");
-        assert_eq!(row["source"], "0");
-        assert_eq!(row["model"], "hf:test/tower@main/model.safetensors");
-        assert_eq!(row["query"], "hf:test/tower@main/text.safetensors");
-        assert_eq!(row["producer"], "the sink tests");
-        // The format carries no name, so this is a label made from what
-        // it does carry: the producer, where the writer gave one.
-        assert_eq!(row["name"], "the sink tests");
-
-        // And the whole file says the same thing once, not once per
-        // keyframe: section 3 repeats the declaration on every one.
-        let whole = as_nut(&mp4, &format!("{name}-whole.nut"), false);
-        assert_eq!(sink_rows("spaces", &whole), from_keys, "{name}");
+        assert_eq!(sink_rows("spaces", &keys), whole, "{name}");
     }
 }
 

@@ -70,16 +70,11 @@ RETURNS packets
 -- Each says in its meta how much of a stream it has to be handed:
 -- `records` asks for `keyframes`, since section 7's `keyframe` policy
 -- puts every record of a file on a sync sample, and `spaces` asks for
--- `first`. A host may hand over more than was asked for and never
--- less, and both read whatever they get.
---
--- What `first` does not cover, measured: section 3 declares a space on
--- the first carrier a writer WRITES TO, which under the `keyframe`
--- policy is the first keyframe a record rides and not the first packet
--- of the file. A host honouring `first` exactly can therefore hand
--- `spaces` a packet that declares nothing. Either a writer declares on
--- the first carrier it sees, or this sink asks for `keyframes`; until
--- then a host handing over the keyframes is what makes it right.
+-- `first`, since section 3 puts every space declaration on every
+-- keyframe from the first keyframe of the stream. A host may hand over
+-- more than was asked for and never less, and both read whatever they
+-- get: a space a writer learned of after the stream began rides its
+-- own first carrier, and a host handing over more is what finds it.
 CREATE FUNCTION records(v video_stream)
 RETURNS sink
   AS 'target/wasm32-wasip2/release/records.wasm', 'records' LANGUAGE wasm;

@@ -143,6 +143,13 @@ ffmpeg -discard nokey -i SRC -map 0:v:0 -c copy <pipe format> -  |  scanner
 - It covers everything ffmpeg can open: MP4, Matroska, MPEG-TS, HLS and DASH
   manifests, remote URLs. ffrwd gains no container parser.
 - Tier 2 is the same command stopped after the first packet (`-frames:v 1`).
+  SPEC section 3 changed on 2026-09-19 to make that answerable: a writer puts
+  every space it is using on every keyframe FROM THE FIRST KEYFRAME OF THE
+  STREAM, whether or not a record rides there, so one packet says what a file
+  carries. It used to declare on the first carrier a record rode, and the
+  first packet of an ordinary file said nothing at all. The `spaces` sink asks
+  for `first` on the strength of the new sentence, and `tool/tests/sinks.rs`
+  holds it to one packet in three codecs and two containers.
 - A stream written with `next` or `spread` placement carries records on frames
   that are not keyframes. The SPACE messages do not say which placement a
   writer used, so the rule is: keyframes first; if a query needs every record
@@ -201,7 +208,7 @@ at.
 ### Considered and set aside
 
 - **Shelling to `ffrwd-index read --mp4` / `--mkv`**, the tool's own container
-  parser. Reads less (0.06% of a file against about 20% for the keyframe copy)
+  parser. Reads less (0.07% of a file against about 20% for the keyframe copy)
   but only MP4 and Matroska, local files only, and it puts a second demuxer's
   opinion about timestamps into the compiler. It stays in the tool, where the
   small read is the point.

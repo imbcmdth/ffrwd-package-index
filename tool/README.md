@@ -113,23 +113,25 @@ with all eight of its planes.
 and at nothing else. Section 7 puts every record of a `keyframe` file
 on a keyframe, the ones whose span ends after the last keyframe
 included: those ride the last keyframe with an end that looks forward.
-So there is nothing after the sync samples for a reader to go and find,
-which is also what lets the same read work on a transport stream, where
-the end of the file is not a thing to seek to. `--scan all` looks at
-every sample, which `next` and `spread` need. Either way only the
-leading NAL units or OBUs of a sample are read, up to the first coded
-slice or frame OBU, because that is where a unit goes. Each read says
-on stderr what it cost:
+Section 3 puts every space declaration on every keyframe from the first
+one, whether or not a record rides there. So there is nothing after the
+sync samples for a reader to go and find, which is also what lets the
+same read work on a transport stream, where the end of the file is not
+a thing to seek to, and what lets a reader that wants only the shape of
+a file read its first packet. `--scan all` looks at every sample, which
+`next` and `spread` need. Either way only the leading NAL units or OBUs
+of a sample are read, up to the first coded slice or frame OBU, because
+that is where a unit goes. Each read says on stderr what it cost:
 
 ```
-big.mp4: scan keyframes: 14 of 300 samples, 9317 of 15564590 bytes read
-  (0.06% of the file), 18 seeks
-big.mp4: scan all: 300 of 300 samples, 82533 of 15564590 bytes read
-  (0.53% of the file), 304 seeks
+big.mp4: scan keyframes: 14 of 300 samples, 10341 of 15564719 bytes read
+  (0.07% of the file), 18 seeks
+big.mp4: scan all: 300 of 300 samples, 83557 of 15564719 bytes read
+  (0.54% of the file), 304 seeks
 ```
 
 Ten seconds of 640x360 with noise over it, fourteen sync samples, six
-records. A keyframe scan of it reads a sixteen hundredth of the file, a
+records. A keyframe scan of it reads a fifteen hundredth of the file, a
 full scan a two hundredth, and reading the index instead is 4422 bytes
 in three seeks. That ratio is the point of the `keyframe` policy, and
 printing it is how a claim about it stays a measurement.
@@ -137,8 +139,8 @@ printing it is how a claim about it stays a measurement.
 Matroska costs more seeks for the same bytes: an MP4 has a sample table
 that says where everything is, and a Matroska file has to be walked
 block by block, which is one small read at each. The same content as
-`big.mkv` is 8152 bytes in 96 seeks for the keyframe scan, since its
-`Cues` say which clusters to go to, and 89802 bytes in 653 seeks for
+`big.mkv` is 9176 bytes in 96 seeks for the keyframe scan, since its
+`Cues` say which clusters to go to, and 90826 bytes in 653 seeks for
 the full one.
 
 ## The rows

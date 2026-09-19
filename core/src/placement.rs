@@ -11,7 +11,7 @@
 //! Feed it [`Planner::carrier`] for every access unit in presentation
 //! order and it hands back the messages for that access unit's unit.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::fragment::{fragment_with_first, slice_room};
 use crate::message::{Message, Space, VectorRecord};
@@ -126,13 +126,28 @@ struct Job {
     slices: VecDeque<Message>,
 }
 
+/// A space the planner is declaring, and when it started.
+#[derive(Clone, Debug)]
+struct Declared {
+    space: Space,
+    /// Declared before any carrier went by, so section 3 puts it on
+    /// the first keyframe of the stream whether or not a record rides
+    /// there. A space that turned up later waits for the first carrier
+    /// this writer writes for it.
+    from_the_start: bool,
+    /// Whether it has gone out at least once.
+    started: bool,
+}
+
 /// Records and access units in, messages out.
 #[derive(Clone, Debug)]
 pub struct Planner {
     policy: Placement,
-    spaces: BTreeMap<u8, Space>,
+    spaces: BTreeMap<u8, Declared>,
     jobs: VecDeque<Job>,
-    started: bool,
+    /// Whether a carrier has gone by, which is what tells a space
+    /// declared at the start from one that turned up live.
+    running: bool,
     skipped: usize,
 }
 
@@ -143,15 +158,43 @@ impl Planner {
             policy,
             spaces: BTreeMap::new(),
             jobs: VecDeque::new(),
-            started: false,
+            running: false,
             skipped: 0,
         }
     }
 
-    /// Declares a space. Its SPACE message goes out on the first
-    /// carrier the planner writes to and on every keyframe after it.
+    /// Declares a space.
+    ///
+    /// Section 3: a space the writer has before the stream begins goes
+    /// on the FIRST KEYFRAME of the stream and on every keyframe after
+    /// it, whether or not a record rides there, so that the first
+    /// packet of a file says what the file carries. A space the writer
+    /// learns of after the stream has begun goes on the first carrier
+    /// it writes for that space, and on every keyframe after that.
+    ///
+    /// A definition that replaces one already declared starts again, so
+    /// that the change is announced rather than waiting for a keyframe
+    /// the old one already rode.
     pub fn declare(&mut self, space: Space) {
-        self.spaces.insert(space.space_id, space);
+        let id = space.space_id;
+        let from_the_start = !self.running;
+        match self.spaces.get_mut(&id) {
+            Some(held) if held.space == space => {}
+            Some(held) => {
+                held.space = space;
+                held.started = false;
+            }
+            None => {
+                self.spaces.insert(
+                    id,
+                    Declared {
+                        space,
+                        from_the_start,
+                        started: false,
+                    },
+                );
+            }
+        }
     }
 
     /// Hands the planner a record to place.
@@ -180,16 +223,24 @@ impl Planner {
             _ => usize::MAX,
         };
 
-        let writing = self.has_work(carrier);
-        if self.spaces_due(carrier, writing) {
-            for space in self.spaces.values() {
-                let message = Message::Space(space.clone());
-                room = room.saturating_sub(message.encoded_len());
-                out.push(message);
-            }
-            self.started = true;
+        // Which spaces write a record here. That is what a space the
+        // writer learned of live is waiting for: its own first carrier.
+        let writing: BTreeSet<u8> = self
+            .jobs
+            .iter()
+            .filter(|job| self.eligible(job, carrier))
+            .map(|job| job.record.space_id)
+            .collect();
+        self.running = true;
+
+        for id in self.spaces_due(carrier, &writing) {
+            let declared = self.spaces.get_mut(&id).expect("a declared space");
+            declared.started = true;
+            let message = Message::Space(declared.space.clone());
+            room = room.saturating_sub(message.encoded_len());
+            out.push(message);
         }
-        if !writing {
+        if writing.is_empty() {
             return out;
         }
 
@@ -202,9 +253,6 @@ impl Planner {
         }
         jobs.retain(|job| !job.bodies.is_empty() || !job.slices.is_empty());
         self.jobs = jobs;
-        if !out.is_empty() {
-            self.started = true;
-        }
         out
     }
 
@@ -235,14 +283,20 @@ impl Planner {
         if vectors.is_empty() {
             return vectors;
         }
-        // A writer that never had room until now still has to say what
-        // space these records are in.
+        // A space that never met a keyframe - a stream with none in it,
+        // or one whose writer could hold none open - still has to be
+        // said, or these records name nothing.
         let mut out = Vec::new();
-        if !self.started {
-            for space in self.spaces.values() {
-                out.push(Message::Space(space.clone()));
-            }
-            self.started = true;
+        let late: Vec<u8> = self
+            .spaces
+            .iter()
+            .filter(|(_, declared)| !declared.started)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            let declared = self.spaces.get_mut(&id).expect("a declared space");
+            declared.started = true;
+            out.push(Message::Space(declared.space.clone()));
         }
         out.extend(vectors);
         out
@@ -259,11 +313,6 @@ impl Planner {
         self.skipped
     }
 
-    /// Whether any record could go on this carrier.
-    fn has_work(&self, carrier: Carrier) -> bool {
-        self.jobs.iter().any(|job| self.eligible(job, carrier))
-    }
-
     fn eligible(&self, job: &Job, carrier: Carrier) -> bool {
         if job.bodies.is_empty() && job.slices.is_empty() {
             return false;
@@ -276,21 +325,31 @@ impl Planner {
         }
     }
 
-    /// Whether the SPACE messages go on this carrier.
+    /// Which SPACE messages go on this carrier, in id order.
     ///
-    /// Section 3: the first carrier the writer writes to, and every
-    /// keyframe after it. A cut or a segment begins at a keyframe, so
+    /// Section 3: every keyframe carries every space the writer has,
+    /// from the first keyframe of the stream, whether or not a record
+    /// rides there. A cut or a segment begins at a keyframe, so
     /// declaring on all of them is what makes whatever begins there
-    /// readable, and it costs one message per keyframe per space.
-    fn spaces_due(&self, carrier: Carrier, writing: bool) -> bool {
-        if self.spaces.is_empty() {
-            return false;
-        }
-        if !self.started {
-            // The first carrier the writer writes to, and not before.
-            return writing;
-        }
-        carrier.keyframe
+    /// readable, and putting them on the first one is what lets a
+    /// reader that wants only the shape of a file name a packet in
+    /// advance. It costs one message per keyframe per space.
+    ///
+    /// A space the writer learned of after the stream began has no
+    /// keyframe behind it to have ridden, so it goes on the first
+    /// carrier written for it, and joins the keyframes after that.
+    fn spaces_due(&self, carrier: Carrier, writing: &BTreeSet<u8>) -> Vec<u8> {
+        self.spaces
+            .iter()
+            .filter(|(id, declared)| {
+                if declared.started || declared.from_the_start {
+                    carrier.keyframe
+                } else {
+                    writing.contains(id)
+                }
+            })
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Puts as much of one job on this carrier as the room allows, and
@@ -675,10 +734,11 @@ mod tests {
     }
 
     #[test]
-    fn spaces_go_on_the_first_carrier_written_to_and_on_every_keyframe() {
-        // Nothing to write until the first record's span ends, so the
-        // spaces wait with it, and from there they go on every keyframe
-        // whether or not a record does.
+    fn spaces_go_on_every_keyframe_from_the_first_one() {
+        // Section 3: every keyframe carries every space, from the first
+        // keyframe of the stream, whether or not a record rides there.
+        // The first record here is five seconds in, and the first
+        // packet still says what the file carries.
         let carriers = carriers(400, 30);
         let plan = plan(
             Placement::Keyframe,
@@ -694,20 +754,16 @@ mod tests {
             .filter(|(messages, _)| has_spaces(messages))
             .map(|(_, carrier)| carrier.pts_ms)
             .collect();
-        assert!(!space_carriers.is_empty());
-        assert!(
-            space_carriers[0] >= 6000,
-            "spaces went out before any record"
-        );
-        // Every keyframe from that one on, and no carrier that is not
-        // one, so a cut beginning at any keyframe can read what it
-        // keeps.
+        // Every keyframe and no carrier that is not one, so a cut
+        // beginning at any keyframe can read what it keeps and the
+        // first packet of the file needs no second read.
         let wanted: Vec<i64> = carriers
             .iter()
-            .filter(|carrier| carrier.keyframe && carrier.pts_ms >= space_carriers[0])
+            .filter(|carrier| carrier.keyframe)
             .map(|carrier| carrier.pts_ms)
             .collect();
         assert_eq!(space_carriers, wanted);
+        assert_eq!(space_carriers[0], 0, "the first keyframe said nothing");
         // Both spaces, every time.
         for (messages, _) in plan.iter().zip(&carriers) {
             let spaces = messages
@@ -715,6 +771,60 @@ mod tests {
                 .filter(|m| matches!(m, Message::Space(_)))
                 .count();
             assert!(spaces == 0 || spaces == 2, "{spaces} spaces on one carrier");
+        }
+    }
+
+    #[test]
+    fn a_space_the_writer_learns_of_live_rides_its_own_first_carrier() {
+        // Section 3's second sentence. A space that turned up after the
+        // stream began has no keyframe behind it to have ridden, so it
+        // waits for the first carrier written for it and joins the
+        // keyframes after that.
+        let carriers = carriers(120, 25);
+        let mut planner = Planner::new(Placement::Next);
+        planner.declare(space(1));
+
+        let mut said: Vec<(i64, Vec<u8>)> = Vec::new();
+        for (index, carrier) in carriers.iter().enumerate() {
+            if index == 40 {
+                // Two seconds in, a second space and a record in it.
+                planner.declare(space(2));
+                planner.submit(Pending::layered(2, 0, 1000, 1600, &planes(16)));
+            }
+            let ids: Vec<u8> = planner
+                .carrier(*carrier)
+                .messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Space(space) => Some(space.space_id),
+                    _ => None,
+                })
+                .collect();
+            if !ids.is_empty() {
+                said.push((carrier.pts_ms, ids));
+            }
+        }
+
+        // Space 1 was there from the start, so it rode every keyframe
+        // including the first.
+        assert_eq!(said[0], (0, vec![1]), "{said:?}");
+        assert_eq!(said[1], (2500, vec![1]), "{said:?}");
+        // Space 2 turned up mid-stream and rode the carrier its record
+        // did, which is no keyframe.
+        let (at, ids) = said
+            .iter()
+            .find(|(_, ids)| ids.contains(&2))
+            .expect("space 2 was never said");
+        assert_eq!(*ids, vec![2], "space 1 went out again off a keyframe");
+        assert_eq!(*at, 4000, "space 2 did not ride its own first carrier");
+        assert!(!carriers
+            .iter()
+            .any(|carrier| carrier.pts_ms == *at && carrier.keyframe));
+        // And from the next keyframe on, both of them.
+        let after: Vec<&(i64, Vec<u8>)> = said.iter().filter(|(pts, _)| *pts > *at).collect();
+        assert!(!after.is_empty());
+        for (pts, ids) in after {
+            assert_eq!(*ids, vec![1, 2], "at {pts} ms");
         }
     }
 
@@ -851,9 +961,27 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_written_when_there_is_nothing_to_say() {
+    fn a_file_with_no_records_still_says_what_it_carries() {
+        // A space and nothing in it: the keyframes still declare it, so
+        // a reader of the first packet learns the file has a space and
+        // no vectors rather than learning nothing.
         let carriers = carriers(10, 5);
         let plan = plan(Placement::Keyframe, &[space(1)], &[], &carriers);
-        assert!(plan.iter().all(|messages| messages.is_empty()));
+        for (messages, carrier) in plan.iter().zip(&carriers) {
+            assert!(
+                !messages.iter().any(|m| matches!(m, Message::Vector(_))),
+                "a record was written where there are none"
+            );
+            let spaces = messages
+                .iter()
+                .filter(|m| matches!(m, Message::Space(_)))
+                .count();
+            assert_eq!(
+                spaces,
+                usize::from(carrier.keyframe),
+                "at {}",
+                carrier.pts_ms
+            );
+        }
     }
 }

@@ -401,9 +401,13 @@ fn weave(args: &[String]) -> Result<(), String> {
     let mut woven = Vec::with_capacity(stream.len() + 4096);
     let mut at = 0usize;
     let mut written = 0usize;
+    let mut declaring = 0usize;
     for (unit, messages) in units.iter().zip(&planned) {
         if messages.is_empty() {
             continue;
+        }
+        if messages.iter().all(|m| matches!(m, Message::Space(_))) {
+            declaring += 1;
         }
         let bytes = Unit::new(messages.clone()).encode();
         woven.extend_from_slice(&stream[at..unit.insert_at]);
@@ -414,12 +418,17 @@ fn weave(args: &[String]) -> Result<(), String> {
     woven.extend_from_slice(&stream[at..]);
     std::fs::write(out, &woven).map_err(|err| format!("{out}: {err}"))?;
 
+    // Section 3 puts the spaces on every keyframe whether a record
+    // rides there or not, so the access units written to are not all
+    // access units carrying a record, and saying so is the difference
+    // between a count somebody can check and one they cannot.
     eprintln!(
-        "{out}: {} access units, {written} carrying {} records in {} spaces, {} bytes added",
-        units.len(),
-        records.len(),
-        spaces.len(),
-        woven.len() - stream.len()
+        "{out}: {units} access units, {carrying} carrying {records} records, {declaring} declaring {spaces} spaces alone, {added} bytes added",
+        units = units.len(),
+        carrying = written - declaring,
+        records = records.len(),
+        spaces = spaces.len(),
+        added = woven.len() - stream.len()
     );
     Ok(())
 }
