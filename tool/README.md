@@ -31,6 +31,10 @@ ffrwd-index search --mp4 IN.mp4 | --mkv IN.mkv | --video IN | --index IN
 ffrwd-index watch --video - [--codec h264|h265|av1] [--fps N]
                   --query NAME=FILE [--query NAME=FILE ...]
                   --threshold T [--min-planes N]
+
+ffrwd-index rows-from-describe [--clip C.ndjson] [--speech S.ndjson]
+                   [--sound D.ndjson] [--package ffrwd.json]
+                   [--producer TEXT] [--out ROWS.ndjson]
 ```
 
 The format is [SPEC.md](../SPEC.md). Nothing here is specific to one
@@ -266,6 +270,8 @@ ffrwd-index search --mp4 film.mp4 --space xclip --query prompt.json --top 5
 **It does not embed text.** A space says which model turns a query into
 its own space, and `search` prints that model on stderr; getting a
 vector out of it is the caller's business.
+[examples/describe](../examples/describe) does it with the same
+package's own text tower.
 
 **The query** is a JSON file, or `-` for standard input. Any of these is
 read: an array of numbers, a base64 string of little-endian binary32,
@@ -347,6 +353,35 @@ gives up on one that grows past a limit rather than buffering it.
 Each row is flushed as it is written. At the end, stderr says how many
 carriers went by, how many matched, how many records are still held and
 how many messages were dropped.
+
+## Rows from `ffrwd/describe`
+
+`rows-from-describe` turns what that package writes to an `.ndjson`
+destination into the rows `weave` takes.
+
+```
+ffrwd-index rows-from-describe --clip clip.ndjson --sound sound.ndjson \
+  --speech speech.ndjson --package ../ffrwd-package-describe/ffrwd.json \
+  --out rows.ndjson
+```
+
+The arithmetic is seconds into milliseconds. The naming is section 3's,
+and it is the part worth a subcommand: the clip space's vectors come
+from X-CLIP's video tower and a search of it is embedded by the text
+tower, which is a different file of the same repository, and the sound
+and speech spaces are one sentence embedder reached twice. `--package`
+reads the URIs and the SHA-256 digests out of the package's own
+manifest; without it the URIs are empty and the hashes go out zero,
+which section 3 reads as unknown, and the tool says so on stderr.
+
+Sound and speech become two spaces rather than one, although the model
+and the dimensionality are the same, because a SPACE message carries
+one modality and these are two: a label for what was heard and a
+transcript of what was said. A reader that wanted to search only what
+was said could not tell them apart if they shared an id.
+
+The whole path, run on a real file, is in
+[examples/describe](../examples/describe).
 
 ## The file index
 

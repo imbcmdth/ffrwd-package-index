@@ -13,10 +13,12 @@
 //! and only the front of each sample is read, because that is where
 //! section 7 puts a unit.
 //!
-//! Two of the commands live in their own files, because each of them
-//! is a decision rather than a translation: [`search`] ranks, and
-//! [`watch`] keeps up with a stream that is still being written.
+//! Three of the commands live in their own files, because each of them
+//! is a decision rather than a translation: [`search`] ranks, [`watch`]
+//! keeps up with a stream that is still being written, and [`describe`]
+//! turns one package's output into rows.
 
+mod describe;
 mod search;
 mod watch;
 
@@ -63,6 +65,9 @@ ffrwd-index: embedding vectors in a video's own stream.
     ffrwd-index watch --video - [--codec h264|h265|av1] [--fps N]
                       --query NAME=FILE [--query NAME=FILE ...]
                       --threshold T [--min-planes N]
+
+    ffrwd-index rows-from-describe [--clip C.ndjson] [--speech S.ndjson]
+                       [--sound D.ndjson] [--package ffrwd.json] [--out ROWS]
 
 --video is an H.264 or HEVC Annex B elementary stream or a raw AV1 OBU
 stream; the codec is taken from the file name unless --codec says
@@ -112,6 +117,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("index") => index(&args[1..]),
         Some("search") => search::search(&args[1..]),
         Some("watch") => watch::watch(&args[1..]),
+        Some("rows-from-describe") => describe::rows_from_describe(&args[1..]),
         None | Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())

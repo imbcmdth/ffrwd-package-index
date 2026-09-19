@@ -34,6 +34,12 @@ scores a query vector against one space of a file by cosine and prints the
 spans, and `watch` reads a growing stream from a pipe and prints a match before
 the frames after it arrive. See [tool/README.md](tool/README.md).
 
+Working today, with released ffrwd: [examples/describe](examples/describe)
+takes one video through `ffrwd/describe`, turns its vectors into rows, weaves
+them into the file's own pictures, indexes it and searches it with a prompt the
+package's own text tower embedded, and prints what the encoding cost against
+the same search over the original binary32.
+
 Working against an unreleased ffrwd: `weave`, the wasm module, runs under a
 sidecar built from ffrwd's `packet-filter` branch, which adds the packets-in,
 packets-out interface (`ffrwd:av@0.16.0`). No query can place it yet. The
@@ -62,6 +68,8 @@ stream hears of it at once. A live stream gets no file index and needs none.
   carry vectors, and putting the index into a file.
 - `tool/`: `ffrwd-index`, a native command line over all of it.
 - `weave/`: the ffrwd module, a thin `wasm32-wasip2` layer over `rows/`.
+- `examples/describe/`: one video through `ffrwd/describe` and out again as a
+  search, with the real commands and their real output.
 - `ffrwd.json`, `src/index.sql`: the ffrwd package.
 - `notes/`: design notes that belong to other repositories.
 

@@ -10,3 +10,4 @@ wit/
 # to say so.
 !**/tests/data/**
 measure/
+examples/describe/out/
