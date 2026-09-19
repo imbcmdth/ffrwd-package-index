@@ -172,14 +172,14 @@ The scanner is the SEI and OBU reader plus the message decoder: `core`'s
   already has a NUT reader. The switch is invisible above one function,
   `embeddings_of(path, tier) -> rows`, beside `probe.probe`.
 
-The open detail is the pipe format. A raw elementary stream (`-f h264`) has no
-timestamps, so the tool falls back on a frame-rate clock: wrong for variable
-frame rate, and off by the reorder delay on B-frame streams (the 83 ms seen in
-`examples/describe`). The pipe has to carry each packet's pts. Either the tool
-learns to read Matroska from a pipe (`-f matroska -`; its reader already
-handles clusters of unknown size, but wants `Seek` today), or the scanner waits
-for the sidecar and reads NUT, which it already parses with timestamps. The
-first is a small change in this repository and unblocks the read path now.
+The pipe format is NUT, which is what ffrwd uses between every other pair of
+processes and which carries each packet's pts. A raw elementary stream
+(`-f h264`) has none, and a reader of one falls back on a frame-rate clock:
+wrong for variable frame rate, and off by the reorder delay on B-frame streams
+(the 83 ms seen in `examples/describe`). The sidecar already has a NUT reader
+with timestamps; the tool does not, so the interim home needs a small NUT
+demuxer in this repository (coded streams only: main and stream headers,
+syncpoints, frames with pts), and the end state needs none.
 
 ### What the seam has to get right
 
@@ -243,8 +243,8 @@ compared against it.
 
 The rule is that `find.sql` always has something to read.
 
-0. **The tool reads timestamps from a pipe** (Matroska on standard input),
-   the open detail of section (b). In this repository, small.
+0. **A scanner that reads NUT from a pipe**: in the sidecar if the crates
+   are published, otherwise a small NUT reader in the tool (section (b)).
 1. **The read path first.** `f.embeddings` (or `f.vectors`, if the
    column is renamed with the record) reads woven records through
    ffmpeg's keyframe copy and the scanner of section (b), beside the existing track reader rather than instead of it. A
