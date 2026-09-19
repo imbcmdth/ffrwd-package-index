@@ -171,9 +171,12 @@ one per row that could not be read, and one summary at the end.
 | `records`, `late`, `dropped`, `bytes_added`, `spaces` | summary | records woven, records nothing carried, rows that could not be read, every byte the packets grew by (framing included), and spaces declared |
 
 A record goes out whole under `keyframe` and `next`, so there is one `woven`
-row per record. Under `spread` a record is doled out plane by plane over
-several carriers, and there is one `woven` row per carrier it used; the summary
-counts the record once.
+row per record. Under `spread` a record is doled out plane by plane as the
+budget allows, and there is one `woven` row per group of messages that went
+somewhere; the summary counts the record once. The last access unit may take
+two of those groups, what the budget allowed and then whatever was left, since
+the budget does not apply to the sweep that puts the leftovers on the last
+carrier rather than losing them.
 
 **This module writes no index.** SPEC.md section 8's file index is a copy of
 the messages at the container level, and a module cannot write one: it has no

@@ -1024,6 +1024,97 @@ fn rows_arriving_after_the_packets_ride_the_next_carrier_looking_back() {
 }
 
 // ------------------------------------------------------------------ //
+// More than one space.
+// ------------------------------------------------------------------ //
+
+/// Record ids count per space, so two spaces writing their first record
+/// are both record 0, and everything downstream has to carry the space
+/// beside the id to tell them apart.
+#[test]
+fn two_spaces_keep_their_own_records_apart() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("two_spaces");
+    let input = encode(&dir, "h264");
+    let rows = dir.join("rows.ndjson");
+    let clip: Vec<f32> = (0..48).map(|c| (c as f32 * 0.31).sin()).collect();
+    let text: Vec<f32> = (0..12).map(|c| (c as f32 * 0.77).cos()).collect();
+    let printed = |values: &[f32]| {
+        values
+            .iter()
+            .map(|v| format!("{v}"))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
+    std::fs::write(
+        &rows,
+        format!(
+            "{{\"space\":\"clip\",\"start_t\":0,\"end_t\":1,\"vector\":[{}]}}\n\
+             {{\"space\":\"text\",\"start_t\":2,\"end_t\":3,\"vector\":[{}]}}\n",
+            printed(&clip),
+            printed(&text)
+        ),
+    )
+    .expect("write the rows");
+
+    let params = r#"{"spaces":[
+        {"name":"clip","dims":48,"encoding":"i8","modality":"picture","model":"test:clip"},
+        {"name":"text","dims":12,"encoding":"f16","modality":"speech","model":"test:text"}
+    ],"escapes":2}"#;
+    let run = weave(&dir, &input, params, &rows);
+    let woven = run.events("woven");
+    assert_eq!(woven.len(), 2, "{:?}", run.rows);
+    let by_space: BTreeMap<&str, &BTreeMap<String, String>> = woven
+        .iter()
+        .map(|row| (row["space"].as_str(), row))
+        .collect();
+    assert_eq!(by_space.len(), 2, "both rows named the same space");
+    // Both are record 0 of their own space, and each reports its own
+    // span rather than the other's.
+    assert_eq!(by_space["clip"]["record_id"], "0");
+    assert_eq!(by_space["text"]["record_id"], "0");
+    assert!(close(
+        by_space["clip"]["start_t"].parse().expect("a time"),
+        0.0
+    ));
+    assert!(close(
+        by_space["clip"]["end_t"].parse().expect("a time"),
+        1.0
+    ));
+    assert!(close(
+        by_space["text"]["start_t"].parse().expect("a time"),
+        2.0
+    ));
+    assert!(close(
+        by_space["text"]["end_t"].parse().expect("a time"),
+        3.0
+    ));
+    // The layered encoding names its planes; a binary16 space has none.
+    assert_eq!(by_space["clip"]["planes"], "0,1,2,3,4,5,6,7");
+    assert!(!by_space["text"].contains_key("planes"));
+    assert_eq!(run.summary()["spaces"], "2");
+    assert_eq!(run.summary()["records"], "2");
+
+    // And both read back out of the stream, in their own spaces.
+    let mp4 = dir.join("woven.mp4");
+    mux(&run.out, &mp4);
+    let read = read_tool(&annexb(&dir, &mp4, "h264"));
+    let spaces: Vec<&BTreeMap<String, String>> = read
+        .iter()
+        .filter(|row| !row.contains_key("record_id"))
+        .collect();
+    assert_eq!(spaces.len(), 2, "two spaces were declared");
+    let records: Vec<&BTreeMap<String, String>> = read
+        .iter()
+        .filter(|row| row.contains_key("record_id"))
+        .collect();
+    assert_eq!(records.len(), 2);
+    let mut ids: Vec<&str> = records.iter().map(|row| row["space_id"].as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["0", "1"], "both records came back in one space");
+    assert_eq!(nut_packets(&run.out), nut_packets(&input));
+}
+
+// ------------------------------------------------------------------ //
 // Rows nothing can be made of.
 // ------------------------------------------------------------------ //
 

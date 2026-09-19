@@ -286,7 +286,7 @@ impl Weaver {
             }
             rows.push(woven_row(
                 self.name_of(key.0),
-                key.1,
+                key,
                 pts,
                 pts_ms,
                 &messages,
@@ -364,7 +364,7 @@ fn present_planes(space: Option<&Space>, body: &[u8]) -> Option<u8> {
 
 fn woven_row(
     space: &str,
-    record_id: u16,
+    key: (u8, u16),
     pts: i64,
     pts_ms: i64,
     messages: &[Message],
@@ -374,8 +374,12 @@ fn woven_row(
     // The span is the carrier's time plus the offsets that went out,
     // which is what a reader will compute, so a row saying anything
     // else would be saying what was meant rather than what was written.
+    //
+    // A record is its SPACE and its id together: ids count per space, so
+    // two spaces both writing their first record are both record 0.
+    let record_id = key.1;
     let offsets = messages.iter().find_map(|message| match message {
-        Message::Vector(record) if record.record_id == record_id => {
+        Message::Vector(record) if (record.space_id, record.record_id) == key => {
             Some((record.start_off, record.end_off))
         }
         _ => None,
@@ -780,6 +784,46 @@ mod tests {
                     < 0
             );
         }
+    }
+
+    #[test]
+    fn two_spaces_on_one_carrier_each_report_their_own_span() {
+        // Ids count per space, so two spaces writing their first record
+        // are both record 0, and a row that looked a record up by its id
+        // alone would hand one of them the other's span.
+        let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 4), space("text", 1, 4)]));
+        assert_eq!(
+            weaver.row(r#"{"space":"clip","start_t":0,"end_t":1,"vector":[1,2,3,4]}"#),
+            None
+        );
+        assert_eq!(
+            weaver.row(r#"{"space":"text","start_t":2,"end_t":3,"vector":[4,3,2,1]}"#),
+            None
+        );
+        let mut rows = Vec::new();
+        for frame in 0..150i64 {
+            weaver.seen(frame * 40);
+            rows.extend(weaver.carrier(frame, frame * 40, frame % 100 == 0).rows);
+        }
+        let woven = parsed(&rows);
+        assert_eq!(woven.len(), 2, "{rows:?}");
+        // One keyframe at four seconds takes both of them.
+        for row in &woven {
+            assert_eq!(row.get("record_id").and_then(Json::as_i64), Some(0));
+            assert_eq!(row.get("carrier_t").and_then(Json::as_f64), Some(4.0));
+        }
+        let clip = woven
+            .iter()
+            .find(|row| row.get("space").and_then(Json::as_str) == Some("clip"))
+            .expect("the clip row");
+        let text = woven
+            .iter()
+            .find(|row| row.get("space").and_then(Json::as_str) == Some("text"))
+            .expect("the text row");
+        assert_eq!(clip.get("start_t").and_then(Json::as_f64), Some(0.0));
+        assert_eq!(clip.get("end_t").and_then(Json::as_f64), Some(1.0));
+        assert_eq!(text.get("start_t").and_then(Json::as_f64), Some(2.0));
+        assert_eq!(text.get("end_t").and_then(Json::as_f64), Some(3.0));
     }
 
     #[test]
