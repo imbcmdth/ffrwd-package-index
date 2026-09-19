@@ -431,30 +431,11 @@ fn demux(codec: Codec, from: &Path, out: &Path) {
 fn a_container_read_finds_what_the_elementary_stream_read_finds() {
     skip_without_ffmpeg!();
     for codec in Codec::every() {
-        // `spread` is left to the codecs whose elementary stream keeps
-        // the clock it was woven on. A record under `keyframe` or
-        // `next` rides one carrier whole, so its span comes back from
-        // that one carrier's presentation time whatever the container
-        // says that is. A `spread` record's planes ride several, and
-        // section 4 has each message name the same span from its own
-        // carrier, so the reader is entitled to refuse two that
-        // disagree. An Annex B stream has no timestamps, so the tool
-        // weaves against `--fps` and decode order; ffmpeg's MP4 muxer
-        // gives such a stream exactly that clock back, so H.264 and
-        // HEVC agree. An AV1 stream does not: SVT-AV1 codes several
-        // frames in one temporal unit and shows them later with
-        // `show_existing_frame`, so sample times in decode order are
-        // not a frame apart and the two clocks part company. See
-        // `a_spread_record_over_a_reordering_stream_says_what_it_lost`.
-        let placements: &[(&str, &str)] = match codec {
-            Codec::Av1 => &[("keyframe", "keyframes"), ("next", "all")],
-            _ => &[
-                ("keyframe", "keyframes"),
-                ("next", "all"),
-                ("spread:120", "all"),
-            ],
-        };
-        for (placement, scan) in placements.iter().copied() {
+        for (placement, scan) in [
+            ("keyframe", "keyframes"),
+            ("next", "all"),
+            ("spread:120", "all"),
+        ] {
             let tag = format!("{}-{}", codec.name(), placement.replace(':', "-"));
             let woven = weave(codec, placement, &tag);
             let mp4 = at(&format!("{tag}.mp4"));
@@ -515,30 +496,87 @@ fn a_container_read_finds_what_the_elementary_stream_read_finds() {
 }
 
 #[test]
-fn a_spread_record_over_a_reordering_stream_says_what_it_lost() {
+fn a_spread_record_over_a_reordering_stream_still_comes_back_whole() {
     skip_without_ffmpeg!();
-    // The case the test above leaves out, pinned rather than avoided.
-    // A record doled out over several carriers carries its span from
-    // each of them, and an AV1 stream muxed into MP4 does not keep the
-    // frame rate the elementary stream was woven against, so the later
-    // messages name a different span and the reader refuses them
-    // instead of merging two records into one. What it does not do is
-    // pass quietly: the record still arrives at whatever precision the
-    // planes that agreed give it, and the tool says on stderr how many
-    // messages it could not use.
-    let woven = weave(Codec::Av1, "spread:120", "av1-spread-report");
-    let mp4 = at("av1-spread-report.mp4");
+    // The hardest case for a record doled out over several carriers.
+    // Each of its messages names the span from its own carrier, and an
+    // AV1 stream muxed into MP4 does not keep the frame rate the
+    // elementary stream was woven against: SVT-AV1 codes several frames
+    // in one temporal unit and shows them later with
+    // `show_existing_frame`, so sample times in decode order are not a
+    // frame apart. Section 4 says the span is the first message's and
+    // the others need not agree, so every plane still lands in the
+    // record and nothing is dropped.
+    let woven = weave(Codec::Av1, "spread:120", "av1-spread-whole");
+    let mp4 = at("av1-spread-whole.mp4");
     mux(&woven, &mp4, &[]);
     let (printed, told) = ok(&["read", "--mp4", &text(&mp4), "--scan", "all"]);
-    assert_eq!(rows_of(&printed).len(), 6, "a record went missing entirely");
+    let rows = rows_of(&printed);
+    assert_eq!(rows.len(), 6, "a record went missing");
     assert!(
-        told.contains("messages were dropped"),
-        "the tool did not say it had dropped anything:\n{told}"
+        !told.contains("messages were dropped"),
+        "the reader threw something away:\n{told}"
     );
-    // Every record still has its sign plane, which is what makes it
-    // readable at all.
-    for row in rows_of(&printed) {
-        assert!(row.planes.starts_with("[0"), "{row:?}");
+    for row in &rows {
+        assert_eq!(
+            row.planes, "[0,1,2,3,4,5,6,7]",
+            "a record came back coarse: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn a_keyframe_scan_reads_the_last_sample_and_finds_the_record_on_it() {
+    skip_without_ffmpeg!();
+    // Section 7: a record whose span ends after the last keyframe has
+    // no keyframe to ride, so it rides the last access unit, which is
+    // not a sync sample. The fast path reads that sample as well, and
+    // the extra record is what proves it did.
+    let rows = at("past-the-last-keyframe.ndjson");
+    let mut text_rows = vectors();
+    // The fixtures are three seconds at a keyframe a second, so a span
+    // ending at 2.9 has no keyframe at or after it.
+    text_rows.push_str(
+        r#"{"space_id":1,"start_ms":2650,"end_ms":2900,"vector":[0.5,-0.5,0.25,-0.25,0.125,-0.125,1,-1,0.5,-0.5,0.25,-0.25,0.125,-0.125,1,-1]}"#,
+    );
+    text_rows.push('\n');
+    std::fs::write(&rows, text_rows).expect("the rows");
+
+    let woven = at("past.h264");
+    ok(&[
+        "weave",
+        "--video",
+        &text(&at("plain.h264")),
+        "--vectors",
+        &text(&rows),
+        "--out",
+        &text(&woven),
+        "--placement",
+        "keyframe",
+    ]);
+    let mp4 = at("past.mp4");
+    let mkv = at("past.mkv");
+    mux(&woven, &mp4, &[]);
+    mux(&mp4, &mkv, &[]);
+
+    for (name, flag, path) in [("mp4", "--mp4", &mp4), ("mkv", "--mkv", &mkv)] {
+        let (whole, _) = ok(&["read", flag, &text(path), "--scan", "all"]);
+        let (fast, told) = ok(&["read", flag, &text(path), "--scan", "keyframes"]);
+        assert_eq!(rows_of(&whole).len(), 7, "{name}");
+        assert_eq!(
+            rows_of(&fast),
+            rows_of(&whole),
+            "{name}: the fast path missed the record on the last access unit"
+        );
+        // And the saving is still a saving: the fast path is the sync
+        // samples and one more, not the whole track.
+        let visited: usize = told
+            .split("scan keyframes: ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: no sample count in {told}"));
+        assert_eq!(visited, 4, "{name}: three keyframes and the last sample");
     }
 }
 
@@ -684,6 +722,10 @@ fn an_mp4_index_is_appended_and_read_back_and_changes_nothing_else() {
         // The index says what the scan said.
         let (from_index, told) = ok(&["read", "--index", &text(&mp4)]);
         assert!(told.contains("came out of"), "{tag}: {told}");
+        assert!(
+            told.contains("a cut or a join"),
+            "{tag}: the tool did not say the index is taken at its word:\n{told}"
+        );
         assert_eq!(
             index_spans(&from_index),
             spans_of(&from_scan),
@@ -727,6 +769,85 @@ fn index_vectors(printed: &str) -> Vec<String> {
         .filter(|line| line.contains("\"vector\":"))
         .map(|line| field(line, "vector").expect("a vector").to_string())
         .collect()
+}
+
+#[test]
+fn an_index_keeps_a_carrier_that_sits_before_the_files_zero() {
+    skip_without_ffmpeg!();
+    // ffmpeg gives an MP4 muxed from an elementary stream an edit list
+    // whose media time lands after the first few samples, so ffprobe
+    // prints a negative `pts_time` for them. Section 8's time is signed
+    // so an index can say the same; clamping it to zero would put the
+    // entry on a picture it did not come off.
+    let declaration = vectors()
+        .lines()
+        .next()
+        .expect("the space declaration")
+        .to_string();
+    // One record available before the first picture, so `next` puts it
+    // on the very first access unit, which is the one before zero.
+    let early = r#"{"space_id":1,"start_ms":0,"end_ms":0,"available_ms":0,"vector":[1,-1,0.5,-0.5,0.25,-0.25,0.125,-0.125,1,-1,0.5,-0.5,0.25,-0.25,0.125,-0.125]}"#;
+    let rows = at("early.ndjson");
+    std::fs::write(&rows, format!("{declaration}\n{early}\n")).expect("the rows");
+
+    let woven = at("early.h264");
+    ok(&[
+        "weave",
+        "--video",
+        &text(&at("plain.h264")),
+        "--vectors",
+        &text(&rows),
+        "--out",
+        &text(&woven),
+        "--placement",
+        "next",
+    ]);
+    let mp4 = at("early.mp4");
+    mux(&woven, &mp4, &[]);
+
+    // The first packet really is before zero, by ffprobe's own reading.
+    let first = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            "-read_intervals",
+            "%+#1",
+        ])
+        .arg(&mp4)
+        .output()
+        .expect("ffprobe runs");
+    let first: f64 = String::from_utf8_lossy(&first.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.trim().trim_end_matches(',').parse().ok())
+        .expect("a first packet time");
+    assert!(first < 0.0, "the fixture does not start before zero");
+
+    let (from_scan, _) = ok(&["read", "--mp4", &text(&mp4), "--scan", "all"]);
+    assert!(
+        from_scan.contains("\"carrier_ms\":-"),
+        "the record did not ride a carrier before zero:\n{from_scan}"
+    );
+    ok(&["index", &text(&mp4)]);
+    let (from_index, _) = ok(&["read", "--index", &text(&mp4)]);
+    assert!(
+        from_index
+            .lines()
+            .any(|line| line.contains("\"time_ms\":-")),
+        "the index clamped a negative carrier:\n{from_index}"
+    );
+    assert_eq!(
+        index_spans(&from_index),
+        spans_of(&from_scan),
+        "the index and the scan disagree either side of zero"
+    );
 }
 
 #[test]

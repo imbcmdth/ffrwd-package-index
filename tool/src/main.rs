@@ -576,7 +576,7 @@ fn report(carried: &[Carried], name: &str, index: Option<&str>) -> Result<(), St
         max_reassemblies: 4096,
         orphan_wait_ms: i64::MAX,
     });
-    let mut spaces: Vec<(u32, Space)> = Vec::new();
+    let mut spaces: Vec<(i64, Space)> = Vec::new();
     for carrier in carried {
         for bytes in &carrier.units {
             let unit = match Unit::decode(bytes) {
@@ -587,7 +587,7 @@ fn report(carried: &[Carried], name: &str, index: Option<&str>) -> Result<(), St
             };
             for message in &unit.messages {
                 if let Message::Space(space) = message {
-                    spaces.push((carrier.time_ms.max(0) as u32, space.clone()));
+                    spaces.push((carrier.time_ms, space.clone()));
                 }
             }
             assembler.push_unit(carrier.time_ms, &unit);
@@ -641,17 +641,17 @@ fn report(carried: &[Carried], name: &str, index: Option<&str>) -> Result<(), St
 /// It holds SPACE and VECTOR messages only, so what goes in is the
 /// records as the assembler put them back together, each against the
 /// carrier its first message rode.
-fn build_index(spaces: &[(u32, Space)], records: &[Record]) -> Result<FileIndex, String> {
-    let mut pairs: Vec<(u32, Message)> = spaces
-        .iter()
-        .map(|(time, space)| (*time, Message::Space(space.clone())))
-        .collect();
+fn build_index(spaces: &[(i64, Space)], records: &[Record]) -> Result<FileIndex, String> {
+    let mut pairs: Vec<(i32, Message)> = Vec::new();
+    for (time, space) in spaces {
+        pairs.push((index_time(*time)?, Message::Space(space.clone())));
+    }
     for record in records {
         if record.values().is_err() {
             continue;
         }
         pairs.push((
-            record.carrier_ms.max(0) as u32,
+            index_time(record.carrier_ms)?,
             Message::Vector(VectorRecord {
                 space_id: record.space.space_id,
                 record_id: record.record_id,
@@ -684,8 +684,18 @@ fn dump_index(path: &str) -> Result<(), String> {
         }
         .map_err(|err| format!("{path}: {err}"))?;
         let tally = src.tally();
+        // Section 8: the index holds absolute times where the stream
+        // holds offsets, so a cut or a join leaves the stream right and
+        // the index wrong. Nothing cheap tells the two apart, because
+        // nothing in an index says which pictures it was built from;
+        // checking would mean reading the sample table to compare time
+        // ranges, which costs more than the index read it would guard
+        // and still misses a cut that kept the file's length. So the
+        // index is taken at its word, and the word is said out loud.
         eprintln!(
-            "{path}: the index came out of {} bytes read in {} seeks",
+            "{path}: the index came out of {} bytes read in {} seeks, \
+             and is taken at its word: a cut or a join since it was built \
+             would leave it wrong, and `ffrwd-index index` rebuilds it",
             tally.bytes_read, tally.seeks
         );
         found.ok_or_else(|| format!("{path} carries no index of this format"))?
@@ -912,13 +922,13 @@ fn attach_mkv(file: &str, out: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// The spaces and records a set of carriers holds, for the index.
-fn collect(carried: &[Carried]) -> (Vec<(u32, Space)>, Vec<Record>) {
+fn collect(carried: &[Carried]) -> (Vec<(i64, Space)>, Vec<Record>) {
     let mut assembler = Assembler::new(Limits {
         max_records: 1 << 20,
         max_reassemblies: 4096,
         orphan_wait_ms: i64::MAX,
     });
-    let mut spaces: Vec<(u32, Space)> = Vec::new();
+    let mut spaces: Vec<(i64, Space)> = Vec::new();
     for carrier in carried {
         for bytes in &carrier.units {
             let Ok(unit) = Unit::decode(bytes) else {
@@ -926,7 +936,7 @@ fn collect(carried: &[Carried]) -> (Vec<(u32, Space)>, Vec<Record>) {
             };
             for message in &unit.messages {
                 if let Message::Space(space) = message {
-                    spaces.push((carrier.time_ms.max(0) as u32, space.clone()));
+                    spaces.push((carrier.time_ms, space.clone()));
                 }
             }
             assembler.push_unit(carrier.time_ms, &unit);
@@ -938,6 +948,17 @@ fn collect(carried: &[Carried]) -> (Vec<(u32, Space)>, Vec<Record>) {
 
 fn offset(value: i64) -> Result<i32, String> {
     i32::try_from(value).map_err(|_| "a span too far from its carrier to write".to_string())
+}
+
+/// A carrier's time as section 8's signed milliseconds.
+///
+/// Signed because an MP4's edit list can put a carrier before the time
+/// the file starts at, and ffprobe reports a negative time for it; a
+/// clamp to zero would move the entry to a picture it did not come off.
+/// The field is a zigzag varint of at most five bytes, so it holds
+/// about twenty-four days either side of zero.
+fn index_time(value: i64) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| "a carrier too far from zero to index".to_string())
 }
 
 fn record_row(record: &Record) -> Result<Json, String> {

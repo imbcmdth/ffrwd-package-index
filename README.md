@@ -12,9 +12,9 @@ search is a single read; for a live stream it writes only the messages, as the
 vectors arrive.
 
 Reading a file is native, without ffmpeg: MP4 and Matroska, fragmented or not,
-with the tool reading the front of the sync samples alone where the records are
-and saying what that cost. Ten seconds of 640x360 comes back out of a sixteen
-hundredth of the file.
+with the tool reading the front of the sync samples and the last one, which is
+where the records are, and saying what that cost. Ten seconds of 640x360 comes
+back out of a sixteen hundredth of the file.
 
 The format is in [SPEC.md](SPEC.md). It is not tied to ffrwd.
 

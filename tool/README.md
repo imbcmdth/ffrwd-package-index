@@ -83,48 +83,47 @@ where it sits relative to its picture, and may disagree about the
 absolute number, because one of the two readers knows what time it is
 and the other was told a frame rate.
 
-One case where that costs something. A record under `spread` is doled
-out over several carriers, and section 4 has each of its messages name
-the same span from its own carrier; a reader refuses two that disagree.
-Weaving `spread` into an elementary stream computes those offsets
-against `--fps` and decode order, so they only still agree in a file
-whose presentation times are a frame apart in decode order. H.264 and
-HEVC remuxed from Annex B are: ffmpeg hands such a stream exactly that
-clock. An AV1 stream is not, because an encoder codes several frames in
-one temporal unit and shows them later with `show_existing_frame`. The
-reader then keeps the planes that agreed, says on stderr how many
-messages it could not use, and the record comes back coarser rather
-than wrong. `keyframe` and `next` put a whole record on one carrier and
-have nothing to disagree with.
+A record doled out over several carriers by `spread` is not a special
+case here. Section 4 says the record's span is the one its first
+message gives and that a reader does not require the later ones to
+agree, so the planes merge whatever the two clocks do. That matters
+most for AV1, where an encoder codes several frames in one temporal
+unit and shows them later with `show_existing_frame`, and sample times
+in decode order are not a frame apart: a `spread` record woven against
+`--fps` and read back off the container's own clock still comes back
+with all eight of its planes.
 
 ### What a scan costs
 
-`--scan keyframes` (the default for `read`) looks at sync samples
-alone, which is where section 7's `keyframe` policy puts every record.
-`--scan all` looks at every sample, which `next` and `spread` need.
-Either way only the leading NAL units or OBUs of a sample are read, up
-to the first coded slice or frame OBU, because that is where a unit
-goes. Each read says on stderr what it cost:
+`--scan keyframes` (the default for `read`) looks at the sync samples
+and at the last sample of the track. That last one is section 7's
+doing: a record whose span ends after the last keyframe has no keyframe
+to ride, so it rides the last access unit, and the fast path reads it
+for one extra sample. `--scan all` looks at every sample, which `next`
+and `spread` need. Either way only the leading NAL units or OBUs of a
+sample are read, up to the first coded slice or frame OBU, because that
+is where a unit goes. Each read says on stderr what it cost:
 
 ```
-big.mp4: scan keyframes: 14 of 300 samples, 9317 of 15564590 bytes read
-  (0.06% of the file), 18 seeks
+big.mp4: scan keyframes: 15 of 300 samples, 9573 of 15564590 bytes read
+  (0.06% of the file), 19 seeks
 big.mp4: scan all: 300 of 300 samples, 82533 of 15564590 bytes read
   (0.53% of the file), 304 seeks
 ```
 
-Ten seconds of 640x360 with noise over it, fourteen sync samples, six
-records. A keyframe scan of it reads a sixteen-hundredth of the file,
-a full scan a two-hundredth, and reading the index instead is 4422
-bytes in three seeks. That ratio is the point of the `keyframe` policy,
-and printing it is how a claim about it stays a measurement.
+Ten seconds of 640x360 with noise over it, fourteen sync samples and a
+last sample, six records. A keyframe scan of it reads a sixteen
+hundredth of the file, a full scan a two hundredth, and reading the
+index instead is 4422 bytes in three seeks. That ratio is the point of
+the `keyframe` policy, and printing it is how a claim about it stays a
+measurement.
 
 Matroska costs more seeks for the same bytes: an MP4 has a sample table
 that says where everything is, and a Matroska file has to be walked
-block by block, which is one small read at each. The same file as
-`big.mkv` is 8152 bytes in 96 seeks for the keyframe scan, since its
-`Cues` say which clusters to go to, and 89802 bytes in 653 seeks for
-the full one.
+block by block, which is one small read at each. The same content as
+`big.mkv` is 8890 bytes in 112 seeks for the keyframe scan, since its
+`Cues` say which clusters to go to and one more walk finds the last
+block, and 89802 bytes in 653 seeks for the full one.
 
 ## The rows
 
@@ -225,9 +224,11 @@ before it, is counted on stderr rather than printed: there is nothing
 to reconstruct it from yet.
 
 `read --index` prints the same rows with a `time_ms` on each, which is
-the index's own record of the carrier's time. It takes an index on its
-own, `file.ffix`, or the file carrying one, `file.mp4` or `file.mkv`,
-and works out which from the first bytes.
+the index's own record of the carrier's time, on the container's clock
+and signed: an MP4's edit list can put a carrier before the time the
+file starts at, and ffprobe prints a negative time for it too. It takes
+an index on its own, `file.ffix`, or the file carrying one, `file.mp4`
+or `file.mkv`, and works out which from the first bytes.
 
 ## The file index
 
@@ -235,6 +236,18 @@ Section 8's copy of the messages at the container level, so that
 searching a file is one read instead of a scan. It is derived and never
 authoritative: a file without one loses nothing but speed, and
 `ffrwd-index index` builds it again whenever it is gone.
+
+Its times are absolute where the stream's are offsets, so a cut or a
+join made without re-encoding leaves the stream's records right and the
+index wrong. Section 8 has whatever cuts a file drop the index or
+rebuild it, and ffmpeg does the first of those for nothing: any remux
+drops a top-level box it does not know. What this tool cannot do is
+tell a stale index from a good one. Nothing in an index says which
+pictures it was built from, so a check would mean reading the sample
+table to compare time ranges, which costs more than the index read it
+would guard and still misses a cut that kept the file's length. So
+`read --index` takes the index at its word and says on stderr that it
+is doing so.
 
 ```
 ffrwd-index index out.mp4
@@ -287,8 +300,9 @@ fragmented file still works.
 ### Matroska
 
 Reading an attachment is native: `read --index file.mkv` finds the
-`AttachedFile` whose MIME type is `application/x-ffrwd-index` or whose
-name is `ffrwd-index.bin` and prints from it.
+first `AttachedFile` whose MIME type is `application/x-ffrwd-index` and
+prints from it. The MIME type is what identifies it; the file name is
+the writer's business, and this one writes `ffrwd-index.bin`.
 
 **Writing one needs ffmpeg**, which is why `index file.mkv` wants an
 `--out`. A Matroska attachment is not an append. It lives inside the
@@ -333,10 +347,10 @@ it carries the declarations.
 
 Records that never meet a carrier the policy would choose, a record
 whose span ends after the last keyframe for instance, go on the last
-access unit rather than being dropped. That last access unit is usually
-not a sync sample, so `read --scan keyframes` will not find such a
-record and `--scan all` will. A file long enough for every record's
-span to end before its last keyframe has none of them.
+access unit rather than being dropped. That access unit is usually not
+a sync sample, which is why `--scan keyframes` reads it as well: one
+extra sample, and the fast path stops having a blind spot at the end of
+every file.
 
 ## What it writes
 
