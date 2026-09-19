@@ -398,32 +398,82 @@ fn parse(bytes: &[char], at: &mut usize) -> Json {
     }
 }
 
-/// One run of the sidecar hosting `weave`, with a rows file.
-fn weave(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
-    weave_with_stdin(dir, input, params, &text(rows), &[])
+/// What standard input carries into one run, since only one thing can.
+enum Feed<'a> {
+    /// Nothing; the packets come off a file and the rows off a path.
+    None,
+    /// The rows, written once the run has started: a live writer has a
+    /// vector when the span it describes is already behind the stream.
+    Rows(&'a [u8]),
+    /// The packets, written a piece at a time: an encoder feeding a
+    /// filter does not hand over a whole file at once, and a rows file
+    /// then reaches the module while the packets are still moving.
+    Packets(&'a [u8]),
 }
 
-/// The same, with the rows arriving however the caller says: a path, or
-/// `-` for standard input, whose bytes are handed over after the run
-/// has started.
-fn weave_with_stdin(
-    dir: &Path,
-    input: &Path,
-    params: &str,
-    rows_in: &str,
-    stdin_bytes: &[u8],
-) -> Run {
+/// How params reach the module.
+enum Params<'a> {
+    /// On the command line, which is where short ones belong.
+    Inline(&'a str),
+    /// In a file, which is what `-params-from` is for: a spaces list
+    /// with a name, a dimensionality and two model URIs apiece is not a
+    /// thing to keep on a command line.
+    File(&'a str),
+}
+
+/// One run of the sidecar hosting `weave`, with a rows file.
+fn weave(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
+    run_weave(
+        dir,
+        &text(input),
+        Params::Inline(params),
+        &text(rows),
+        Feed::None,
+    )
+}
+
+/// The same, with the params read out of a file this writes.
+fn weave_with_params_file(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
+    let path = dir.join("params.json");
+    std::fs::write(&path, params).expect("write the params");
+    run_weave(
+        dir,
+        &text(input),
+        Params::File(&text(&path)),
+        &text(rows),
+        Feed::None,
+    )
+}
+
+/// The same, with the packets arriving a piece at a time on standard
+/// input rather than off a file all at once.
+fn weave_streaming(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
+    let bytes = std::fs::read(input).expect("read the packets to feed");
+    run_weave(
+        dir,
+        "-",
+        Params::Inline(params),
+        &text(rows),
+        Feed::Packets(&bytes),
+    )
+}
+
+fn run_weave(dir: &Path, input: &str, params: Params<'_>, rows_in: &str, feed: Feed<'_>) -> Run {
     let out = dir.join("woven.nut");
+    let (flag, value) = match params {
+        Params::Inline(text) => ("-params", text.to_string()),
+        Params::File(path) => ("-params-from", path.to_string()),
+    };
     let mut child = Command::new(sidecar().expect("a sidecar"))
         .args([
             "-f",
             "nut",
             "-i",
-            &text(input),
+            input,
             "-m",
             &text(&module()),
-            "-params",
-            params,
+            flag,
+            &value,
             "-rows-in",
             rows_in,
             "-f",
@@ -439,19 +489,39 @@ fn weave_with_stdin(
         .spawn()
         .expect("spawn ffrwd-wasm");
     let mut stdin = child.stdin.take().expect("child stdin");
-    let bytes = stdin_bytes.to_vec();
+    let written: Vec<u8> = match feed {
+        Feed::None => Vec::new(),
+        Feed::Rows(bytes) | Feed::Packets(bytes) => bytes.to_vec(),
+    };
+    let paced = matches!(feed, Feed::Packets(_));
+    let delayed = matches!(feed, Feed::Rows(_));
     let writer = std::thread::spawn(move || {
-        if !bytes.is_empty() {
-            // Long enough that the packets are already moving: the point
-            // of a live run is that a row turns up while they do.
+        if delayed {
+            // Long enough that the packets are already moving.
             std::thread::sleep(std::time::Duration::from_millis(400));
-            let _ = stdin.write_all(&bytes);
+        }
+        if paced {
+            // A piece every few milliseconds, so the run takes calls
+            // rather than one. The rows reader opens its file as soon
+            // as the module does, which puts the rows in hand while
+            // there are still carriers to come.
+            let pieces = 24usize;
+            let step = written.len().div_ceil(pieces).max(1);
+            for piece in written.chunks(step) {
+                if stdin.write_all(piece).is_err() {
+                    break;
+                }
+                let _ = stdin.flush();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        } else if !written.is_empty() {
+            let _ = stdin.write_all(&written);
             let _ = stdin.flush();
         }
         drop(stdin);
     });
     let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
-    writer.join().expect("the rows writer");
+    writer.join().expect("the stdin writer");
     assert!(
         finished.status.success(),
         "ffrwd-wasm exited with {:?}\n{}",
@@ -470,10 +540,9 @@ fn weave_with_stdin(
 
 /// ffmpeg's per-frame hashes, the hash column alone.
 ///
-/// A muxer derives a sample's duration from its neighbours and two
-/// containers holding the same packets need not write the same table,
-/// so the columns around the hash are the container's business rather
-/// than the filter's. The hashes are the pictures.
+/// The columns around the hash are a decoder's account of the timing,
+/// which the packet comparison below pins exactly; these are the
+/// pictures.
 fn frame_hashes(path: &Path) -> Vec<String> {
     ffmpeg(&["-i", &text(path), "-f", "framemd5", "-"])
         .lines()
@@ -482,7 +551,7 @@ fn frame_hashes(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Every packet's pts, dts and flags, as ffprobe prints them.
+/// Every packet's pts, dts, duration and flags, as ffprobe prints them.
 fn packets(args: &[&str]) -> Vec<String> {
     ffprobe(
         &[
@@ -491,7 +560,7 @@ fn packets(args: &[&str]) -> Vec<String> {
                 "-of",
                 "csv=p=0",
                 "-show_entries",
-                "packet=pts,dts,flags",
+                "packet=pts,dts,duration,flags",
             ],
             args,
         ]
@@ -504,6 +573,10 @@ fn packets(args: &[&str]) -> Vec<String> {
 
 fn nut_packets(path: &Path) -> Vec<String> {
     packets(&["-f", "nut", "-i", &text(path)])
+}
+
+fn file_packets(path: &Path) -> Vec<String> {
+    packets(&["-i", &text(path)])
 }
 
 /// The woven NUT muxed with `-c copy`, which moves no picture.
@@ -649,7 +722,8 @@ fn whole_stream(name: &str, codec: &str, length_prefixed_input: bool) {
     assert_eq!(summary["dropped"], "0");
     assert!(summary["bytes_added"].parse::<u64>().expect("a count") > 0);
 
-    // (c) One packet in, one packet out, every timestamp untouched.
+    // (c) One packet in, one packet out, every timestamp untouched, off
+    // the wire the filter wrote.
     assert_eq!(
         nut_packets(&run.out),
         nut_packets(&input),
@@ -657,20 +731,29 @@ fn whole_stream(name: &str, codec: &str, length_prefixed_input: bool) {
     );
     assert_eq!(nut_packets(&input).len(), FRAMES);
 
-    // (a) The pictures are the pictures the encoder wrote, through two
-    // containers.
-    let unwoven_mp4 = dir.join("plain.mp4");
-    mux(&plain, &unwoven_mp4);
-    let wanted_hashes = frame_hashes(&unwoven_mp4);
-    assert_eq!(wanted_hashes.len(), FRAMES);
+    // (a) The pictures are the pictures the encoder wrote, and (c)
+    // again through a real muxer: pts, dts and duration for every
+    // packet, in both containers, against the same encode that never
+    // met the filter.
     let mut muxed = Vec::new();
     for container in ["mp4", "mkv"] {
+        let unwoven = dir.join(format!("plain.{container}"));
+        mux(&plain, &unwoven);
         let path = dir.join(format!("woven.{container}"));
         mux(&run.out, &path);
+        let wanted_hashes = frame_hashes(&unwoven);
+        assert_eq!(wanted_hashes.len(), FRAMES);
         assert_eq!(
             frame_hashes(&path),
             wanted_hashes,
             "{name}: the woven {container} does not decode to the same frames"
+        );
+        let wanted_packets = file_packets(&unwoven);
+        assert_eq!(wanted_packets.len(), FRAMES);
+        assert_eq!(
+            file_packets(&path),
+            wanted_packets,
+            "{name}: the woven {container} does not carry the same packets"
         );
         muxed.push(path);
     }
@@ -986,7 +1069,13 @@ fn rows_arriving_after_the_packets_ride_the_next_carrier_looking_back() {
     // The rows go in on standard input, written only once the run has
     // started: a live writer has a vector when the span it describes is
     // already behind the stream.
-    let run = weave_with_stdin(&dir, &input, &params("clip", dims, "next"), "-", &feed);
+    let run = run_weave(
+        &dir,
+        &text(&input),
+        Params::Inline(&params("clip", dims, "next")),
+        "-",
+        Feed::Rows(&feed),
+    );
 
     let woven = run.events("woven");
     assert_eq!(woven.len(), wanted.len(), "{:?}", run.rows);
@@ -1024,12 +1113,144 @@ fn rows_arriving_after_the_packets_ride_the_next_carrier_looking_back() {
 }
 
 // ------------------------------------------------------------------ //
+// A budget per access unit.
+// ------------------------------------------------------------------ //
+
+/// The `spread` policy, with a budget too small to hold one message.
+///
+/// A record then leaves as SLICES, which is section 6, and the point of
+/// the policy is that the bitrate it adds stays level: no access unit
+/// takes more than the budget. Since a FRAGMENT names the record it
+/// slices and not which of that record's values, a record cut this way
+/// goes as one value, and the proof that it was right is that every
+/// plane comes back out of an elementary stream read in DECODE order,
+/// which is not the order the slices were written in.
+///
+/// The packets arrive a piece at a time on standard input, the way an
+/// encoder hands them over, so the rows are in the module's hands while
+/// there are still carriers to come. Off a file the whole stream can
+/// reach the module before the first row does, and then there is no
+/// budget left to spread anything over.
+#[test]
+fn a_budget_spreads_a_record_across_carriers_as_slices() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("spread");
+    let input = encode(&dir, "h264");
+    let dims = 512;
+    let rows = dir.join("rows.ndjson");
+    let values: Vec<f32> = (0..dims).map(|c| ((c % 17) as f32) * 0.05 - 0.4).collect();
+    let printed: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+    std::fs::write(
+        &rows,
+        format!(
+            r#"{{"space":"clip","start_t":0,"end_t":0.5,"vector":[{}]}}"#,
+            printed.join(",")
+        ) + "\n",
+    )
+    .expect("write the rows");
+
+    // Forty bytes of messages per access unit, where one plane's
+    // message is past eighty.
+    let params = format!(
+        r#"{{"spaces":[{{"name":"clip","dims":{dims},"encoding":"i8","model":"test:clip"}}],"placement":"spread","budget":40,"escapes":{ESCAPES}}}"#
+    );
+    let run = weave_streaming(&dir, &input, &params, &rows);
+
+    let woven = run.events("woven");
+    assert!(
+        woven.len() > 4,
+        "one record over {} carriers is not a spread: {:?}",
+        woven.len(),
+        run.rows
+    );
+    // The bitrate stays level: no carrier took more than the budget.
+    for row in &woven {
+        let bytes: usize = row["bytes"].parse().expect("a byte count");
+        assert!(bytes <= 40, "a carrier took {bytes} bytes: {row:?}");
+    }
+    // The record's first row names the span, which is inside the value
+    // being sliced rather than on the slices.
+    let first = &woven[0];
+    assert!(close(first["start_t"].parse().expect("a time"), 0.0));
+    assert!(close(first["end_t"].parse().expect("a time"), 0.5));
+    let summary = run.summary();
+    assert_eq!(summary["records"], "1");
+    assert_eq!(summary["late"], "0");
+    assert_eq!(summary["dropped"], "0");
+    assert_eq!(nut_packets(&run.out), nut_packets(&input));
+
+    // Every slice came back, in the codec's own order and not the
+    // writer's, and the record is whole.
+    let mp4 = dir.join("woven.mp4");
+    mux(&run.out, &mp4);
+    let plain_mp4 = dir.join("plain.mp4");
+    mux(&input, &plain_mp4);
+    assert_eq!(frame_hashes(&mp4), frame_hashes(&plain_mp4));
+    assert_eq!(file_packets(&mp4), file_packets(&plain_mp4));
+
+    let stream = annexb(&dir, &mp4, "h264");
+    let slices = fragments(&stream);
+    assert!(
+        slices > 1,
+        "the record went in {slices} slices, so it was never cut"
+    );
+    let read = read_tool(&stream);
+    let records: Vec<&BTreeMap<String, String>> = read
+        .iter()
+        .filter(|row| row.contains_key("record_id"))
+        .collect();
+    assert_eq!(records.len(), 1, "the record did not come back: {read:?}");
+    assert_eq!(
+        records[0]["planes"], "0,1,2,3,4,5,6,7",
+        "a plane was lost between the slices"
+    );
+    let got: Vec<f64> = records[0]["vector"]
+        .split(',')
+        .map(|v| v.parse().expect("a component"))
+        .collect();
+    assert_eq!(got.len(), dims);
+    for (component, (got, want)) in got.iter().zip(expected(&values)).enumerate() {
+        assert!(
+            close(*got, f64::from(want)),
+            "component {component} is {got}, not {want}"
+        );
+    }
+}
+
+/// How many FRAGMENT messages an Annex B stream carries.
+fn fragments(stream: &Path) -> usize {
+    let bytes = std::fs::read(stream).expect("read the stream");
+    let mut count = 0usize;
+    for au in ffrwd_index_core::avc::access_units(&bytes, ffrwd_index_core::avc::Codec::H264) {
+        for raw in ffrwd_index_core::avc::units_annexb(
+            &bytes[au.start..au.end],
+            ffrwd_index_core::avc::Codec::H264,
+        ) {
+            let Ok(unit) = Unit::decode(&raw) else {
+                continue;
+            };
+            count += unit
+                .messages
+                .iter()
+                .filter(|m| matches!(m, Message::Fragment(_)))
+                .count();
+        }
+    }
+    count
+}
+
+// ------------------------------------------------------------------ //
 // More than one space.
 // ------------------------------------------------------------------ //
 
 /// Record ids count per space, so two spaces writing their first record
 /// are both record 0, and everything downstream has to carry the space
 /// beside the id to tell them apart.
+///
+/// The params go in through `-params-from`, which is where a spaces list
+/// belongs: each space carries a name, a dimensionality and up to two
+/// model URIs, and a run declaring a handful of them is past what a
+/// command line should hold.
 #[test]
 fn two_spaces_keep_their_own_records_apart() {
     let Some(_) = sidecar() else { return };
@@ -1060,7 +1281,7 @@ fn two_spaces_keep_their_own_records_apart() {
         {"name":"clip","dims":48,"encoding":"i8","modality":"picture","model":"test:clip"},
         {"name":"text","dims":12,"encoding":"f16","modality":"speech","model":"test:text"}
     ],"escapes":2}"#;
-    let run = weave(&dir, &input, params, &rows);
+    let run = weave_with_params_file(&dir, &input, params, &rows);
     let woven = run.events("woven");
     assert_eq!(woven.len(), 2, "{:?}", run.rows);
     let by_space: BTreeMap<&str, &BTreeMap<String, String>> = woven

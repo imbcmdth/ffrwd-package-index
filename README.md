@@ -86,7 +86,7 @@ One JSON object, through `init` or `set-params`.
 | `placement` | `keyframe` (the default), `next` or `spread` |
 | `budget` | bytes of messages per access unit. Belongs to `spread`, and `spread` needs one |
 | `escapes` | how many of a vector's largest components an `i8` space sends exactly rather than quantized. 2 by default, 16 at most |
-| `planes` | how many of an `i8` record's eight bit-planes are sent at all, 1 to 8. All eight by default |
+| `planes` | how many of an `i8` record's eight bit-planes are sent at all, 1 to 8. All eight by default. Section 5 lets a writer stop early where it knows the space does not need the rest; the measurements say four planes of a MiniLM space reconstruct to cosine 0.991 |
 
 A space's fields are section 3's, and they are the fields `tool/`'s own rows
 spell, read by the same code:
@@ -171,12 +171,33 @@ one per row that could not be read, and one summary at the end.
 | `records`, `late`, `dropped`, `bytes_added`, `spaces` | summary | records woven, records nothing carried, rows that could not be read, every byte the packets grew by (framing included), and spaces declared |
 
 A record goes out whole under `keyframe` and `next`, so there is one `woven`
-row per record. Under `spread` a record is doled out plane by plane as the
-budget allows, and there is one `woven` row per group of messages that went
-somewhere; the summary counts the record once. The last access unit may take
-two of those groups, what the budget allowed and then whatever was left, since
-the budget does not apply to the sweep that puts the leftovers on the last
-carrier rather than losing them.
+row per record. Under `spread` a record is doled out as the budget allows, and
+there is one `woven` row per group of messages that went somewhere; the summary
+counts the record once, and the record's own span is on its first row. The last
+access unit may take two of those groups, what the budget allowed and then
+whatever was left, since the budget does not apply to the sweep that puts the
+leftovers on the last carrier rather than losing them.
+
+### The budget, planes and slices
+
+Section 5 gives a writer with a budget two ways to send the layered encoding
+and section 6 gives it a third, and which is right depends on the budget.
+
+- **One message per bit-plane**, when a plane's message fits the budget. Eight
+  carriers take eight planes, plane 0 first, and a reader that has only the
+  first few reads a coarser vector rather than a wrong one.
+- **One message, cut into slices**, when it does not. A FRAGMENT names the
+  record it slices and not which of that record's values, so a record cut into
+  slices has to have exactly one value to cut: if it were split into planes
+  first, planes 1 to 7, whose messages are all the same length, could not be
+  told apart. That only shows up where slices reach a reader out of
+  presentation order, which is every elementary stream with B-frames in it,
+  and it shows up as a record that never completes. So a budget below one
+  plane's message sends the whole record as one value and lets the planner cut
+  it.
+
+Either way no access unit takes more than the budget, which is what the policy
+is for.
 
 **This module writes no index.** SPEC.md section 8's file index is a copy of
 the messages at the container level, and a module cannot write one: it has no
@@ -187,35 +208,57 @@ that reads a finished file and writes a `uuid` box or a Matroska attachment.
 [notes/packet-filter-placement.md](notes/packet-filter-placement.md) section 3
 is what it would take.
 
+### Which clock a span is on
+
+Section 4 says the format carries only offsets, and that however a writer is
+told a span, the span and the carrier's presentation time have to be on one
+clock before it subtracts. The clock here is the stream's own: a row's
+`start_t` is compared against `pts * time_base`, the presentation time the
+packets themselves carry. A stream's first picture is often not at zero -
+ffmpeg gives a four-second H.264 encode with two B-frames a first presented
+`pts` of 4096 in a time base of 1/51200, which is 0.08 seconds - so a producer
+whose rows count from the first picture and a stream that does not start there
+are 80 milliseconds apart. Either put the rows on the stream's clock, or offset
+them before handing them over.
+
 ### Decode order, and what is held
 
 Packets arrive in decode order. The placement policies speak of presentation
 time, so something has to hold a packet until its place among its neighbours is
-settled, and this is how: `dts` never decreases and no packet is presented
-before it is decoded, so once a packet with `dts = T` has arrived, nothing
-still to come can be presented before `T`. Every held packet whose `pts` is at
-or below the newest `dts` is therefore settled, in ascending `pts`, and that is
-exact - no guess at a reorder depth, which the interface does not carry anyway.
-Packets are released in the order they arrived, which is the order they have to
-leave in, and the hold is one reorder depth deep: four packets for a
-three-frame reorder.
+settled, and two rules do it.
 
-One packet is always held back until the final call. The final call carries no
-packets of its own, so a record that no carrier the policy would choose ever
-came along for would have nothing left to ride; this is the one access unit
-that is always still there. It costs one call of latency and no more.
+The stream's **decode delay**, which `input-stream` carries, is how far decode
+order and presentation order can differ. Once that many more packets have
+arrived after a held one, nothing still to come can be shown before it. That
+works from the first packet, which is what the head of a reordering stream
+needs: the wire settles no `dts` for exactly those packets.
+
+After them **`dts`** says it more tightly. It never decreases and no packet is
+presented before it is decoded, so once a packet with `dts = T` has arrived,
+nothing still to come can be presented before `T`, and every held packet whose
+`pts` is at or below it is settled in ascending `pts`. Whichever rule fires
+first settles the packet.
+
+Packets are released in the order they arrived, which is the order they have to
+leave in, and the hold is a reorder depth deep: four packets for a delay of
+two. Nothing is held past its turn. The final call of an instance's life
+carries the last packets, so a record that no carrier the policy would choose
+ever came along for rides a real last access unit; a host that ended with no
+packets at all would leave nothing to put one on, and it is then reported
+`late` rather than quietly dropped.
 
 ### What is bounded, and what happens at the cap
 
 - **Pending records: 4096.** A row arriving when that many records are already
   waiting for a carrier is dropped, with a `dropped` row saying so. This is
   what bounds a file run, where every row arrives before the first packet.
-- **Held packets: 256.** Past that, the packet earliest in presentation order
-  is settled whether or not its order was, one at a time, until the front of
-  the hold can be released. A stream whose timestamps settle normally never
-  reaches it; a stream whose `dts` the wire never carries is what it is for.
+- **Held packets: 256.** The backstop under both rules above. Past it the
+  packet earliest in presentation order is settled whether or not its order
+  was, one at a time, until the front of the hold can be released. A stream
+  whose header and timestamps say anything usable never reaches it.
 - **Units: 4096 bytes.** A carrier with more messages than that gets more than
-  one unit, each in its own NAL or OBU, which section 7 lets a reader accept.
+  one unit, each in its own NAL or OBU, splitting between messages, which is
+  what section 7 asks for.
 
 ## Using it from a query
 
