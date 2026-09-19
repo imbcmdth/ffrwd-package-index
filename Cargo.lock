@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "ffrwd-index"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-index-core",
+]
+
+[[package]]
 name = "ffrwd-index-core"
 version = "0.1.0"

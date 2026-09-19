@@ -5,6 +5,7 @@
 # never part of a wasm build.
 members = [
     "core",
+    "tool",
 ]
 resolver = "2"
 
