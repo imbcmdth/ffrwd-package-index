@@ -1,0 +1,14 @@
+[workspace]
+# `core` is the codec: plain Rust, no I/O, no dependencies, and the
+# only crate the future packet filter compiles in. `tool` is the
+# native command line over it, which reads and writes files and so is
+# never part of a wasm build.
+members = [
+    "core",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

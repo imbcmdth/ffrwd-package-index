@@ -1,0 +1,639 @@
+//! What a reader feeds messages to as they come out of a stream.
+//!
+//! Three things have to happen between a message and a record: planes
+//! of one record that rode different frames are merged, slices are
+//! reassembled, and vectors whose SPACE has not arrived wait for it.
+//! All three are unbounded if written naively, and the bytes come from
+//! a file anybody can write, so every one of them has a ceiling here
+//! and passes what it drops on to [`Assembler::dropped`] rather than
+//! growing.
+//!
+//! Record ids wrap at 65536 (section 4), so an id alone does not name a
+//! record. The assembler expands each id against the last it saw for
+//! that space, with the half-range window section 4 gives a writer: an
+//! id may be reused once 32768 newer records have gone by.
+
+use std::collections::{BTreeMap, VecDeque};
+
+use crate::fragment::Reassembly;
+use crate::message::{expand_record_id, Encoding, Message, Space, Unit, VectorBody, VectorRecord};
+use crate::quant::Planes;
+use crate::{Error, Result};
+
+/// How much an assembler will hold before it starts dropping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Records held at once, whole or waiting for planes.
+    pub max_records: usize,
+    /// Records being reassembled from slices at once.
+    pub max_reassemblies: usize,
+    /// How long a record waits for a SPACE that has not arrived, in
+    /// milliseconds of carrier time.
+    pub orphan_wait_ms: i64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        // A file reader wants everything; a live reader wants a bound.
+        // These are the live numbers, which a file reader raises.
+        Self {
+            max_records: 4096,
+            max_reassemblies: 64,
+            orphan_wait_ms: 30_000,
+        }
+    }
+}
+
+/// One record, as far as the messages so far describe it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    /// The space as it was declared.
+    pub space: Space,
+    pub record_id: u16,
+    /// The presentation time of the first carrier this record rode on.
+    pub carrier_ms: i64,
+    /// The span, in milliseconds of presentation time.
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// The body, merged from every message of this record.
+    pub body: VectorBody,
+    /// Which planes arrived, for an I8 record; `None` for the float
+    /// encodings, which arrive whole or not at all.
+    pub planes: Option<u8>,
+}
+
+impl Record {
+    /// The vector, reconstructed from whatever arrived.
+    pub fn values(&self) -> Result<Vec<f32>> {
+        self.body.values()
+    }
+}
+
+/// A record while it is still being put together.
+#[derive(Clone, Debug)]
+struct Held {
+    space_id: u8,
+    record_id: u16,
+    carrier_ms: i64,
+    start_ms: i64,
+    end_ms: i64,
+    /// The bodies of every VECTOR message of this record, in the order
+    /// they arrived. They stay raw until the SPACE says how to read
+    /// them, which may be never.
+    bodies: Vec<Vec<u8>>,
+}
+
+/// One record's slices, and the time of the carrier that opened them.
+#[derive(Clone, Debug)]
+struct Slices {
+    bytes: Reassembly,
+    /// The presentation time of the carrier of the slice at offset 0.
+    anchor_ms: Option<i64>,
+}
+
+/// Messages in, records out.
+#[derive(Debug)]
+pub struct Assembler {
+    limits: Limits,
+    spaces: BTreeMap<u8, Space>,
+    /// The last expanded sequence seen per space, for the wraparound.
+    sequence: BTreeMap<u8, u64>,
+    order: VecDeque<(u8, u64)>,
+    held: BTreeMap<(u8, u64), Held>,
+    slices: BTreeMap<(u8, u64), Slices>,
+    slice_order: VecDeque<(u8, u64)>,
+    now_ms: i64,
+    dropped: usize,
+}
+
+impl Assembler {
+    /// An assembler with the given ceilings.
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            spaces: BTreeMap::new(),
+            sequence: BTreeMap::new(),
+            order: VecDeque::new(),
+            held: BTreeMap::new(),
+            slices: BTreeMap::new(),
+            slice_order: VecDeque::new(),
+            now_ms: i64::MIN,
+            dropped: 0,
+        }
+    }
+
+    /// Every message of a unit, from a carrier at `carrier_ms`.
+    ///
+    /// A message the assembler cannot use is counted and skipped: one
+    /// bad record in a file does not stop the read.
+    pub fn push_unit(&mut self, carrier_ms: i64, unit: &Unit) {
+        for message in &unit.messages {
+            if self.push(carrier_ms, message).is_err() {
+                self.dropped += 1;
+            }
+        }
+    }
+
+    /// One message, from a carrier at `carrier_ms`.
+    pub fn push(&mut self, carrier_ms: i64, message: &Message) -> Result<()> {
+        self.now_ms = self.now_ms.max(carrier_ms);
+        match message {
+            Message::Space(space) => {
+                self.spaces.insert(space.space_id, space.clone());
+                Ok(())
+            }
+            Message::Vector(record) => self.push_vector(carrier_ms, record),
+            Message::Fragment(fragment) => {
+                let key = (
+                    fragment.space_id,
+                    self.expand(fragment.space_id, fragment.record_id),
+                );
+                if !self.slices.contains_key(&key) {
+                    self.evict_slices();
+                    self.slices.insert(
+                        key,
+                        Slices {
+                            bytes: Reassembly::new(fragment.total)?,
+                            anchor_ms: None,
+                        },
+                    );
+                    self.slice_order.push_back(key);
+                }
+                let slices = self.slices.get_mut(&key).ok_or(Error::FragmentBounds)?;
+                slices.bytes.push(fragment)?;
+                // Section 6: the offsets belong to the carrier of the
+                // slice at offset 0, not to whichever slice arrived
+                // last, so that carrier's time is kept here.
+                if fragment.offset == 0 {
+                    slices.anchor_ms = Some(carrier_ms);
+                }
+                if slices.bytes.complete() {
+                    let held = self.slices.remove(&key).ok_or(Error::FragmentBounds)?;
+                    self.slice_order.retain(|other| *other != key);
+                    let anchor = held.anchor_ms.unwrap_or(carrier_ms);
+                    let bytes = held.bytes.take().ok_or(Error::FragmentBounds)?;
+                    let record = VectorRecord::decode(&bytes)?;
+                    return self.push_vector(anchor, &record);
+                }
+                Ok(())
+            }
+            Message::Unknown { .. } => Ok(()),
+        }
+    }
+
+    /// The spaces declared so far.
+    pub fn spaces(&self) -> impl Iterator<Item = &Space> {
+        self.spaces.values()
+    }
+
+    /// One space, if it has been declared.
+    pub fn space(&self, space_id: u8) -> Option<&Space> {
+        self.spaces.get(&space_id)
+    }
+
+    /// The records in hand, in the order their first message arrived.
+    ///
+    /// A record whose space never arrived, or whose bodies do not read
+    /// in that space's encoding, is left out.
+    pub fn records(&self) -> Vec<Record> {
+        self.order
+            .iter()
+            .filter_map(|key| self.held.get(key))
+            .filter_map(|held| self.resolve(held).ok())
+            .collect()
+    }
+
+    /// How many records are being held, resolvable or not.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether anything is being held.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// How many messages and records were dropped: malformed, orphaned
+    /// past the wait, or pushed out by a ceiling.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// The bytes being held for records that are not finished.
+    pub fn footprint(&self) -> usize {
+        let records: usize = self
+            .held
+            .values()
+            .map(|held| held.bodies.iter().map(Vec::len).sum::<usize>())
+            .sum();
+        let slices: usize = self
+            .slices
+            .values()
+            .map(|slices| slices.bytes.footprint())
+            .sum();
+        records + slices
+    }
+
+    fn push_vector(&mut self, carrier_ms: i64, record: &VectorRecord) -> Result<()> {
+        let sequence = self.expand(record.space_id, record.record_id);
+        let key = (record.space_id, sequence);
+        let start_ms = carrier_ms + i64::from(record.start_off);
+        let end_ms = carrier_ms + i64::from(record.end_off);
+        match self.held.get_mut(&key) {
+            Some(held) => {
+                // Every message of a record describes the same span,
+                // each from its own carrier. They must agree.
+                if held.start_ms != start_ms || held.end_ms != end_ms {
+                    return Err(Error::Mismatch);
+                }
+                held.bodies.push(record.body.clone());
+            }
+            None => {
+                self.evict_records();
+                self.held.insert(
+                    key,
+                    Held {
+                        space_id: record.space_id,
+                        record_id: record.record_id,
+                        carrier_ms,
+                        start_ms,
+                        end_ms,
+                        bodies: vec![record.body.clone()],
+                    },
+                );
+                self.order.push_back(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// One held record, read in its space's encoding.
+    fn resolve(&self, held: &Held) -> Result<Record> {
+        let space = self.spaces.get(&held.space_id).ok_or(Error::Mismatch)?;
+        let mut bodies = held.bodies.iter();
+        let first = bodies.next().ok_or(Error::Mismatch)?;
+        let mut body = VectorBody::decode(space, first)?;
+        for next in bodies {
+            let next = VectorBody::decode(space, next)?;
+            // Only the layered encoding arrives in pieces. A float
+            // record that arrives twice is the same vector twice.
+            if let (VectorBody::I8(planes), VectorBody::I8(more)) = (&mut body, next) {
+                planes.merge(&more)?;
+            }
+        }
+        let planes = match (&body, space.encoding) {
+            (VectorBody::I8(planes), Encoding::I8) => Some(planes.present()),
+            _ => None,
+        };
+        Ok(Record {
+            space: space.clone(),
+            record_id: held.record_id,
+            carrier_ms: held.carrier_ms,
+            start_ms: held.start_ms,
+            end_ms: held.end_ms,
+            body,
+            planes,
+        })
+    }
+
+    /// A 16-bit record id as a sequence that does not wrap, against the
+    /// last id seen for that space, and remembers it.
+    fn expand(&mut self, space_id: u8, record_id: u16) -> u64 {
+        let sequence = expand_record_id(self.sequence.get(&space_id).copied(), record_id);
+        let entry = self.sequence.entry(space_id).or_insert(sequence);
+        if sequence > *entry {
+            *entry = sequence;
+        }
+        sequence
+    }
+
+    /// Makes room for one more record: the oldest orphan past its wait
+    /// first, then simply the oldest.
+    fn evict_records(&mut self) {
+        while let Some(key) = self.order.front().copied() {
+            let Some(held) = self.held.get(&key) else {
+                self.order.pop_front();
+                continue;
+            };
+            let orphaned = !self.spaces.contains_key(&held.space_id)
+                && self.now_ms.saturating_sub(held.carrier_ms) > self.limits.orphan_wait_ms;
+            if !orphaned {
+                break;
+            }
+            self.order.pop_front();
+            self.held.remove(&key);
+            self.dropped += 1;
+        }
+        while self.held.len() >= self.limits.max_records {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+            if self.held.remove(&key).is_some() {
+                self.dropped += 1;
+            }
+        }
+    }
+
+    /// Makes room for one more reassembly.
+    fn evict_slices(&mut self) {
+        while self.slices.len() >= self.limits.max_reassemblies {
+            let Some(key) = self.slice_order.pop_front() else {
+                break;
+            };
+            if self.slices.remove(&key).is_some() {
+                self.dropped += 1;
+            }
+        }
+    }
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self::new(Limits::default())
+    }
+}
+
+/// Planes merged out of several bodies of one record, for a caller that
+/// has the bodies already.
+pub fn merge_bodies(space: &Space, bodies: &[Vec<u8>]) -> Result<Planes> {
+    let mut merged: Option<Planes> = None;
+    for body in bodies {
+        let planes = Planes::decode(space.dims as usize, body)?;
+        match merged.as_mut() {
+            Some(held) => held.merge(&planes)?,
+            None => merged = Some(planes),
+        }
+    }
+    merged.ok_or(Error::Planes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{Fragment, Modality};
+
+    fn i8_space() -> Space {
+        let mut space = Space::new(1, 16, Encoding::I8);
+        space.modality = Modality::Picture;
+        space.model = "test:model".into();
+        space
+    }
+
+    fn vector(dims: usize) -> Vec<f32> {
+        (0..dims).map(|i| (i as f32 * 0.3).sin()).collect()
+    }
+
+    fn record(
+        space_id: u8,
+        record_id: u16,
+        planes: &Planes,
+        mask: u8,
+        start: i32,
+        end: i32,
+    ) -> VectorRecord {
+        VectorRecord {
+            space_id,
+            record_id,
+            start_off: start,
+            end_off: end,
+            body: planes.subset(mask).encode(),
+        }
+    }
+
+    #[test]
+    fn planes_from_several_carriers_become_one_record() {
+        let space = i8_space();
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::default();
+        assembler
+            .push(1000, &Message::Space(space.clone()))
+            .expect("a space");
+        // Plane 0 on one carrier, planes 1 and 2 on a later one, with
+        // each message's offsets taken from its own carrier.
+        assembler
+            .push(
+                1000,
+                &Message::Vector(record(1, 7, &planes, 0b0000_0001, -900, -100)),
+            )
+            .expect("plane 0");
+        assembler
+            .push(
+                2000,
+                &Message::Vector(record(1, 7, &planes, 0b0000_0110, -1900, -1100)),
+            )
+            .expect("planes 1 and 2");
+        let records = assembler.records();
+        assert_eq!(records.len(), 1, "one record, not three");
+        assert_eq!(records[0].planes, Some(0b0000_0111));
+        assert_eq!((records[0].start_ms, records[0].end_ms), (100, 900));
+        assert_eq!(records[0].carrier_ms, 1000);
+        let read = records[0].values().expect("a reconstruction");
+        assert_eq!(read.len(), 16);
+    }
+
+    #[test]
+    fn a_vector_waits_for_its_space_and_then_reads() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::default();
+        assembler
+            .push(0, &Message::Vector(record(1, 1, &planes, 0xff, 0, 500)))
+            .expect("a vector");
+        assert!(assembler.records().is_empty(), "no space, no record");
+        assert_eq!(assembler.len(), 1, "but it is held");
+        assembler
+            .push(0, &Message::Space(i8_space()))
+            .expect("a space");
+        assert_eq!(assembler.records().len(), 1, "the space arrived");
+    }
+
+    #[test]
+    fn a_space_that_never_arrives_is_dropped_after_the_wait() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let limits = Limits {
+            orphan_wait_ms: 1000,
+            ..Limits::default()
+        };
+        let mut assembler = Assembler::new(limits);
+        assembler
+            .push(0, &Message::Vector(record(1, 1, &planes, 0xff, 0, 100)))
+            .expect("a vector");
+        // A later carrier, past the wait, and one more record to make
+        // the assembler look at what it is holding.
+        assembler
+            .push(5000, &Message::Vector(record(1, 2, &planes, 0xff, 0, 100)))
+            .expect("a vector");
+        assert_eq!(assembler.len(), 1, "the first record aged out");
+        assert_eq!(assembler.dropped(), 1);
+    }
+
+    #[test]
+    fn the_ceiling_on_records_holds() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let limits = Limits {
+            max_records: 8,
+            ..Limits::default()
+        };
+        let mut assembler = Assembler::new(limits);
+        assembler
+            .push(0, &Message::Space(i8_space()))
+            .expect("a space");
+        for id in 0..100u16 {
+            assembler
+                .push(
+                    i64::from(id),
+                    &Message::Vector(record(1, id, &planes, 0xff, 0, 10)),
+                )
+                .expect("a vector");
+        }
+        assert!(assembler.len() <= 8, "held {}", assembler.len());
+        assert_eq!(assembler.dropped(), 92);
+        assert!(assembler.footprint() < 8 * 1024);
+    }
+
+    #[test]
+    fn record_ids_that_wrap_are_different_records() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::new(Limits {
+            max_records: 1024,
+            ..Limits::default()
+        });
+        assembler
+            .push(0, &Message::Space(i8_space()))
+            .expect("a space");
+        // 65534, 65535, 0, 1: the last two are new records, not the
+        // ones from the start of the stream.
+        for (index, id) in [65534u16, 65535, 0, 1].iter().enumerate() {
+            assembler
+                .push(
+                    index as i64 * 100,
+                    &Message::Vector(record(1, *id, &planes, 0xff, 0, 10)),
+                )
+                .expect("a vector");
+        }
+        assert_eq!(assembler.len(), 4, "four records across the wrap");
+        let records = assembler.records();
+        assert_eq!(
+            records.iter().map(|r| r.record_id).collect::<Vec<_>>(),
+            vec![65534, 65535, 0, 1]
+        );
+    }
+
+    #[test]
+    fn the_same_id_again_within_the_window_is_the_same_record() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::default();
+        assembler
+            .push(0, &Message::Space(i8_space()))
+            .expect("a space");
+        assembler
+            .push(
+                0,
+                &Message::Vector(record(1, 900, &planes, 0b0000_0001, 0, 10)),
+            )
+            .expect("plane 0");
+        assembler
+            .push(
+                0,
+                &Message::Vector(record(1, 900, &planes, 0b0000_0010, 0, 10)),
+            )
+            .expect("plane 1");
+        assert_eq!(assembler.len(), 1);
+        assert_eq!(assembler.records()[0].planes, Some(0b0000_0011));
+    }
+
+    #[test]
+    fn slices_become_a_record() {
+        let space = i8_space();
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let whole = record(1, 5, &planes, 0xff, -2000, -1000);
+        let slices = crate::fragment::fragment_record(&whole, 20).expect("slices");
+        assert!(slices.len() > 1);
+        let mut assembler = Assembler::default();
+        assembler.push(0, &Message::Space(space)).expect("a space");
+        for (index, slice) in slices.iter().enumerate() {
+            assembler
+                .push(3000 + index as i64, &Message::Fragment(slice.clone()))
+                .expect("a slice");
+        }
+        let records = assembler.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].planes, Some(0xff));
+        // Section 6: the span is relative to the carrier of the slice
+        // at offset 0, which is carrier 3000, not the one the last
+        // slice rode in on.
+        assert_eq!((records[0].start_ms, records[0].end_ms), (1000, 2000));
+        assert_eq!(records[0].carrier_ms, 3000);
+    }
+
+    #[test]
+    fn a_missing_slice_leaves_no_record_and_is_bounded() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let whole = record(1, 5, &planes, 0xff, 0, 10);
+        let slices = crate::fragment::fragment_record(&whole, 20).expect("slices");
+        let mut assembler = Assembler::new(Limits {
+            max_reassemblies: 2,
+            ..Limits::default()
+        });
+        assembler
+            .push(0, &Message::Space(i8_space()))
+            .expect("a space");
+        for id in 0..10u16 {
+            let mut first = slices[0].clone();
+            first.record_id = id;
+            assembler
+                .push(0, &Message::Fragment(first))
+                .expect("a slice");
+        }
+        assert!(assembler.records().is_empty());
+        assert!(assembler.footprint() < 4096, "{}", assembler.footprint());
+        assert!(assembler.dropped() >= 8);
+    }
+
+    #[test]
+    fn a_slice_of_an_impossible_size_is_refused() {
+        let mut assembler = Assembler::default();
+        let fragment = Fragment {
+            space_id: 1,
+            record_id: 1,
+            total: crate::fragment::MAX_VALUE_BYTES as u32 + 1,
+            offset: 0,
+            bytes: vec![1, 2, 3],
+        };
+        assert!(assembler.push(0, &Message::Fragment(fragment)).is_err());
+        assert_eq!(assembler.footprint(), 0);
+    }
+
+    #[test]
+    fn messages_of_one_record_that_disagree_about_the_span_are_refused() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::default();
+        assembler
+            .push(0, &Message::Space(i8_space()))
+            .expect("a space");
+        assembler
+            .push(0, &Message::Vector(record(1, 3, &planes, 0b0001, 0, 100)))
+            .expect("plane 0");
+        assert_eq!(
+            assembler.push(0, &Message::Vector(record(1, 3, &planes, 0b0010, 0, 200))),
+            Err(Error::Mismatch)
+        );
+    }
+
+    #[test]
+    fn a_unit_of_mixed_messages_counts_what_it_cannot_use() {
+        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let mut assembler = Assembler::default();
+        let unit = Unit::new(vec![
+            Message::Space(i8_space()),
+            Message::Vector(record(1, 1, &planes, 0xff, 0, 10)),
+            Message::Vector(record(1, 1, &planes, 0xff, 50, 60)),
+            Message::Unknown {
+                kind: 0x90,
+                value: vec![1, 2],
+            },
+        ]);
+        assembler.push_unit(0, &unit);
+        assert_eq!(assembler.records().len(), 1);
+        assert_eq!(assembler.dropped(), 1, "the disagreeing record");
+    }
+}

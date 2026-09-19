@@ -1,0 +1,11 @@
+[package]
+name = "ffrwd-index-core"
+version = "0.1.0"
+edition = "2021"
+description = "The ffrwd index format: messages, the layered 8-bit encoding, and carriage in H.264, HEVC and AV1"
+license = "Apache-2.0"
+
+# No dependencies on purpose. The f16 conversions are twenty lines and
+# the crate has to build for wasm32 targets a packet filter runs on,
+# where every added crate is a build to keep working.
+[dependencies]
