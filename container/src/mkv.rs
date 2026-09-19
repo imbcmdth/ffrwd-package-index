@@ -17,10 +17,9 @@
 //! **Keyframes.** A `SimpleBlock` says so in its flags. A `Block`
 //! inside a `BlockGroup` does not, and the rule there is the format's
 //! own: a block with no `ReferenceBlock` beside it references nothing,
-//! so it is a keyframe. A keyframe scan's map also carries the track's
-//! last block, keyframe or not, because section 7 puts a record with no
-//! keyframe left to ride on the last access unit. Where `Cues` answered
-//! the rest, finding it is one more cluster walked.
+//! so it is a keyframe. A keyframe scan reads the sync samples and
+//! nothing else: section 7 puts every record of a `keyframe` file on a
+//! keyframe, the last one included.
 //!
 //! **Lacing** packs several frames into one block. Video never uses it,
 //! every muxer sets `FlagLacing` to zero for a video track, and
@@ -481,10 +480,6 @@ fn block_header(bytes: &[u8]) -> Result<(u64, usize, i64, u8)> {
 /// time has been taken, the rest of the cluster is left unread, because
 /// the cue that asked for it has been answered.
 ///
-/// `last` is set to every block of the track the walk passes, whether
-/// or not the filter keeps it, so that a keyframe scan can still find
-/// the track's last sample: section 7 puts a record with no keyframe
-/// left to ride on the last access unit.
 fn walk_cluster<R: Read + Seek>(
     src: &mut Source<R>,
     cluster: Element,
@@ -492,7 +487,6 @@ fn walk_cluster<R: Read + Seek>(
     track: u64,
     keyframes_only: bool,
     stop_after: Option<i64>,
-    last: &mut Option<Sample>,
 ) -> Result<Vec<Sample>> {
     let end = cluster.end_or(limit);
     let mut at = cluster.body;
@@ -534,7 +528,6 @@ fn walk_cluster<R: Read + Seek>(
                         relative,
                         keyframe: flags & 0x80 != 0,
                     };
-                    *last = Some(sample_of(block, timestamp));
                     if !keyframes_only || block.keyframe {
                         out.push(sample_of(block, timestamp));
                     }
@@ -566,7 +559,6 @@ fn walk_cluster<R: Read + Seek>(
                         relative,
                         keyframe,
                     };
-                    *last = Some(sample_of(block, timestamp));
                     if !keyframes_only || keyframe {
                         out.push(sample_of(block, timestamp));
                     }
@@ -673,7 +665,6 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
     };
 
     let mut samples: Vec<Sample> = Vec::new();
-    let mut last: Option<Sample> = None;
     match cues {
         Some(cues) => {
             for (at, time) in cues {
@@ -690,18 +681,7 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
                     info.number,
                     true,
                     Some(time),
-                    &mut last,
                 )?);
-            }
-            // The cues name keyframes, and the last sample of the track
-            // is usually not one, so the last cluster is walked for it.
-            // That is one cluster of block headers, and it is what lets
-            // a keyframe scan find a record that had no keyframe left to
-            // ride. A cue that stopped this walk early leaves `last`
-            // pointing at the wrong block, so it is taken from here.
-            last = None;
-            if let Some(cluster) = map.clusters.last() {
-                walk_cluster(src, *cluster, seg.end, info.number, true, None, &mut last)?;
             }
         }
         None => {
@@ -713,7 +693,6 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
                     info.number,
                     keyframes_only,
                     None,
-                    &mut last,
                 )?);
                 if samples.len() > crate::mp4::MAX_SAMPLES {
                     return Err(Error::Format("more samples than this reader will hold"));
@@ -723,14 +702,7 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
     }
     // The blocks stay in the order the file has them, which is decode
     // order, the same order an MP4's sample tables are in and the order
-    // ffprobe lists packets in. A keyframe scan's map ends with the
-    // track's last block whether or not it is a keyframe, which is what
-    // `VideoTrack::scanned` then puts on the end of the scan.
-    if let Some(last) = last {
-        if samples.last().map(|sample| sample.offset) != Some(last.offset) {
-            samples.push(last);
-        }
-    }
+    // ffprobe lists packets in.
     for (index, sample) in samples.iter_mut().enumerate() {
         sample.index = index as u32;
         sample.pts *= multiplier;
@@ -846,8 +818,8 @@ mod tests {
     }
 
     /// `trailing` adds a block after the last keyframe, so that the
-    /// track's last sample is not a sync sample, which is the case a
-    /// keyframe scan has to read anyway.
+    /// track's last sample is not a sync sample, which is the shape a
+    /// keyframe scan must not go looking past.
     fn file_with_tail(segment_unknown: bool, cluster_unknown: bool, trailing: bool) -> Vec<u8> {
         let mut first = element(ID_TIMESTAMP, &[0]);
         first.extend_from_slice(&simple_block(1, 0, true, &[1, 2, 3, 4]));
@@ -924,9 +896,11 @@ mod tests {
     }
 
     #[test]
-    fn a_keyframe_scan_keeps_the_last_sample_of_the_track() {
-        // Section 7: a record whose span ends after the last keyframe
-        // rides the last access unit, so the fast path has to read it.
+    fn a_keyframe_scan_reads_the_sync_samples_and_nothing_else() {
+        // Section 7 puts every record of a `keyframe` file on a
+        // keyframe, the last one included, so the fast path has no
+        // reason to go and find the end of the track. On a transport
+        // stream there is no end to go and find.
         for (segment_unknown, cluster_unknown) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
@@ -945,14 +919,9 @@ mod tests {
                 .collect();
             assert_eq!(
                 visited,
-                vec![0, 100, 133],
-                "two keyframes and the last sample, segment unknown {segment_unknown}, \
-                 cluster unknown {cluster_unknown}"
+                vec![0, 100],
+                "the sync samples alone, segment unknown {segment_unknown},                  cluster unknown {cluster_unknown}"
             );
-            // And the last sample is the same bytes the full walk found.
-            let last = fast.scanned(Scan::Keyframes).pop().expect("a sample");
-            assert_eq!(last.offset, all.samples[3].offset);
-            assert_eq!(last.size, all.samples[3].size);
         }
     }
 

@@ -526,12 +526,12 @@ fn a_spread_record_over_a_reordering_stream_still_comes_back_whole() {
 }
 
 #[test]
-fn a_keyframe_scan_reads_the_last_sample_and_finds_the_record_on_it() {
+fn a_record_past_the_last_keyframe_is_on_a_keyframe_anyway() {
     skip_without_ffmpeg!();
-    // Section 7: a record whose span ends after the last keyframe has
-    // no keyframe to ride, so it rides the last access unit, which is
-    // not a sync sample. The fast path reads that sample as well, and
-    // the extra record is what proves it did.
+    // Section 7: a record whose span ends after the last keyframe rides
+    // the LAST KEYFRAME, with an end that looks forward, so the sync
+    // samples of a file hold all of its records and a keyframe scan
+    // never has to go and find the end of the track.
     let rows = at("past-the-last-keyframe.ndjson");
     let mut text_rows = vectors();
     // The fixtures are three seconds at a keyframe a second, so a span
@@ -566,17 +566,25 @@ fn a_keyframe_scan_reads_the_last_sample_and_finds_the_record_on_it() {
         assert_eq!(
             rows_of(&fast),
             rows_of(&whole),
-            "{name}: the fast path missed the record on the last access unit"
+            "{name}: the fast path missed the record past the last keyframe"
         );
-        // And the saving is still a saving: the fast path is the sync
-        // samples and one more, not the whole track.
+        // And the record really is ahead of the keyframe it rode: its
+        // span ends after its carrier, which is what a positive
+        // `end_off` says.
+        let past = rows_of(&fast)
+            .into_iter()
+            .find(|row| row.end_off > 0)
+            .unwrap_or_else(|| panic!("{name}: nothing looked forward in {:?}", rows_of(&fast)));
+        assert!(past.start_off < past.end_off, "{name}: {past:?}");
+        // And the saving is still a saving: the sync samples alone, not
+        // the whole track.
         let visited: usize = told
             .split("scan keyframes: ")
             .nth(1)
             .and_then(|rest| rest.split(' ').next())
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| panic!("{name}: no sample count in {told}"));
-        assert_eq!(visited, 4, "{name}: three keyframes and the last sample");
+        assert_eq!(visited, 3, "{name}: the three keyframes and no more");
     }
 }
 
@@ -1122,4 +1130,131 @@ fn an_index_box_that_is_not_last_is_refused_until_a_rewrite_is_asked_for() {
         1,
         "the rewrite left the old box in"
     );
+}
+
+// ---------------------------------------------------------------- //
+// A keyframe copy is the whole file.
+// ---------------------------------------------------------------- //
+
+/// Section 7's claim, through real ffmpeg: a file written with the
+/// `keyframe` policy gives up every one of its records to a copy that
+/// keeps the keyframes and throws the rest away.
+///
+/// That is what a compile-time reader will do, and it is why the rule
+/// changed: a record whose span ends after the last keyframe used to
+/// ride the last access unit, which such a copy never sees. Two ways of
+/// making the copy are covered because two demuxers honour different
+/// flags: `-discard nokey` is read by the MP4 demuxer and by little
+/// else, and the `noise=drop=not(key)` bitstream filter works wherever
+/// packets flow, which is how Matroska and MPEG-TS are done here.
+#[test]
+fn a_keyframe_copy_of_a_woven_file_holds_every_record() {
+    skip_without_ffmpeg!();
+    let rows = at("past-keys.ndjson");
+    let mut text_rows = vectors();
+    // The fixtures are three seconds at a keyframe a second, so a span
+    // ending at 2.9 has no keyframe at or after it and rides the one at
+    // two seconds looking forward.
+    text_rows.push_str(
+        r#"{"space_id":1,"start_ms":2650,"end_ms":2900,"vector":[0.5,-0.5,0.25,-0.25,0.125,-0.125,1,-1,0.5,-0.5,0.25,-0.25,0.125,-0.125,1,-1]}"#,
+    );
+    text_rows.push('\n');
+    std::fs::write(&rows, text_rows).expect("the rows");
+
+    for codec in Codec::every() {
+        let name = format!("keycopy-{}", codec.extension());
+        let woven = at(&format!("{name}.{}", codec.extension()));
+        ok(&[
+            "weave",
+            "--video",
+            &text(&at(&format!("plain.{}", codec.extension()))),
+            "--vectors",
+            &text(&rows),
+            "--out",
+            &text(&woven),
+            "--placement",
+            "keyframe",
+        ]);
+        let whole_mp4 = at(&format!("{name}-whole.mp4"));
+        let whole_mkv = at(&format!("{name}-whole.mkv"));
+        mux(&woven, &whole_mp4, &[]);
+        mux(&whole_mp4, &whole_mkv, &[]);
+
+        let (printed, _) = ok(&["read", "--mp4", &text(&whole_mp4), "--scan", "all"]);
+        let wanted = rows_of(&printed);
+        assert_eq!(wanted.len(), 7, "{name}: the whole file is not whole");
+        assert!(
+            wanted.iter().any(|row| row.end_off > 0),
+            "{name}: nothing in the fixture ends after its carrier, \
+             so a keyframe copy would pass whatever the rule was"
+        );
+
+        // The MP4 demuxer's own flag, which reads the sample table and
+        // never touches the rest of the file.
+        let keys_mp4 = at(&format!("{name}-keys.mp4"));
+        ffmpeg(&[
+            "-discard",
+            "nokey",
+            "-i",
+            &text(&whole_mp4),
+            "-c",
+            "copy",
+            "-f",
+            "mp4",
+            &text(&keys_mp4),
+        ]);
+        // And the bitstream filter, which works on anything: Matroska
+        // here, and MPEG-TS, which has no end of file to seek to at all.
+        let keys_mkv = at(&format!("{name}-keys.mkv"));
+        drop_non_keyframes(&whole_mkv, &keys_mkv, "matroska");
+        // And through MPEG-TS, which has no end of file to seek to at
+        // all, so a keyframe copy of one is the case the rule was
+        // changed for. This ffmpeg puts h264 and hevc in a transport
+        // stream and refuses av1, so that codec stops at the two
+        // containers above.
+        let mut ways = vec![
+            ("-discard nokey, mp4", "--mp4", keys_mp4),
+            ("noise=drop, matroska", "--mkv", keys_mkv),
+        ];
+        if codec != Codec::Av1 {
+            let whole_ts = at(&format!("{name}-whole.ts"));
+            mux(&whole_mp4, &whole_ts, &["-f", "mpegts"]);
+            let keys_ts = at(&format!("{name}-keys.ts"));
+            drop_non_keyframes(&whole_ts, &keys_ts, "mpegts");
+            // The tool reads MP4 and Matroska natively, so the
+            // transport stream's keyframes are put in a Matroska.
+            let keys_ts_mkv = at(&format!("{name}-keys-ts.mkv"));
+            mux(&keys_ts, &keys_ts_mkv, &[]);
+            ways.push(("noise=drop, mpegts", "--mkv", keys_ts_mkv));
+        }
+
+        for (how, flag, path) in &ways {
+            let (printed, _) = ok(&["read", flag, &text(path), "--scan", "all"]);
+            let found = rows_of(&printed);
+            assert_eq!(
+                found.len(),
+                wanted.len(),
+                "{name}: {how} gave {} of {} records",
+                found.len(),
+                wanted.len()
+            );
+            assert_eq!(&found, &wanted, "{name}: {how} read different records");
+        }
+    }
+}
+
+/// A copy of a file with every packet that is not a keyframe thrown
+/// away, which is what a reader taking the fast path asks ffmpeg for.
+fn drop_non_keyframes(from: &Path, out: &Path, format: &str) {
+    ffmpeg(&[
+        "-i",
+        from.to_str().expect("a path"),
+        "-c",
+        "copy",
+        "-bsf:v",
+        "noise=drop=not(key)",
+        "-f",
+        format,
+        out.to_str().expect("a path"),
+    ]);
 }

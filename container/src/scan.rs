@@ -31,11 +31,11 @@ use crate::{Error, Result, Sample, Source, TrackCodec, VideoTrack};
 /// Which samples a read visits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Scan {
-    /// The sync samples, and the last sample of the track. That is
-    /// where section 7's `keyframe` policy puts every record: whole
-    /// records on keyframes, and a record whose span ends after the
-    /// last keyframe on the last access unit. What makes reading a file
-    /// cheap is that this is a handful of samples out of thousands.
+    /// The sync samples. That is where section 7's `keyframe` policy
+    /// puts every record, the ones whose span ends after the last
+    /// keyframe included: those ride the last keyframe looking forward.
+    /// What makes reading a file cheap is that this is a handful of
+    /// samples out of thousands.
     #[default]
     Keyframes,
     /// Every sample, which `next` and `spread` need.

@@ -1590,3 +1590,125 @@ fn the_test_harness_reads_the_rows_it_checks() {
         1.08
     ));
 }
+
+// ------------------------------------------------------------------ //
+// The last keyframe holds what nothing else would.
+// ------------------------------------------------------------------ //
+
+/// Section 7 changed on 2026-09-19: a record whose span ends after the
+/// last keyframe rides that keyframe, with an `end_off` that looks
+/// forward, so the keyframes of a file hold all of its records and a
+/// reader of sync samples alone never has to go and find the end of the
+/// track. A writer streaming past does not know which keyframe is the
+/// last one, so the module holds each keyframe, and every packet behind
+/// it, until the next keyframe arrives or the stream ends.
+#[test]
+fn a_record_past_the_last_keyframe_rides_that_keyframe() {
+    let Some(_) = sidecar() else { return };
+    for codec in ["h264", "hevc", "av1"] {
+        let dir = scratch(&format!("last_keyframe_{codec}"));
+        let input = encode(&dir, codec);
+        let dims = 16;
+        let rows = dir.join("rows.ndjson");
+        // The encodes are four seconds at a keyframe a second, so a
+        // span ending at 3.8 has no keyframe at or after it.
+        let values: Vec<f32> = (0..dims).map(|c| (c as f32 * 0.41).sin()).collect();
+        let printed: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+        std::fs::write(
+            &rows,
+            format!(
+                r#"{{"space":"clip","start_t":3.5,"end_t":3.8,"vector":[{}]}}"#,
+                printed.join(",")
+            ) + "\n",
+        )
+        .expect("write the rows");
+
+        let run = weave(&dir, &input, &params("clip", dims, "keyframe"), &rows);
+        let woven = run.events("woven");
+        assert_eq!(woven.len(), 1, "{codec}: {:?}", run.rows);
+        let row = &woven[0];
+        assert!(
+            row["end_off_ms"].parse::<f64>().expect("an offset") > 0.0,
+            "{codec}: the record did not look forward: {row:?}"
+        );
+        let summary = run.summary();
+        assert_eq!(summary["late"], "0", "{codec}");
+        assert_eq!(
+            summary["overran"], "0",
+            "{codec}: the hold reached its bound"
+        );
+        assert_eq!(
+            nut_packets(&run.out),
+            nut_packets(&input),
+            "{codec}: holding a GOP changed the packets"
+        );
+
+        // The carrier really is a keyframe, and it is the last one.
+        // The times are the NUT's own, which is the clock the module
+        // reports in: a muxer shifts a stream whose first picture is
+        // not at zero, and this stream's is not.
+        let last_keyframe: f64 = ffprobe(&[
+            "-show_packets",
+            "-of",
+            "csv=p=0",
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-f",
+            "nut",
+            "-i",
+            &text(&run.out),
+        ])
+        .lines()
+        .filter(|line| line.contains(",K"))
+        .filter_map(|line| line.split(',').next().and_then(|value| value.parse().ok()))
+        .fold(f64::MIN, f64::max);
+        assert!(
+            close(row["carrier_t"].parse().expect("a time"), last_keyframe),
+            "{codec}: the record rode {}, and the last keyframe is at {last_keyframe}",
+            row["carrier_t"]
+        );
+
+        let mp4 = dir.join("woven.mp4");
+        mux(&run.out, &mp4);
+
+        // And a copy that keeps the keyframes and throws the rest away
+        // still has it, which is the whole point of the rule.
+        let keys = dir.join("keys.mp4");
+        ffmpeg(&[
+            "-discard",
+            "nokey",
+            "-i",
+            &text(&mp4),
+            "-c",
+            "copy",
+            "-f",
+            "mp4",
+            &text(&keys),
+        ]);
+        let read = read_container(&keys);
+        assert_eq!(
+            read.len(),
+            1,
+            "{codec}: a keyframe copy lost the record: {read:?}"
+        );
+    }
+}
+
+/// What `ffrwd-index read --mp4` prints, as rows.
+fn read_container(path: &Path) -> Vec<BTreeMap<String, String>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-index"))
+        .args(["read", "--mp4", &text(path), "--scan", "all"])
+        .output()
+        .expect("spawn ffrwd-index");
+    assert!(
+        output.status.success(),
+        "ffrwd-index read exited with {:?}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains("\"vector\":"))
+        .map(members)
+        .collect()
+}

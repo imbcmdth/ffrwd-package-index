@@ -98,6 +98,7 @@ pub struct Weaver {
     records: usize,
     dropped: usize,
     bytes_added: usize,
+    overran: usize,
 }
 
 /// What one carrier took.
@@ -108,6 +109,11 @@ pub struct Carried {
     pub messages: Vec<Message>,
     /// One row per record with something in those messages.
     pub rows: Vec<String>,
+    /// Whether this access unit may still be asked to take more, which
+    /// under the `keyframe` policy every keyframe is until the next one
+    /// goes by: see `core::placement::Placed::open`. A writer that streams holds it,
+    /// and every packet behind it, until it closes.
+    pub open: bool,
 }
 
 impl Weaver {
@@ -125,6 +131,7 @@ impl Weaver {
             records: 0,
             dropped: 0,
             bytes_added: 0,
+            overran: 0,
         }
     }
 
@@ -266,15 +273,24 @@ impl Weaver {
 
     /// The messages one access unit carries, and the rows saying so.
     pub fn carrier(&mut self, pts: i64, pts_ms: i64, keyframe: bool) -> Carried {
-        let messages = self.planner.carrier(Carrier { pts_ms, keyframe });
-        self.report(pts, pts_ms, messages)
+        let placed = self.planner.carrier(Carrier { pts_ms, keyframe });
+        let mut carried = self.report(pts, pts_ms, placed.messages);
+        carried.open = placed.open;
+        carried
     }
 
-    /// Everything still waiting, against the last access unit of the
-    /// stream. With the `keyframe` policy a record whose span ends
-    /// after the last keyframe has no carrier of its own, and the
-    /// alternative is losing it, so it rides the last access unit with
-    /// the offsets that says.
+    /// Everything still waiting, against the access unit the caller
+    /// held open.
+    ///
+    /// Under `keyframe` that is the last KEYFRAME, and the records
+    /// riding it have a positive `end_off` where their span ends after
+    /// it: section 7 keeps every record on a sync sample so that a
+    /// reader of sync samples alone has the file. Under `next` and
+    /// `spread` nothing is held and this is the last access unit.
+    ///
+    /// A caller with nothing open does not call this: there is no
+    /// access unit a keyframe reader would visit to put them on, and
+    /// [`Weaver::trailing`] reports them late instead.
     pub fn flush(&mut self, pts: i64, pts_ms: i64, keyframe: bool) -> Carried {
         let messages = self.planner.finish(Carrier { pts_ms, keyframe });
         self.report(pts, pts_ms, messages)
@@ -320,13 +336,25 @@ impl Weaver {
                 planes.get(&key).copied(),
             ));
         }
-        Carried { messages, rows }
+        Carried {
+            messages,
+            rows,
+            open: false,
+        }
     }
 
     /// Adds what the codec's own framing cost on top of the messages:
     /// the NAL or OBU header, and whatever escaping it needed.
     pub fn note_bytes(&mut self, added: usize) {
         self.bytes_added += added;
+    }
+
+    /// Notes one access unit that went out before it could be asked
+    /// for more, because the writer's hold reached its bound. Under
+    /// `keyframe` that is a keyframe a record might still have ridden,
+    /// and the record falls to the next keyframe or is reported late.
+    pub fn note_overrun(&mut self) {
+        self.overran += 1;
     }
 
     /// One row per record nothing carried, and the run's own tally.
@@ -353,6 +381,7 @@ impl Weaver {
                 ("dropped", number(self.dropped as f64)),
                 ("bytes_added", number(self.bytes_added as f64)),
                 ("spaces", number(self.config.spaces.len() as f64)),
+                ("overran", number(self.overran as f64)),
             ])
             .write(),
         );
@@ -512,6 +541,11 @@ fn seconds_to_ms(row: &Json, field: &str) -> Result<i64, String> {
 ///
 /// The cap is the backstop under both, for a stream whose timestamps
 /// say something neither rule can use.
+///
+/// A [`Reorder::barrier`] holds the release back beyond what the
+/// reordering needs: a writer whose placement may still add to an
+/// access unit cannot let that access unit, or anything behind it,
+/// leave. That is what section 7's last keyframe asks of a writer.
 pub struct Reorder<T> {
     slots: VecDeque<Slot<T>>,
     /// The floor every future packet's presentation time sits on.
@@ -522,6 +556,9 @@ pub struct Reorder<T> {
     /// How many packets have arrived, for the decode delay to count
     /// against.
     pushed: u64,
+    /// Nothing from this arrival onwards leaves, whatever it was
+    /// decided.
+    barrier: Option<u64>,
     /// No more packets are coming, so every held packet is settled.
     closed: bool,
     max_held: usize,
@@ -536,6 +573,16 @@ struct Slot<T> {
     decided: bool,
 }
 
+/// One packet whose place in presentation order has just been settled.
+pub struct Settled<'a, T> {
+    /// Its presentation timestamp, in whatever unit the caller pushed.
+    pub pts: i64,
+    /// Where it arrived in decode order, which is what a barrier is
+    /// set against.
+    pub seq: u64,
+    pub item: &'a mut T,
+}
+
 impl<T> Reorder<T> {
     pub fn new(max_held: usize, decode_delay: u32) -> Self {
         Self {
@@ -543,10 +590,41 @@ impl<T> Reorder<T> {
             settled: i64::MIN,
             decode_delay: u64::from(decode_delay),
             pushed: 0,
+            barrier: None,
             closed: false,
             max_held: max_held.max(1),
             forced: 0,
         }
+    }
+
+    /// Holds the packet most recently settled, and everything behind
+    /// it, out of the release until the barrier moves or lifts.
+    pub fn hold_from(&mut self, seq: u64) {
+        self.barrier = Some(seq);
+    }
+
+    /// Lets everything go again.
+    pub fn lift(&mut self) {
+        self.barrier = None;
+    }
+
+    /// Where the barrier stands, if anywhere.
+    pub fn barrier(&self) -> Option<u64> {
+        self.barrier
+    }
+
+    /// How many packets are held behind the barrier, and how many bytes
+    /// they measure by the caller's own reckoning.
+    pub fn behind_barrier(&self, size: impl Fn(&T) -> usize) -> (usize, usize) {
+        let Some(barrier) = self.barrier else {
+            return (0, 0);
+        };
+        self.slots
+            .iter()
+            .filter(|slot| slot.seq >= barrier)
+            .fold((0, 0), |(count, bytes), slot| {
+                (count + 1, bytes + size(&slot.item))
+            })
     }
 
     /// One packet, in decode order.
@@ -571,7 +649,7 @@ impl<T> Reorder<T> {
     /// The next packet in presentation order whose place is settled,
     /// marked as decided. The caller writes into it and then releases
     /// it in decode order with [`Reorder::release`].
-    pub fn settle(&mut self) -> Option<(i64, &mut T)> {
+    pub fn settle(&mut self) -> Option<Settled<'_, T>> {
         let pick = self
             .slots
             .iter()
@@ -579,17 +657,17 @@ impl<T> Reorder<T> {
             .filter(|(_, slot)| !slot.decided)
             .min_by_key(|(index, slot)| (slot.pts, *index))
             .map(|(index, _)| index)?;
+        let undecided = self.slots.iter().filter(|slot| !slot.decided).count();
         let slot = &self.slots[pick];
         // How many packets arrived after this one, which is what the
         // decode delay is counted against.
         let behind = self.pushed.saturating_sub(slot.seq + 1);
         let ready = self.closed || slot.pts <= self.settled || behind >= self.decode_delay;
-        // At the cap, one packet at a time is forced on: the front slot
-        // is what blocks the release, so forcing stops the moment it is
-        // decided rather than emptying the whole hold and giving up on
-        // the reordering that is still working.
-        let blocked = !self.slots.front().expect("a slot is held").decided;
-        let forced = !self.closed && blocked && self.slots.len() > self.max_held;
+        // At the cap, one packet at a time is forced on: the count is
+        // of what is UNDECIDED, since a barrier may be holding any
+        // number of decided packets and the reordering is not what put
+        // them there.
+        let forced = !self.closed && undecided > self.max_held;
         if !ready && !forced {
             return None;
         }
@@ -598,27 +676,44 @@ impl<T> Reorder<T> {
         }
         let slot = &mut self.slots[pick];
         slot.decided = true;
-        Some((slot.pts, &mut slot.item))
+        Some(Settled {
+            pts: slot.pts,
+            seq: slot.seq,
+            item: &mut slot.item,
+        })
     }
 
-    /// Everything at the front that has been decided, in the order it
-    /// arrived, which is the order it has to leave in.
+    /// Everything at the front that has been decided and is not behind
+    /// the barrier, in the order it arrived, which is the order it has
+    /// to leave in.
     ///
-    /// Nothing is held past its turn: the final call of an instance's
-    /// life carries the last packets, so a record nobody carried has a
-    /// real last carrier to ride and there is no reason to keep one out
-    /// of the stream for the whole run.
+    /// Nothing is held past its turn otherwise: the final call of an
+    /// instance's life carries the last packets, so a record nobody
+    /// carried has a real last carrier to ride and there is no reason
+    /// to keep one out of the stream for the whole run.
     pub fn release(&mut self) -> Vec<T> {
         let mut out = Vec::new();
-        while self.slots.front().is_some_and(|slot| slot.decided) {
+        while self
+            .slots
+            .front()
+            .is_some_and(|slot| slot.decided && !self.barrier.is_some_and(|at| slot.seq >= at))
+        {
             out.push(self.slots.pop_front().expect("a decided slot").item);
         }
         out
     }
 
+    /// One held packet by the arrival it was settled at.
+    pub fn at(&mut self, seq: u64) -> Option<&mut T> {
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.seq == seq)
+            .map(|slot| &mut slot.item)
+    }
+
     /// The held packet latest in presentation order, for a caller with
     /// a record nothing else will carry. None where nothing is held.
-    pub fn last_held(&mut self) -> Option<(i64, &mut T)> {
+    pub fn last_held(&mut self) -> Option<(i64, u64, &mut T)> {
         let pick = self
             .slots
             .iter()
@@ -626,7 +721,7 @@ impl<T> Reorder<T> {
             .max_by_key(|(index, slot)| (slot.pts, *index))
             .map(|(index, _)| index)?;
         let slot = &mut self.slots[pick];
-        Some((slot.pts, &mut slot.item))
+        Some((slot.pts, slot.seq, &mut slot.item))
     }
 
     /// How many packets are held.
@@ -933,6 +1028,58 @@ mod tests {
     }
 
     #[test]
+    fn a_record_past_the_last_keyframe_rides_that_keyframe_looking_forward() {
+        // Section 7: the keyframes of a file hold all of its records,
+        // so a record whose span ends after the last keyframe rides
+        // that keyframe with a positive end_off rather than riding the
+        // last access unit, which a reader of sync samples alone would
+        // never open.
+        let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 8)]));
+        // A span ending at five seconds, in a stream of four.
+        assert_eq!(
+            weaver.row(r#"{"space":"clip","start_t":4,"end_t":5,"vector":[1,2,3,4,5,6,7,8]}"#),
+            None
+        );
+        let mut open: Option<(i64, i64)> = None;
+        let mut rows = Vec::new();
+        for frame in 0..100i64 {
+            let pts_ms = frame * 40;
+            weaver.seen(pts_ms);
+            let carried = weaver.carrier(frame, pts_ms, frame % 25 == 0);
+            if carried.open {
+                open = Some((frame, pts_ms));
+            }
+            rows.extend(carried.rows);
+        }
+        assert!(rows.is_empty(), "the record rode something already");
+        let (pts, pts_ms) = open.expect("a keyframe was held open");
+        assert_eq!(pts_ms, 75 * 40, "the last keyframe was not the one held");
+        rows.extend(weaver.flush(pts, pts_ms, true).rows);
+
+        let woven = parsed(&rows);
+        assert_eq!(woven.len(), 1, "{rows:?}");
+        assert_eq!(
+            woven[0].get("carrier_t").and_then(Json::as_f64),
+            Some(3.0),
+            "the record did not ride the last keyframe"
+        );
+        assert_eq!(
+            woven[0].get("start_off_ms").and_then(Json::as_i64),
+            Some(1000)
+        );
+        assert_eq!(
+            woven[0].get("end_off_ms").and_then(Json::as_i64),
+            Some(2000),
+            "the end of the span is ahead of its carrier and must say so"
+        );
+        let trailing = parsed(&weaver.trailing());
+        assert_eq!(
+            trailing.last().unwrap().get("late").and_then(Json::as_i64),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn a_span_no_offset_can_reach_is_late_rather_than_wrong() {
         let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 4)]));
         // Four hundred days from the stream, which no svarint of
@@ -946,7 +1093,8 @@ mod tests {
             weaver.seen(frame * 40);
             weaver.carrier(frame, frame * 40, frame == 0);
         }
-        weaver.flush(29, 29 * 40, false);
+        // The keyframe held open is the first and only one.
+        weaver.flush(0, 0, true);
         let trailing = parsed(&weaver.trailing());
         assert_eq!(trailing.len(), 2, "one late row and the summary");
         assert_eq!(
@@ -1170,15 +1318,15 @@ mod tests {
         let mut most = 0usize;
         for (index, (pts, dts)) in frames.iter().enumerate() {
             reorder.push(index, *pts, *dts);
-            while let Some((pts, _)) = reorder.settle() {
-                settled.push(pts);
+            while let Some(settle) = reorder.settle() {
+                settled.push(settle.pts);
             }
             left.extend(reorder.release().into_iter().map(|index| index as i64));
             most = most.max(reorder.held());
         }
         reorder.close();
-        while let Some((pts, _)) = reorder.settle() {
-            settled.push(pts);
+        while let Some(settle) = reorder.settle() {
+            settled.push(settle.pts);
         }
         left.extend(reorder.release().into_iter().map(|index| index as i64));
         // A packet settles once `DELAY` more have arrived after it, so

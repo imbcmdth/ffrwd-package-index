@@ -40,6 +40,27 @@ pub struct Carrier {
     pub keyframe: bool,
 }
 
+/// What one access unit takes, and whether the writer must keep it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Placed {
+    /// The messages for this access unit's unit, which may be empty.
+    pub messages: Vec<Message>,
+    /// Whether this access unit may still be asked to take more.
+    ///
+    /// Section 7 puts a record whose span ends after the LAST keyframe
+    /// on that keyframe, with a positive `end_off`, so that the
+    /// keyframes of a file hold all of its records. A writer streaming
+    /// past does not know which keyframe is the last one until the next
+    /// one arrives, so under [`Placement::Keyframe`] every keyframe is
+    /// open from here until the one after it, and the writer holds it
+    /// and everything behind it until then. The access unit still open
+    /// when the stream ends is the one [`Planner::finish`] is handed.
+    ///
+    /// Under `next` and `spread` nothing is ever open: those policies
+    /// never look back.
+    pub open: bool,
+}
+
 /// A record waiting for a carrier.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pending {
@@ -142,8 +163,17 @@ impl Planner {
         });
     }
 
-    /// The messages for one access unit's unit, which may be empty.
-    pub fn carrier(&mut self, carrier: Carrier) -> Vec<Message> {
+    /// The messages for one access unit's unit, which may be empty, and
+    /// whether the writer must hold that access unit open.
+    pub fn carrier(&mut self, carrier: Carrier) -> Placed {
+        let open = matches!(self.policy, Placement::Keyframe) && carrier.keyframe;
+        Placed {
+            messages: self.messages_for(carrier),
+            open,
+        }
+    }
+
+    fn messages_for(&mut self, carrier: Carrier) -> Vec<Message> {
         let mut out = Vec::new();
         let mut room = match self.policy {
             Placement::Spread { budget_bytes } => budget_bytes,
@@ -178,12 +208,22 @@ impl Planner {
         out
     }
 
-    /// Everything still waiting, against one last carrier.
+    /// Everything still waiting, against the access unit the writer
+    /// held open.
     ///
-    /// A file writer calls this after its last access unit and puts
-    /// what comes back on that access unit: with the `keyframe` policy
-    /// a record whose span ends after the last keyframe has no carrier
-    /// of its own, and the alternative is losing it.
+    /// Under [`Placement::Keyframe`] that is the LAST KEYFRAME, which
+    /// is the one [`Placed::open`] last said to hold: a record whose
+    /// span ends after it has no keyframe of its own, and section 7 has
+    /// it ride that one with a positive `end_off` rather than ride the
+    /// last access unit, which a reader of sync samples alone would
+    /// never look at. Under `next` and `spread` nothing is held and the
+    /// caller passes the last access unit it has.
+    ///
+    /// A caller with no open access unit to give - a `keyframe` stream
+    /// with no keyframe in it, or one whose writer could not hold the
+    /// last one - has nowhere to put these records, and should report
+    /// them rather than call this with an access unit a keyframe reader
+    /// will not visit.
     pub fn finish(&mut self, carrier: Carrier) -> Vec<Message> {
         let mut vectors = Vec::new();
         let mut jobs = std::mem::take(&mut self.jobs);
@@ -362,23 +402,36 @@ pub fn plan(
     let mut queued = records.into_iter().peekable();
 
     let mut out = Vec::with_capacity(carriers.len());
-    for carrier in carriers {
+    // Which access unit the leftovers go on: the last one the planner
+    // said to hold open, which under `keyframe` is the last keyframe
+    // and under the other policies is nothing, so the last carrier of
+    // all stands in. A caller with every carrier in hand knows which is
+    // which without holding anything, which is why a file writer is
+    // two passes and a stream writer holds packets.
+    let mut open: Option<usize> = None;
+    for (index, carrier) in carriers.iter().enumerate() {
         while queued
             .peek()
             .is_some_and(|record| record.available_ms <= carrier.pts_ms)
         {
             planner.submit(queued.next().expect("a record"));
         }
-        out.push(planner.carrier(*carrier));
+        let placed = planner.carrier(*carrier);
+        if placed.open {
+            open = Some(index);
+        }
+        out.push(placed.messages);
     }
     for record in queued {
         planner.submit(record);
     }
-    if let Some(last) = carriers.last() {
-        let left = planner.finish(*last);
-        if let Some(messages) = out.last_mut() {
-            messages.extend(left);
-        }
+    let last = match planner.policy {
+        Placement::Keyframe => open,
+        _ => carriers.len().checked_sub(1),
+    };
+    if let Some(index) = last {
+        let left = planner.finish(carriers[index]);
+        out[index].extend(left);
     }
     out
 }
@@ -698,8 +751,12 @@ mod tests {
     }
 
     #[test]
-    fn a_record_that_never_meets_a_keyframe_still_goes_out_at_the_end() {
-        let carriers = carriers(10, 20); // one keyframe, at the start
+    fn a_record_that_never_meets_a_keyframe_rides_the_last_one() {
+        // Two keyframes and nothing after them that either record's
+        // span reaches: section 7 puts both on the second keyframe,
+        // with the end of the span ahead of the carrier, so a reader of
+        // sync samples alone still has them.
+        let carriers = carriers(20, 12); // keyframes at 0 and 1200 ms
         let plan = plan(Placement::Keyframe, &[space(1)], &records(2), &carriers);
         let vectors = plan
             .iter()
@@ -707,11 +764,59 @@ mod tests {
             .filter(|m| matches!(m, Message::Vector(_)))
             .count();
         assert_eq!(vectors, 16, "eight planes of each of two records");
-        let last = plan.last().expect("a carrier");
+        for (index, messages) in plan.iter().enumerate() {
+            let carried = messages
+                .iter()
+                .filter(|m| matches!(m, Message::Vector(_)))
+                .count();
+            if carried > 0 {
+                assert!(
+                    carriers[index].keyframe,
+                    "a record rode carrier {index}, which is no keyframe"
+                );
+            }
+        }
+        let last_keyframe = carriers
+            .iter()
+            .rposition(|carrier| carrier.keyframe)
+            .expect("a keyframe");
         assert!(
-            last.iter().any(|m| matches!(m, Message::Vector(_))),
-            "the leftovers went on the last carrier"
+            last_keyframe < carriers.len() - 1,
+            "the fixture ends on a keyframe, so nothing is being tested"
         );
+        // The second record's span ends at 2000 ms, past every carrier,
+        // so it rode the last keyframe looking forward.
+        let forward = placed(&plan, &carriers)
+            .into_iter()
+            .filter(|(_, record)| record.end_off > 0)
+            .count();
+        assert_eq!(forward, 8, "the later record did not look forward");
+        assert!(
+            plan[last_keyframe]
+                .iter()
+                .any(|m| matches!(m, Message::Vector(_))),
+            "the leftovers did not go on the last keyframe"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_stays_open_until_the_next_one() {
+        let mut planner = Planner::new(Placement::Keyframe);
+        planner.declare(space(1));
+        let mut opened = Vec::new();
+        for (index, carrier) in carriers(40, 10).iter().enumerate() {
+            if planner.carrier(*carrier).open {
+                opened.push(index);
+            }
+        }
+        assert_eq!(opened, vec![0, 10, 20, 30], "every keyframe and no other");
+
+        // And a live policy holds nothing at all.
+        let mut planner = Planner::new(Placement::Next);
+        planner.declare(space(1));
+        assert!(carriers(40, 10)
+            .iter()
+            .all(|carrier| !planner.carrier(*carrier).open));
     }
 
     #[test]
@@ -732,11 +837,15 @@ mod tests {
             available_ms: -1,
             bodies: vec![vec![1, 2, 3]],
         });
-        let messages = planner.carrier(carriers[0]);
+        let placed = planner.carrier(carriers[0]);
         assert!(
-            !messages.iter().any(|m| matches!(m, Message::Vector(_))),
+            !placed
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Vector(_))),
             "an offset that does not fit was written anyway"
         );
+        assert!(!placed.open, "the live policies never look back");
         assert_eq!(planner.pending(), 0);
         assert_eq!(planner.skipped(), 1);
     }

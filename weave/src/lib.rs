@@ -43,6 +43,7 @@ use exports::ffrwd::av::packet_filter::{
 };
 
 use ffrwd_index_core::message::{Message, Unit};
+use ffrwd_index_core::placement::Placement;
 use ffrwd_index_core::UNIT_SOFT_LIMIT;
 use ffrwd_index_rows::weave::{Config, Reorder, Weaver, MAX_HELD_PACKETS};
 
@@ -71,9 +72,37 @@ const ROWS_SCHEMA: &str = r#"{
     "late": {"type": "integer"},
     "dropped": {"type": "integer"},
     "bytes_added": {"type": "integer", "description": "Every byte the packets grew by, framing included."},
-    "spaces": {"type": "integer"}
+    "spaces": {"type": "integer"},
+    "overran": {"type": "integer", "description": "Access units that went out before the placement could be asked for more, because the writer's hold reached its bound."}
   }
 }"#;
+
+/// How many packets one held GOP may be before the keyframe goes out
+/// with what it has.
+///
+/// The reorder cap is a handful of frames and is far too small for
+/// this: a GOP is seconds of video, and under `keyframe` the whole of
+/// it is held so that its keyframe can still take a record nothing
+/// else will carry. A thousand packets is forty seconds at 25 fps and
+/// ten at a hundred, which is longer than any keyframe interval worth
+/// writing.
+const MAX_GOP_PACKETS: usize = 1024;
+
+/// And how many bytes, which is the bound that actually matters: a
+/// held GOP is held in memory, and a thousand packets of 4K is not the
+/// same thing as a thousand packets of a thumbnail. Thirty-two
+/// mebibytes is about fifteen seconds at 20 Mbps.
+const MAX_GOP_BYTES: usize = 32 << 20;
+
+/// The access unit the writer is holding open under `keyframe`.
+#[derive(Clone, Copy, Debug)]
+struct OpenCarrier {
+    /// Its presentation timestamp, in the stream's own base.
+    pts: i64,
+    /// Where it arrived in decode order, which is how it is found
+    /// again in the hold.
+    seq: u64,
+}
 
 /// What one open instance holds.
 struct State {
@@ -83,6 +112,8 @@ struct State {
     /// The stream's time base, as a fraction of a second.
     num: i64,
     den: i64,
+    /// The keyframe still open, under `keyframe` placement alone.
+    open: Option<OpenCarrier>,
     /// The params in force, kept so `set-params` can say what changed.
     config: Config,
 }
@@ -147,6 +178,7 @@ impl Guest for Weave {
                 framing,
                 num: i64::from(coded.time_base.num),
                 den: i64::from(coded.time_base.den),
+                open: None,
                 config,
             });
         });
@@ -218,24 +250,65 @@ impl Guest for Weave {
             // Carriers in presentation order, which is not the order the
             // packets arrived in.
             let mut added = Vec::new();
-            while let Some((pts, packet)) = state.reorder.settle() {
+            while let Some(settled) = state.reorder.settle() {
+                let pts = settled.pts;
+                let seq = settled.seq;
                 let pts_ms = to_ms(pts, state.num, state.den);
-                let carried = state.weaver.carrier(pts, pts_ms, packet.keyframe);
-                added.push(apply(state.framing, pts, packet, carried, &mut written));
+                let carried = state.weaver.carrier(pts, pts_ms, settled.item.keyframe);
+                let open = carried.open;
+                added.push(apply(
+                    state.framing,
+                    pts,
+                    settled.item,
+                    carried,
+                    &mut written,
+                ));
+                if open {
+                    // A keyframe may still be asked to take a record
+                    // nothing else will carry, so it stays in hand, and
+                    // so does every packet behind it: they cannot
+                    // overtake it on the way out. The keyframe before
+                    // this one is closed by the same stroke.
+                    state.reorder.hold_from(seq);
+                    state.open = Some(OpenCarrier { pts, seq });
+                }
             }
-            // The final call carries the last packets, so whatever no
-            // carrier the policy would choose ever came along for rides
-            // the last access unit of the stream rather than being lost.
+            // Bounded: a GOP is held, not a stream. Past the bound the
+            // keyframe goes out with what it has and takes no more, and
+            // a record that would have ridden it falls to the next
+            // keyframe or, at the end of the stream, is reported late.
+            if state.reorder.barrier().is_some() {
+                let (packets, bytes) = state.reorder.behind_barrier(|packet| packet.data.len());
+                if packets > MAX_GOP_PACKETS || bytes > MAX_GOP_BYTES {
+                    state.reorder.lift();
+                    state.open = None;
+                    state.weaver.note_overrun();
+                }
+            }
+            // The final call carries the last packets. Under `keyframe`
+            // what no carrier the policy would choose came along for
+            // rides the LAST KEYFRAME, which is the access unit held
+            // open for exactly this; under the live policies it rides
+            // the last access unit of all.
             //
-            // A host that ended with no packets at all would leave
-            // nothing to put them on, and then they are reported late
-            // and not written, which is the honest answer: a filter
-            // cannot invent an access unit to carry them.
+            // Where neither is in hand - a stream with no keyframe in
+            // it, or one whose last GOP overran the bound - there is no
+            // access unit a keyframe reader would visit, and the
+            // records are reported late rather than written somewhere
+            // nobody will look.
             if last {
-                if let Some((pts, packet)) = state.reorder.last_held() {
+                state.reorder.lift();
+                let target: Option<(i64, u64)> = match state.config.placement {
+                    Placement::Keyframe => state.open.take().map(|open| (open.pts, open.seq)),
+                    _ => state.reorder.last_held().map(|(pts, seq, _)| (pts, seq)),
+                };
+                if let Some((pts, seq)) = target {
+                    let keyframe = state.reorder.at(seq).is_some_and(|packet| packet.keyframe);
                     let pts_ms = to_ms(pts, state.num, state.den);
-                    let carried = state.weaver.flush(pts, pts_ms, packet.keyframe);
-                    added.push(apply(state.framing, pts, packet, carried, &mut written));
+                    let carried = state.weaver.flush(pts, pts_ms, keyframe);
+                    if let Some(packet) = state.reorder.at(seq) {
+                        added.push(apply(state.framing, pts, packet, carried, &mut written));
+                    }
                 }
             }
             for grew in added {

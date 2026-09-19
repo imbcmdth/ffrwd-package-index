@@ -149,12 +149,14 @@ ffmpeg -discard nokey -i SRC -map 0:v:0 -c copy <pipe format> -  |  scanner
   of a live-written file the caller asks for the full copy (the same command
   without `-discard nokey`, still at disk speed). Worth a `placement` hint in a
   later version of the format if this turns out to matter.
-- A `keyframe`-placed record whose span ends after the last keyframe rides the
-  last access unit (SPEC section 7). The keyframe copy misses it. On the
-  example file it returned 12 of the full scan's 14 rows; which two were
-  missing was not checked, and this rule is the likely cause. Cover it with a
-  second short copy from near the end (`-sseof -2`), or by reading the file
-  index when there is one.
+- A `keyframe`-placed record whose span ends after the last keyframe used to
+  ride the last access unit, and the keyframe copy missed it: on the example
+  file it returned 12 of the full scan's 14 rows. SPEC section 7 changed on
+  2026-09-19 and it rides the LAST KEYFRAME instead, with an `end_off` that
+  looks forward, so the keyframe copy is complete and needs no second read
+  from near the end. A file written by an older writer still has the old
+  shape; `-sseof -2`, or the file index where there is one, is what would
+  cover that.
 - When the file has an index (section 8) and nothing suggests it is stale,
   tier 3 is one small read and no ffmpeg. The index does not survive a remux,
   so the pipe is the path that always works and the index is the shortcut.

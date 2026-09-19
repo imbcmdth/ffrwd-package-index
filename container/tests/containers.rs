@@ -30,7 +30,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use ffrwd_index_container::scan::{carriages, Scan};
-use ffrwd_index_container::{kind_of, mkv, mp4, write, Kind, Source, TrackCodec};
+use ffrwd_index_container::{kind_of, mkv, mp4, write, Kind, Sample, Source, TrackCodec};
 
 // ---------------------------------------------------------------- //
 // ffmpeg.
@@ -437,19 +437,14 @@ fn a_matroska_keyframe_scan_finds_what_a_full_walk_would() {
     skip_without_ffmpeg!();
     for name in ["h264.mkv", "hevc.mkv", "av1.webm", "live.mkv", "big.mkv"] {
         let all = track_of(name, Scan::All);
-        // Section 7's fast path: the sync samples, and the last sample
-        // of the track, which is where a record with no keyframe left
-        // to ride ends up.
-        let mut wanted: Vec<i64> = all
+        // Section 7's fast path: the sync samples and nothing else,
+        // because every record of a `keyframe` file is on one.
+        let wanted: Vec<i64> = all
             .samples
             .iter()
             .filter(|sample| sample.keyframe)
             .map(|sample| sample.pts)
             .collect();
-        let last = all.samples.last().expect("a sample");
-        if !last.keyframe {
-            wanted.push(last.pts);
-        }
         let fast = track_of(name, Scan::Keyframes);
         let found: Vec<i64> = fast
             .scanned(Scan::Keyframes)
@@ -457,11 +452,13 @@ fn a_matroska_keyframe_scan_finds_what_a_full_walk_would() {
             .map(|sample| sample.pts)
             .collect();
         assert_eq!(found, wanted, "{name}: the cues and the walk disagree");
-        // And it really is the same block, not one that happens to be
-        // shown at the same time.
-        let taken = fast.scanned(Scan::Keyframes).pop().expect("a sample");
-        assert_eq!(taken.offset, last.offset, "{name}");
-        assert_eq!(taken.size, last.size, "{name}");
+        // And they really are the same blocks, not ones that happen to
+        // be shown at the same time.
+        let keys: Vec<&Sample> = all.samples.iter().filter(|s| s.keyframe).collect();
+        for (taken, want) in fast.scanned(Scan::Keyframes).iter().zip(keys) {
+            assert_eq!(taken.offset, want.offset, "{name}");
+            assert_eq!(taken.size, want.size, "{name}");
+        }
     }
 }
 
