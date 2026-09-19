@@ -887,10 +887,12 @@ fn av1_carries_its_records_and_moves_no_picture() {
 ///
 /// A host on this machine drains a four-second file in well under a
 /// second, so which packet is in flight when a row lands on a pipe is
-/// not a thing a test can pin. What CAN be pinned is the placement
-/// itself, and `available_t` is how: each row says when its writer had
-/// it, exactly as it would have arrived on a wire, and every record
-/// must then ride a carrier at or after that.
+/// not a thing a test can pin, and neither is when a file's rows reach
+/// the module, which is a reader thread of the host's. What CAN be
+/// pinned is the placement itself, and `available_t` is how: each row
+/// says when its writer had it, exactly as it would have arrived on a
+/// wire, and every record must then ride a carrier at or after that,
+/// looking back at a span that had already ended.
 #[test]
 fn a_record_that_existed_only_after_its_span_rides_a_later_carrier() {
     let Some(_) = sidecar() else { return };
@@ -944,17 +946,24 @@ fn a_record_that_existed_only_after_its_span_rides_a_later_carrier() {
             carrier + row["end_off_ms"].parse::<f64>().expect("an offset") / 1000.0,
             end_t
         ));
-        carriers.push(carrier);
+        carriers.push((record_id, carrier));
     }
-    // `next` takes the first carrier at all, not the next keyframe, so
-    // three records a half second apart are on three of them.
-    carriers.sort_by(f64::total_cmp);
-    carriers.dedup_by(|a, b| close(*a, *b));
-    assert_eq!(
-        carriers.len(),
-        wanted.len(),
-        "the live policy put every record on one carrier"
-    );
+    // A record whose writer had it earlier is never on a later carrier
+    // than one whose writer had it later. Which carriers exactly is not
+    // a thing to assert here: the rows reader is a thread of the host's
+    // and a file's rows may all reach the module on one call, in which
+    // case one carrier takes all three, correctly. The unit test in
+    // `rows` drives the arrivals itself and pins the spread.
+    carriers.sort_by_key(|(record_id, _)| *record_id);
+    for pair in carriers.windows(2) {
+        assert!(
+            pair[1].1 >= pair[0].1 - 1e-6,
+            "a record available earlier rode a later carrier: {pair:?}"
+        );
+    }
+    let summary = run.summary();
+    assert_eq!(summary["records"], wanted.len().to_string());
+    assert_eq!(summary["late"], "0");
     assert_eq!(nut_packets(&run.out), nut_packets(&input));
 }
 
