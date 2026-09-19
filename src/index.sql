@@ -1,0 +1,47 @@
+-- weave: embedding vectors put into a video's own encoded stream.
+--
+-- NOT YET RUNNABLE. The module is a packet filter, `ffrwd:av@0.16.0`'s
+-- packets-in, packets-out interface, and no part of the dialect places
+-- one in a query yet: a query naming this function compiles as far as
+-- loading the module and is then refused, by name, with
+--
+--   the module 'target/wasm32-wasip2/release/weave.wasm' is a packet
+--   filter, and no part of a query places one yet
+--
+-- That refusal is the point of this file. The package installs, lists
+-- and describes, so a host can see what the module is and what it
+-- accepts; what it cannot do is run, and the compiler says so rather
+-- than failing somewhere further in.
+--
+-- What the declaration WANTS to say is in ../notes/packet-filter-placement.md
+-- and in the README: a new `wrtype`, `packets`, beside `sink`, for a
+-- call that hands back the stream it was given, still encoded, deferred
+-- past the encoder the COPY's destination already places:
+--
+--   CREATE FUNCTION weave(v video_stream, vecs STRUCT(vector vector, t number)[])
+--     RETURNS packets
+--     AS 'target/wasm32-wasip2/release/weave.wasm', 'weave' LANGUAGE wasm;
+--
+--   COPY (SELECT weave(f.video[1], embed(f.video[1]).vectors))
+--     FROM input('in.mp4') f TO 'out.mp4';
+--
+-- `wrtype := wstype | sink | packets | STRUCT(...)` is the whole grammar
+-- delta. Until it lands, `RETURNS packets` does not parse, so the
+-- declaration below says `video_stream` instead - which is what the
+-- packets are, and which is enough for the compiler to load the module,
+-- recognise it as a packet filter and refuse it in the words above. The
+-- return type is not what stops it and never gets looked at.
+--
+-- The module reads its rows through the sidecar's `-rows-in`, not
+-- through an annotation stream: rows produced upstream of the encoder
+-- cannot reach a filter on the stream, because ffmpeg sits between them
+-- and drops what it does not understand. See the note.
+--
+-- spaces, placement, budget, escapes and planes are the module's params,
+-- one JSON object; the README has the schema. A run's rows say what was
+-- woven where, and a later step builds SPEC.md section 8's file index
+-- from them: a module has no filesystem and runs before the muxer, so
+-- the index is not this function's to write.
+CREATE FUNCTION weave(v video_stream)
+RETURNS video_stream
+  AS 'target/wasm32-wasip2/release/weave.wasm', 'weave' LANGUAGE wasm;

@@ -1,0 +1,26 @@
+{
+  "name": "ffrwd/index",
+  "version": "0.1.0",
+  "description": "Embedding vectors woven into a video's own encoded stream, as SEI messages in H.264 and HEVC and a metadata OBU in AV1, so a search travels with the picture through remuxing, segmenting and live transport.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/imbcmdth/ffrwd-package-index",
+  "dependencies": {
+    "ffrwd/wasm": "0.16.0"
+  },
+  "keywords": [
+    "embedding",
+    "vector",
+    "search",
+    "index",
+    "sei",
+    "obu",
+    "h264",
+    "hevc",
+    "av1",
+    "packet-filter",
+    "metadata"
+  ],
+  "lib": {
+    "weave": "src/index.sql"
+  }
+}
