@@ -150,6 +150,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "records"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-index-core",
+ "ffrwd-index-rows",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -195,6 +204,15 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "spaces"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-index-core",
+ "ffrwd-index-rows",
+ "wit-bindgen",
 ]
 
 [[package]]

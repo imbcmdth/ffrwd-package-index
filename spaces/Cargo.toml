@@ -1,0 +1,18 @@
+[package]
+name = "spaces"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "An ffrwd packet sink: one row per embedding space a video stream declares."
+
+[lib]
+name = "spaces"
+crate-type = ["cdylib"]
+
+# wit-bindgen and the two crates of this workspace, and nothing else.
+# The JSON is `ffrwd-index-rows`, which the tool and `weave` already
+# read and write the same rows with.
+[dependencies]
+wit-bindgen = "0.57.1"
+ffrwd-index-core = { path = "../core" }
+ffrwd-index-rows = { path = "../rows" }

@@ -1,19 +1,24 @@
 [workspace]
 # `core` is the codec: plain Rust, no I/O, no dependencies. `rows` is
 # the JSON both callers of it speak, which is theirs and not the
-# format's. `container` is MP4 and Matroska, which only a program with
-# a file needs. `weave` is the packet filter, a thin wasm32-wasip2
-# cdylib over the first two. `tool` is the native command line over all
-# three, which reads and writes files and so is never part of a wasm
-# build.
+# format's, plus the two state machines over it: weaving and reading.
+# `container` is MP4 and Matroska, which only a program with a file
+# needs. `weave`, `records` and `spaces` are the ffrwd modules, thin
+# wasm32-wasip2 cdylibs over the first two: one packet filter that
+# writes and two packet sinks that read. `tool` is the native command
+# line over all of it, which reads and writes files and so is never
+# part of a wasm build.
 #
-# `weave` builds for wasm32-wasip2 alone, so it is excluded from the
-# workspace default members: `cargo test` and `cargo clippy` over the
-# workspace are native, and wit-bindgen's generated code is not.
+# The three modules build for wasm32-wasip2 alone, so they are excluded
+# from the workspace default members: `cargo test` and `cargo clippy`
+# over the workspace are native, and wit-bindgen's generated code is
+# not.
 members = [
     "container",
     "core",
+    "records",
     "rows",
+    "spaces",
     "tool",
     "weave",
 ]

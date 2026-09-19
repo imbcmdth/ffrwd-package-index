@@ -28,7 +28,6 @@
 //!   this module writes are what a later step builds one from.
 
 mod params;
-mod stream;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -47,7 +46,7 @@ use ffrwd_index_core::placement::Placement;
 use ffrwd_index_core::UNIT_SOFT_LIMIT;
 use ffrwd_index_rows::weave::{Config, Reorder, Weaver, MAX_HELD_PACKETS};
 
-use crate::stream::Framing;
+use ffrwd_index_rows::stream::{self, Framing};
 
 const ROWS_SCHEMA: &str = r#"{
   "type": "object",

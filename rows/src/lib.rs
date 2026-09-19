@@ -20,6 +20,10 @@
 //!
 //! - [`json`]: a small JSON reader and writer, one value per line.
 //! - [`space`]: a SPACE message as a JSON object, both ways.
+//! - [`read`]: packets in, rows out, which is what the two reading
+//!   sinks both do.
+//! - [`stream`]: which framing a pad's packets are in, and getting
+//!   units into and out of one.
 //! - [`vector`]: a vector as JSON numbers or as base64 f32, and the
 //!   body that goes on the wire.
 //! - [`weave`]: rows in, messages on carriers out - the module's whole
@@ -31,6 +35,8 @@
 #![forbid(unsafe_code)]
 
 pub mod json;
+pub mod read;
 pub mod space;
+pub mod stream;
 pub mod vector;
 pub mod weave;

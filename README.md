@@ -40,10 +40,16 @@ them into the file's own pictures, indexes it and searches it with a prompt the
 package's own text tower embedded, and prints what the encoding cost against
 the same search over the original binary32.
 
-Working against an unreleased ffrwd: `weave`, the wasm module, runs under a
-sidecar built from ffrwd's `packet-filter` branch, which adds the packets-in,
-packets-out interface (`ffrwd:av@0.16.0`). No query can place it yet. The
-intended use, not runnable today:
+Working against an unreleased ffrwd: three wasm modules, all
+`ffrwd:av@0.16.0`, which no released ffrwd hosts.
+
+`weave` writes. It is a packet filter: encoded packets in, the same packets
+out, with the vectors woven into them and every timestamp untouched. Rows can
+arrive while packets flow, so the same module serves a live stream: a vector is
+woven onto the first frame after it exists, and a watcher reading the stream
+hears of it at once. A live stream gets no file index and needs none. The
+declaration is what the dialect accepts today, and a query that writes the call
+is refused by name, because nothing builds the shape a packet filter sits in:
 
 ```sql
 COPY (
@@ -52,9 +58,22 @@ COPY (
 ) TO 'film.indexed.mp4'
 ```
 
-Rows can arrive while packets flow, so the same module serves a live stream: a
-vector is woven onto the first frame after it exists, and a watcher reading the
-stream hears of it at once. A live stream gets no file index and needs none.
+`records` and `spaces` read. They are packet sinks: `records` answers one row
+per record, with the span in seconds of the stream's own clock and the vector
+itself, and `spaces` answers one row per embedding space the stream declares.
+Both run today as COPY destinations, with their rows on the sidecar's stdout:
+
+```sql
+COPY (SELECT f.video[1] FROM input('film.indexed.mp4') f) TO ffrwd.index.records()
+```
+
+What they exist for is the other thing: reading a woven file at COMPILE time,
+so that `f.embeddings` is a relation a query can join and filter. Both declare
+that the keyframes are all they need to be handed, which is section 7's doing,
+and which is what makes that read cheap. Nothing in the dialect spells it yet.
+
+The reading modules and the writing one are the same code: `rows/` holds both
+state machines over `core/`, and the wasm crates are shims.
 
 ## Layout
 
@@ -62,12 +81,16 @@ stream hears of it at once. A live stream gets no file index and needs none.
 - `core/`: the codec, plain Rust with no dependencies and no I/O: messages, the
   layered 8-bit encoding, SEI and OBU wrapping, inserting into and reading from
   H.264, HEVC and AV1 streams, placement, and the file index.
-- `rows/`: the JSON rows a producer hands over (spaces and vectors), and the
-  weaving state machine, shared by the tool and the module.
+- `rows/`: the JSON rows a producer hands over (spaces and vectors), which
+  framing a packet is in, and the two state machines over `core/`: weaving
+  vectors into packets and reading them back out. Shared by the tool and the
+  three modules, and tested natively.
 - `container/`: reading MP4 and Matroska far enough to find the samples that
   carry vectors, and putting the index into a file.
 - `tool/`: `ffrwd-index`, a native command line over all of it.
-- `weave/`: the ffrwd module, a thin `wasm32-wasip2` layer over `rows/`.
+- `weave/`: the ffrwd packet filter that writes, a thin `wasm32-wasip2` layer
+  over `rows/`.
+- `records/`, `spaces/`: the two ffrwd packet sinks that read, the same way.
 - `examples/describe/`: one video through `ffrwd/describe` and out again as a
   search, with the real commands and their real output.
 - `ffrwd.json`, `src/index.sql`: the ffrwd package.

@@ -203,6 +203,55 @@ impl Assembler {
             .collect()
     }
 
+    /// Every record nothing more can be added to, taken out of the
+    /// assembler as it is handed over.
+    ///
+    /// A record is finished when every plane of its encoding has
+    /// arrived: a float body arrives whole or not at all, and an I8
+    /// record with all eight planes has nothing left to merge. A
+    /// reader answering rows as it goes calls this after each batch
+    /// and [`Assembler::drain`] at the end, and never answers the same
+    /// record twice.
+    ///
+    /// A record the writer never means to finish - one sent with a cap
+    /// on its planes, which section 5 allows - is not finished by this
+    /// rule and waits for the drain. There is nothing in the stream
+    /// that says which of the two it is.
+    pub fn take_finished(&mut self) -> Vec<Record> {
+        let ready: Vec<(u8, u64)> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|key| {
+                self.held
+                    .get(key)
+                    .and_then(|held| self.resolve(held).ok())
+                    .is_some_and(|record| record.planes.unwrap_or(0xff) == 0xff)
+            })
+            .collect();
+        self.take(&ready)
+    }
+
+    /// Everything still held, taken out.
+    pub fn drain(&mut self) -> Vec<Record> {
+        let left: Vec<(u8, u64)> = self.order.iter().copied().collect();
+        self.take(&left)
+    }
+
+    fn take(&mut self, keys: &[(u8, u64)]) -> Vec<Record> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(held) = self.held.remove(key) else {
+                continue;
+            };
+            if let Ok(record) = self.resolve(&held) {
+                out.push(record);
+            }
+        }
+        self.order.retain(|key| !keys.contains(key));
+        out
+    }
+
     /// The records of one space, in the order their first message
     /// arrived, which is what a reader that has just seen that space
     /// declared wants: the vectors that were waiting for it.

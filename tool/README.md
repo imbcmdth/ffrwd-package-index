@@ -239,6 +239,18 @@ A record whose sign plane never arrived, because the stream was cut
 before it, is counted on stderr rather than printed: there is nothing
 to reconstruct it from yet.
 
+The two ffrwd sinks in `records/` and `spaces/` read the same stream
+and answer the same things in ffrwd's own row spelling: `records`
+answers `index`, `space`, `record_id`, `start_t`, `end_t`, `planes`
+and `vector`, and `spaces` answers section 3's fields with a derived
+`name` beside them. The difference is the clock and the input. This
+tool reads a container and knows each sample's presentation time, or
+reads an elementary stream and is told a frame rate; a sink is handed
+packets with the timestamps the container will carry. Where the two
+disagree about an absolute time it is because a container's edit list
+did not survive the copy into the pipe, and the spans and the offsets
+still agree exactly.
+
 `read --index` prints the same rows with a `time_ms` on each, which is
 the index's own record of the carrier's time, on the container's clock
 and signed: an MP4's edit list can put a carrier before the time the

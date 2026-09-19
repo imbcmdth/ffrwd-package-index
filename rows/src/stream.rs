@@ -1,4 +1,5 @@
-//! Which framing a pad's packets are in, and putting a unit into one.
+//! Which framing a pad's packets are in, and getting units into and
+//! out of one.
 //!
 //! Three shapes reach a packet filter and section 7 covers all three.
 //! H.264 and HEVC travel either as Annex B, start code before every
@@ -8,9 +9,13 @@
 //! low-overhead OBUs whatever the container.
 //!
 //! The extradata itself is never touched. A filter may answer `init`
-//! with a changed header, and this one has no reason to: the SPS and
-//! PPS that described the pictures still describe them, and an SEI
-//! added to an access unit changes nothing out of band.
+//! with a changed header, and the one in `weave/` has no reason to: the
+//! SPS and PPS that described the pictures still describe them, and an
+//! SEI added to an access unit changes nothing out of band.
+//!
+//! Both directions are here because both the writer and the readers
+//! need them, and a packet framed one way on the way in has to be
+//! framed the same way on the way out.
 
 use ffrwd_index_core::avc::{self, Codec};
 use ffrwd_index_core::obu;
@@ -93,6 +98,20 @@ pub fn insert(framing: Framing, packet: &[u8], unit: &[u8]) -> Result<Vec<u8>, S
     }
 }
 
+/// Every unit of this format in one packet, in the order it carries
+/// them. A packet this reader cannot parse answers none rather than
+/// stopping the read: one broken access unit in a stream is not a
+/// reason to lose the rest.
+pub fn units_in(framing: Framing, packet: &[u8]) -> Vec<Vec<u8>> {
+    match framing {
+        Framing::AnnexB(codec) => avc::units_annexb(packet, codec),
+        Framing::LengthPrefixed { codec, length_size } => {
+            avc::units_length_prefixed(packet, length_size, codec).unwrap_or_default()
+        }
+        Framing::Av1 => obu::units_obu(packet),
+    }
+}
+
 /// The `nuh_temporal_id_plus1` an SEI in this access unit has to
 /// repeat, which is its first coded slice's. H.264 has no such field
 /// and the wrapper ignores what it is given.
@@ -171,6 +190,34 @@ mod tests {
             Framing::Av1
         );
         assert!(framing_of("vp9", &[]).unwrap_err().contains("weave writes"));
+    }
+
+    #[test]
+    fn what_goes_in_comes_back_out_of_every_framing() {
+        let packet = annexb_h264();
+        let annexb = Framing::AnnexB(Codec::H264);
+        let woven = insert(annexb, &packet, &unit()).expect("woven");
+        assert_eq!(units_in(annexb, &woven), vec![unit()]);
+        assert!(
+            units_in(annexb, &packet).is_empty(),
+            "a unit came from nowhere"
+        );
+
+        let sample = avc::annexb_to_length_prefixed(&packet, 4).expect("a sample");
+        let prefixed = Framing::LengthPrefixed {
+            codec: Codec::H264,
+            length_size: 4,
+        };
+        let woven = insert(prefixed, &sample, &unit()).expect("woven");
+        assert_eq!(units_in(prefixed, &woven), vec![unit()]);
+
+        let obus = vec![0x12u8, 0x00, 0x0a, 0x01, 0x00, 0x32, 0x02, 0x00, 0x00];
+        let woven = insert(Framing::Av1, &obus, &unit()).expect("woven");
+        assert_eq!(units_in(Framing::Av1, &woven), vec![unit()]);
+
+        // Bytes that are not the framing they were said to be answer
+        // nothing rather than stopping a read.
+        assert!(units_in(prefixed, &[0xff, 0xff, 0xff, 0xff, 1]).is_empty());
     }
 
     #[test]

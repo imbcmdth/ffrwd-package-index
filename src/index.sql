@@ -1,47 +1,81 @@
--- weave: embedding vectors put into a video's own encoded stream.
+-- ffrwd/index: embedding vectors put into a video's own encoded
+-- packets, and read back out of them.
 --
--- NOT YET RUNNABLE. The module is a packet filter, `ffrwd:av@0.16.0`'s
--- packets-in, packets-out interface, and no part of the dialect places
--- one in a query yet: a query naming this function compiles as far as
--- loading the module and is then refused, by name, with
+-- Three modules. `weave` is a packet filter and writes; `records` and
+-- `spaces` are packet sinks and read. All three are `ffrwd:av@0.16.0`,
+-- which is unreleased, so none of them runs under a released ffrwd.
+
+-- ---------------------------------------------------------------- --
+-- Writing.
+-- ---------------------------------------------------------------- --
+
+-- weave: the vectors of `vecs` woven into `v`'s own encoded packets,
+-- as SEI messages in H.264 and HEVC and a metadata OBU in AV1. The
+-- same stream comes back, packet for packet, with the same timestamps:
+-- a player that has never heard of the format plays it unchanged.
 --
---   the module 'target/wasm32-wasip2/release/weave.wasm' is a packet
---   filter, and no part of a query places one yet
+-- NOT RUNNABLE YET. The declaration below is the one the dialect
+-- accepts, and a query that writes the call compiles as far as
+-- checking it and is then refused, because nothing builds the shape a
+-- packet filter sits in (encoder, filter, muxer). The refusal is by
+-- name and says so. See ffrwd's own known_gaps.md.
 --
--- That refusal is the point of this file. The package installs, lists
--- and describes, so a host can see what the module is and what it
--- accepts; what it cannot do is run, and the compiler says so rather
--- than failing somewhere further in.
---
--- What the declaration WANTS to say is in ../notes/packet-filter-placement.md
--- and in the README: a new `wrtype`, `packets`, beside `sink`, for a
--- call that hands back the stream it was given, still encoded, deferred
--- past the encoder the COPY's destination already places:
---
---   CREATE FUNCTION weave(v video_stream, vecs STRUCT(vector vector, t number)[])
---     RETURNS packets
---     AS 'target/wasm32-wasip2/release/weave.wasm', 'weave' LANGUAGE wasm;
+-- What it will read, once a destination places one:
 --
 --   COPY (SELECT weave(f.video[1], embed(f.video[1]).vectors))
 --     FROM input('in.mp4') f TO 'out.mp4';
 --
--- `wrtype := wstype | sink | packets | STRUCT(...)` is the whole grammar
--- delta. Until it lands, `RETURNS packets` does not parse, so the
--- declaration below says `video_stream` instead - which is what the
--- packets are, and which is enough for the compiler to load the module,
--- recognise it as a packet filter and refuse it in the words above. The
--- return type is not what stops it and never gets looked at.
+--   COPY (SELECT weave(f.video[1], embed(f.video[1]).vectors))
+--     FROM input('in.mp4') f TO publish('relay', 'live');
 --
--- The module reads its rows through the sidecar's `-rows-in`, not
--- through an annotation stream: rows produced upstream of the encoder
--- cannot reach a filter on the stream, because ffmpeg sits between them
--- and drops what it does not understand. See the note.
---
--- spaces, placement, budget, escapes and planes are the module's params,
--- one JSON object; the README has the schema. A run's rows say what was
--- woven where, and a later step builds SPEC.md section 8's file index
--- from them: a module has no filesystem and runs before the muxer, so
--- the index is not this function's to write.
-CREATE FUNCTION weave(v video_stream)
-RETURNS video_stream
+-- The rows say which space a vector is in, the span it describes in
+-- seconds, and the vector. The module's own params (spaces, placement,
+-- budget, escapes, planes) are one JSON object; README.md has the
+-- schema. A run's rows say what was woven where, and SPEC.md section
+-- 8's file index is built from them by a later step: a module has no
+-- filesystem and runs before the muxer, so the index is not this
+-- function's to write.
+CREATE FUNCTION weave(v video_stream,
+                      vecs STRUCT(space text, start_t number, end_t number,
+                                  vector vector)[])
+RETURNS packets
   AS 'target/wasm32-wasip2/release/weave.wasm', 'weave' LANGUAGE wasm;
+
+-- ---------------------------------------------------------------- --
+-- Reading.
+-- ---------------------------------------------------------------- --
+
+-- records: one row per record in a woven stream. Which space it is in,
+-- the span it describes in seconds of the stream's own presentation
+-- clock, and the vector itself, rebuilt from whatever planes arrived
+-- and not normalized.
+--
+-- spaces: one row per embedding space the stream declares. What the
+-- vectors are, how many components they have, which model made them
+-- and which model turns a search into the same space. `name` is a
+-- label this sink derives, not a field of the format.
+--
+-- Both are packet sinks, so both are COPY destinations and their rows
+-- ride the hosting sidecar's own stdout:
+--
+--   COPY (SELECT f.video[1] FROM input('woven.mp4') f) TO records();
+--   COPY (SELECT f.video[1] FROM input('woven.mp4') f) TO spaces();
+--
+-- That is what runs today. What these exist for is the other thing:
+-- reading a woven file at COMPILE time, so that `f.embeddings` is a
+-- relation a query can join and filter. Nothing in the dialect spells
+-- a packet sink whose rows are a compile-time relation yet; that is
+-- being built separately, and these two are what it will run.
+--
+-- Both declare in their meta how much of a stream they have to be
+-- handed: `keyframes`, since section 7's `keyframe` policy puts every
+-- record of a file on a sync sample and section 3 puts every space
+-- declaration there too. A host may hand over more and both read
+-- whatever they get.
+CREATE FUNCTION records(v video_stream)
+RETURNS sink
+  AS 'target/wasm32-wasip2/release/records.wasm', 'records' LANGUAGE wasm;
+
+CREATE FUNCTION spaces(v video_stream)
+RETURNS sink
+  AS 'target/wasm32-wasip2/release/spaces.wasm', 'spaces' LANGUAGE wasm;
