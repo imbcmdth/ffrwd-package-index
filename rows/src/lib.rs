@@ -1,4 +1,5 @@
-//! The rows both callers of the codec speak.
+//! The rows both callers of the codec speak, and what a writer does
+//! with them.
 //!
 //! `core` is the format and stays that way: no dependencies, no I/O, no
 //! opinion about how a caller spells a space or a vector. But the tool
@@ -21,6 +22,8 @@
 //! - [`space`]: a SPACE message as a JSON object, both ways.
 //! - [`vector`]: a vector as JSON numbers or as base64 f32, and the
 //!   body that goes on the wire.
+//! - [`weave`]: rows in, messages on carriers out - the module's whole
+//!   decision, kept here so it is tested on the native target.
 //!
 //! Nothing here opens a file or allocates unboundedly on bad input, so
 //! the wasm module compiles it in as happily as the tool does.
@@ -30,3 +33,4 @@
 pub mod json;
 pub mod space;
 pub mod vector;
+pub mod weave;
