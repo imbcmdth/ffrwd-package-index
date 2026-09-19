@@ -269,8 +269,10 @@ all of them the same way:
 - `keyframe`: whole records ride on keyframes, each on the first keyframe at or
   after the end of its span. A reader of a file then needs only the start of
   each sync sample. A record whose span ends after the last keyframe rides on
-  the last access unit, so such a reader reads the last sample as well. This is
-  the policy for files.
+  the last keyframe, with an `end_off` that is positive, so the keyframes of a
+  file hold all of its records. A writer that cannot know which keyframe is
+  the last holds each keyframe back until the next one arrives or the stream
+  ends. This is the policy for files.
 - `next`: a record rides on the first carrier after it exists. This is the
   policy for live streams, where a watcher should hear of a match at once and
   the next keyframe may be seconds away.
