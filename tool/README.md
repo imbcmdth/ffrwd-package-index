@@ -6,7 +6,7 @@ own elementary stream and takes them back out.
 ```
 ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                   [--placement keyframe|next|spread:BYTES]
-                  [--fps N] [--codec h264|h265]
+                  [--escapes N] [--fps N] [--codec h264|h265]
 
 ffrwd-index read  --video IN [--fps N] [--codec h264|h265] [--index OUT.ffix]
 ffrwd-index read  --index IN.ffix
@@ -96,6 +96,23 @@ Everything but `id` and `dims` may be left out.
 The vector is quantized on the way in for an `i8` space, and narrowed
 for an `f16` one. An `f32` space carries the numbers as they are.
 
+### Escapes
+
+`--escapes N` (2 by default, 16 at most) is how many of a vector's
+largest components an `i8` space sends exactly, as an index and a
+binary16 value, instead of quantizing them. One scale for the whole
+vector is set by its largest component, so a model with one component
+that dwarfs the rest spends its range on that component alone; taking
+the largest few out of the scale gives the rest the range they occupy.
+Measured on a video-text model, one component held 30% of each vector's
+energy and two escapes brought the agreement with the original ranking
+from 80% to 99%, for eight bytes a record.
+
+`--escapes 0` writes none, which is right for a model whose components
+are all of a size. The escapes ride with the record's first message,
+the one that carries the sign plane, so a reader that has anything at
+all has them.
+
 ### What `read` prints
 
 The spaces first, in the same shape the rows use, then one line per
@@ -103,13 +120,20 @@ record:
 
 ```json
 {"space":{"id":1,"dims":8,"encoding":"i8","unit_length":true,...}}
-{"space_id":1,"record_id":0,"carrier_ms":300,"start_ms":0,"end_ms":250,"planes":[0,1,2],"vector":[...]}
+{"space_id":1,"record_id":0,"carrier_ms":300,"start_ms":0,"end_ms":250,"planes":[0,1,2],"escapes":[[5,0.9975586]],"vector":[...]}
 ```
 
 `carrier_ms` is the frame the record rode in on. `planes` is which of
 the eight bit-planes arrived, and appears for `i8` spaces only: the
 vector is reconstructed from the planes in hand, so a record with three
 of them is a coarse reading of the same vector rather than a wrong one.
+`escapes` is the components that travelled exactly, as index and value
+pairs, and appears only when there are some; their values are in
+`vector` as well, which is where a reader uses them.
+
+A record whose sign plane never arrived, because the stream was cut
+before it, is counted on stderr rather than printed: there is nothing
+to reconstruct it from yet.
 
 `read --index file.ffix` prints the same rows with a `time_ms` on each,
 which is the index's own record of the carrier's time.

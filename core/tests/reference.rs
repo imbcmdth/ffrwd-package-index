@@ -47,6 +47,10 @@ use ffrwd_index_core::UUID;
 
 const FPS: i64 = 30;
 
+/// Escapes per layered record, so the woven fixtures carry them and the
+/// read back has to put them together again.
+const ESCAPES: usize = 2;
+
 /// Which fixture, and how its carriage works.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stream {
@@ -235,7 +239,7 @@ fn records() -> (Vec<Pending>, Vec<Want>) {
     for index in 0..6u16 {
         let start = i64::from(index) * 300;
         let end = start + 250;
-        let planes = Planes::quantize(&vector(u64::from(index), 64)).expect("quantized");
+        let planes = Planes::quantize(&vector(u64::from(index), 64), ESCAPES).expect("quantized");
         pending.push(Pending::layered(1, index, start, end, &planes));
         want.push(Want {
             space_id: 1,
@@ -1035,7 +1039,7 @@ fn trace_headers_sees_a_user_data_unregistered_sei_of_ours() {
     let original = Stream::H264.bytes();
     let mut space = Space::new(9, 16, Encoding::I8);
     space.model = "t:m".into();
-    let planes = Planes::quantize(&vector(3, 16)).expect("quantized");
+    let planes = Planes::quantize(&vector(3, 16), ESCAPES).expect("quantized");
     let unit = Unit::new(vec![
         Message::Space(space),
         Message::Vector(VectorRecord {

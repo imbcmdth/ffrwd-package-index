@@ -71,24 +71,40 @@ fn rows() -> String {
     out
 }
 
-/// One row of output, as name and value pairs of text.
+/// One field of a row, as the text between its name and the end of its
+/// value. Arrays and objects are matched by their brackets, so a list
+/// of lists comes back whole.
 fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let needle = format!("\"{name}\":");
     let at = line.find(&needle)? + needle.len();
     let rest = &line[at..];
-    let end = rest
-        .find([',', '}'])
-        .filter(|_| !rest.starts_with('[') && !rest.starts_with('{'));
-    match end {
-        Some(end) => Some(&rest[..end]),
-        None => {
-            // An array or an object: find its close.
-            let open = rest.chars().next()?;
-            let close = if open == '[' { ']' } else { '}' };
-            let end = rest.find(close)? + 1;
-            Some(&rest[..end])
+    let open = rest.chars().next()?;
+    if open != '[' && open != '{' {
+        let end = rest.find([',', '}'])?;
+        return Some(&rest[..end]);
+    }
+    let close = if open == '[' { ']' } else { '}' };
+    let mut depth = 0i32;
+    for (index, letter) in rest.char_indices() {
+        if letter == open {
+            depth += 1;
+        } else if letter == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&rest[..index + 1]);
+            }
         }
     }
+    None
+}
+
+/// The numbers of a JSON array, or of an array of arrays, flattened.
+fn numbers(text: &str) -> Vec<&str> {
+    text.trim_matches(|letter| letter == '[' || letter == ']')
+        .split(',')
+        .map(|value| value.trim_matches(|letter| letter == '[' || letter == ']'))
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 #[test]
@@ -173,6 +189,70 @@ fn rows_woven_in_come_back_out() {
             vec!["[0.5,-0.25,0,1]", "[0.5,-0.25,0,1]"],
             "{placement}"
         );
+    }
+}
+
+#[test]
+fn escapes_go_in_and_come_back_exactly() {
+    let dir = scratch("escapes");
+    let rows_path = dir.join("rows.ndjson");
+    std::fs::write(&rows_path, rows()).expect("the rows");
+
+    let weave = |name: &str, escapes: &str| -> String {
+        let out = dir.join(name);
+        let (code, _, told) = tool(&[
+            "weave",
+            "--video",
+            fixture("ref.h264").to_str().expect("a path"),
+            "--vectors",
+            rows_path.to_str().expect("a path"),
+            "--out",
+            out.to_str().expect("a path"),
+            "--escapes",
+            escapes,
+        ]);
+        assert_eq!(code, 0, "{told}");
+        let (code, printed, told) = tool(&["read", "--video", out.to_str().expect("a path")]);
+        assert_eq!(code, 0, "{told}");
+        printed
+    };
+
+    // Two escapes by hand, which is also the default.
+    let two = weave("two.h264", "2");
+    let default = weave("default.h264", "2");
+    assert_eq!(two, default);
+    let layered: Vec<&str> = two
+        .lines()
+        .filter(|line| field(line, "space_id") == Some("1"))
+        .collect();
+    assert_eq!(layered.len(), 5);
+    for line in &layered {
+        let escapes = numbers(field(line, "escapes").expect("an escapes list"));
+        assert_eq!(escapes.len(), 4, "two pairs in {line}");
+        let components = numbers(field(line, "vector").expect("a vector"));
+        // An escaped component is in the vector exactly as the escape
+        // gives it, printed by the same writer, so the text is equal.
+        for pair in escapes.chunks(2) {
+            let index: usize = pair[0].parse().expect("an index");
+            assert_eq!(components[index], pair[1], "escape {index} in {line}");
+        }
+    }
+
+    // None asked for, none written, and the field stays away.
+    let none = weave("none.h264", "0");
+    assert!(
+        !none.contains("\"escapes\""),
+        "a stream woven without escapes printed some"
+    );
+    // The quantized components differ, which is the whole point.
+    assert_ne!(none, two);
+
+    // A float space has no escapes to speak of either way.
+    for line in two
+        .lines()
+        .filter(|line| field(line, "space_id") == Some("2"))
+    {
+        assert!(field(line, "escapes").is_none(), "{line}");
     }
 }
 

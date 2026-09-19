@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn planes_from_several_carriers_become_one_record() {
         let space = i8_space();
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         assembler
             .push(1000, &Message::Space(space.clone()))
@@ -432,8 +432,56 @@ mod tests {
     }
 
     #[test]
+    fn the_escapes_arrive_with_plane_zero_and_stay() {
+        // Section 5 puts a record's escapes in the message that carries
+        // plane 0, whichever carrier that turns out to be.
+        let planes = Planes::quantize(&vector(16), 2).expect("quantized");
+        assert_eq!(planes.escapes().len(), 2);
+        let mut assembler = Assembler::default();
+        assembler
+            .push(1000, &Message::Space(i8_space()))
+            .expect("a space");
+        // The magnitude planes first, with no escapes in them.
+        assembler
+            .push(
+                1000,
+                &Message::Vector(record(1, 4, &planes, 0b1111_1110, -900, -100)),
+            )
+            .expect("the magnitude planes");
+        let held = assembler.records();
+        assert_eq!(held.len(), 1, "the record is held, planes and all");
+        assert!(
+            held[0].values().is_err(),
+            "but without plane 0 there is nothing to read yet"
+        );
+        // Then plane 0, which brings them.
+        assembler
+            .push(
+                2000,
+                &Message::Vector(record(1, 4, &planes, 0b0000_0001, -1900, -1100)),
+            )
+            .expect("plane 0 and the escapes");
+
+        let records = assembler.records();
+        assert_eq!(records.len(), 1);
+        let VectorBody::I8(merged) = &records[0].body else {
+            panic!("the layered encoding came back as something else");
+        };
+        assert_eq!(merged, &planes, "the record is the one that was sent");
+        assert_eq!(merged.escapes(), planes.escapes());
+        let read = records[0].values().expect("a reconstruction");
+        for (index, value) in planes.escapes() {
+            assert_eq!(
+                read[*index as usize],
+                crate::quant::f16_to_f32(*value),
+                "an escaped component is the escape's own value"
+            );
+        }
+    }
+
+    #[test]
     fn a_vector_waits_for_its_space_and_then_reads() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         assembler
             .push(0, &Message::Vector(record(1, 1, &planes, 0xff, 0, 500)))
@@ -448,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_space_that_never_arrives_is_dropped_after_the_wait() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let limits = Limits {
             orphan_wait_ms: 1000,
             ..Limits::default()
@@ -468,7 +516,7 @@ mod tests {
 
     #[test]
     fn the_ceiling_on_records_holds() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let limits = Limits {
             max_records: 8,
             ..Limits::default()
@@ -492,7 +540,7 @@ mod tests {
 
     #[test]
     fn record_ids_that_wrap_are_different_records() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::new(Limits {
             max_records: 1024,
             ..Limits::default()
@@ -520,7 +568,7 @@ mod tests {
 
     #[test]
     fn the_same_id_again_within_the_window_is_the_same_record() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         assembler
             .push(0, &Message::Space(i8_space()))
@@ -544,7 +592,7 @@ mod tests {
     #[test]
     fn slices_become_a_record() {
         let space = i8_space();
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let whole = record(1, 5, &planes, 0xff, -2000, -1000);
         let slices = crate::fragment::fragment_record(&whole, 20).expect("slices");
         assert!(slices.len() > 1);
@@ -567,7 +615,7 @@ mod tests {
 
     #[test]
     fn a_missing_slice_leaves_no_record_and_is_bounded() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let whole = record(1, 5, &planes, 0xff, 0, 10);
         let slices = crate::fragment::fragment_record(&whole, 20).expect("slices");
         let mut assembler = Assembler::new(Limits {
@@ -605,7 +653,7 @@ mod tests {
 
     #[test]
     fn messages_of_one_record_that_disagree_about_the_span_are_refused() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         assembler
             .push(0, &Message::Space(i8_space()))
@@ -631,7 +679,7 @@ mod tests {
             space
         );
 
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         assembler.push(0, &Message::Space(space)).expect("a space");
         assembler
@@ -646,7 +694,7 @@ mod tests {
 
     #[test]
     fn a_unit_of_mixed_messages_counts_what_it_cannot_use() {
-        let planes = Planes::quantize(&vector(16)).expect("quantized");
+        let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         let unit = Unit::new(vec![
             Message::Space(i8_space()),

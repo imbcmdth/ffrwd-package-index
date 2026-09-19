@@ -212,9 +212,12 @@ mod tests {
         space
     }
 
+    fn values() -> Vec<f32> {
+        (0..16).map(|i| (i as f32 * 0.4).cos()).collect()
+    }
+
     fn planes() -> Planes {
-        let vector: Vec<f32> = (0..16).map(|i| (i as f32 * 0.4).cos()).collect();
-        Planes::quantize(&vector).expect("quantized")
+        Planes::quantize(&values(), 0).expect("quantized")
     }
 
     fn vector(record_id: u16, mask: u8) -> Message {
@@ -287,6 +290,40 @@ mod tests {
         };
         assert_eq!(merged.present(), 0xff, "every plane made it into the entry");
         assert_eq!(merged, planes());
+    }
+
+    #[test]
+    fn the_escapes_of_a_record_survive_being_merged() {
+        // Plane 0 and the escapes on one carrier, the rest on another:
+        // the one entry the index keeps has both.
+        let escaped = Planes::quantize(&values(), 2).expect("quantized");
+        assert_eq!(escaped.escapes().len(), 2);
+        let message = |mask: u8| {
+            Message::Vector(VectorRecord {
+                space_id: 1,
+                record_id: 11,
+                start_off: -500,
+                end_off: 0,
+                body: escaped.subset(mask).encode(),
+            })
+        };
+        let index = FileIndex::build(vec![
+            (0, Message::Space(space(1))),
+            (1000, message(0b0000_0001)),
+            (2000, message(0b1111_1110)),
+        ]);
+        assert_eq!(index.records().count(), 1);
+        let (time, record) = index.records().next().expect("a record");
+        assert_eq!(time, 1000);
+        let body = record.decode_body(&space(1)).expect("a body");
+        let VectorBody::I8(merged) = body else {
+            panic!("the layered encoding came back as something else");
+        };
+        assert_eq!(merged, escaped);
+        assert_eq!(merged.escapes(), escaped.escapes());
+        // And the whole thing still writes and reads as bytes.
+        let bytes = index.encode();
+        assert_eq!(FileIndex::parse(&bytes).expect("an index"), index);
     }
 
     #[test]

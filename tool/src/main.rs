@@ -22,14 +22,14 @@ use ffrwd_index_core::message::{
     Encoding, Message, Modality, Space, Unit, VectorBody, VectorRecord,
 };
 use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
-use ffrwd_index_core::quant::{f32_to_f16, Planes};
+use ffrwd_index_core::quant::{f16_to_f32, f32_to_f16, Planes};
 
 const USAGE: &str = "\
 ffrwd-index: embedding vectors in a video's own elementary stream.
 
     ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                       [--placement keyframe|next|spread:BYTES]
-                      [--fps N] [--codec h264|h265]
+                      [--escapes N] [--fps N] [--codec h264|h265]
 
     ffrwd-index read  --video IN [--fps N] [--codec h264|h265]
                       [--index OUT.ffix]
@@ -39,7 +39,9 @@ ffrwd-index: embedding vectors in a video's own elementary stream.
 IN and OUT are H.264 or HEVC Annex B elementary streams; the codec is
 taken from the file name unless --codec says otherwise. An elementary
 stream carries no timestamps, so --fps (30 by default) is what gives
-each access unit a presentation time.
+each access unit a presentation time. --escapes (2 by default, 16 at
+most) is how many of a vector's largest components an i8 space sends
+exactly rather than quantized.
 
 The row shapes are in tool/README.md.";
 
@@ -150,6 +152,26 @@ fn fps_of(flags: &Flags) -> Result<f64, String> {
     Ok(value)
 }
 
+/// How many of a vector's largest components go exactly.
+///
+/// Two is the default because that is what the measurement behind
+/// section 5 found: one component of a video-text model held 30% of
+/// each vector's energy, and sending the two largest exactly brought
+/// the agreement with the original ranking from 80% to 99%.
+fn escapes_of(flags: &Flags) -> Result<usize, String> {
+    let text = flags.get("escapes").unwrap_or("2");
+    let value: usize = text
+        .parse()
+        .map_err(|_| format!("{text} is not a number of escapes"))?;
+    if value > usize::from(ffrwd_index_core::MAX_ESCAPES) {
+        return Err(format!(
+            "{value} escapes is more than the {} this format allows",
+            ffrwd_index_core::MAX_ESCAPES
+        ));
+    }
+    Ok(value)
+}
+
 /// The presentation time of the carrier at `index`.
 fn pts_ms(index: usize, fps: f64) -> i64 {
     (index as f64 * 1000.0 / fps).round() as i64
@@ -175,17 +197,26 @@ fn placement_of(text: &str) -> Result<Placement, String> {
 
 fn weave(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args)?;
-    flags.only(&["video", "vectors", "out", "placement", "fps", "codec"])?;
+    flags.only(&[
+        "video",
+        "vectors",
+        "out",
+        "placement",
+        "escapes",
+        "fps",
+        "codec",
+    ])?;
     let video = flags.need("video")?;
     let vectors = flags.need("vectors")?;
     let out = flags.need("out")?;
     let codec = codec_of(video, flags.get("codec"))?;
     let fps = fps_of(&flags)?;
     let policy = placement_of(flags.get("placement").unwrap_or("keyframe"))?;
+    let escapes = escapes_of(&flags)?;
 
     let stream = std::fs::read(video).map_err(|err| format!("{video}: {err}"))?;
     let rows = std::fs::read_to_string(vectors).map_err(|err| format!("{vectors}: {err}"))?;
-    let (spaces, records) = read_rows(&rows)?;
+    let (spaces, records) = read_rows(&rows, escapes)?;
 
     let units = avc::access_units(&stream, codec);
     if units.is_empty() {
@@ -229,7 +260,7 @@ fn weave(args: &[String]) -> Result<(), String> {
 }
 
 /// The spaces and records of an NDJSON file.
-fn read_rows(text: &str) -> Result<(Vec<Space>, Vec<Pending>), String> {
+fn read_rows(text: &str, escapes: usize) -> Result<(Vec<Space>, Vec<Pending>), String> {
     let mut spaces: BTreeMap<u8, Space> = BTreeMap::new();
     let mut records = Vec::new();
     let mut next_id: BTreeMap<u8, u32> = BTreeMap::new();
@@ -255,7 +286,8 @@ fn read_rows(text: &str) -> Result<(Vec<Space>, Vec<Pending>), String> {
         let space = spaces
             .get(&space_id)
             .ok_or_else(|| at(format!("space {space_id} has not been declared")))?;
-        let record = read_vector(&row, space, next_id.entry(space_id).or_insert(0)).map_err(at)?;
+        let record =
+            read_vector(&row, space, escapes, next_id.entry(space_id).or_insert(0)).map_err(at)?;
         records.push(record);
     }
     if spaces.is_empty() {
@@ -359,7 +391,12 @@ fn modality_of(name: &str) -> Result<Modality, String> {
 }
 
 /// A vector row, in its space's encoding.
-fn read_vector(row: &Json, space: &Space, next_id: &mut u32) -> Result<Pending, String> {
+fn read_vector(
+    row: &Json,
+    space: &Space,
+    escapes: usize,
+    next_id: &mut u32,
+) -> Result<Pending, String> {
     let values: Vec<f32> = row
         .get("vector")
         .and_then(Json::as_array)
@@ -405,7 +442,7 @@ fn read_vector(row: &Json, space: &Space, next_id: &mut u32) -> Result<Pending, 
 
     let mut pending = match space.encoding {
         Encoding::I8 => {
-            let planes = Planes::quantize(&values).map_err(|err| err.to_string())?;
+            let planes = Planes::quantize(&values, escapes).map_err(|err| err.to_string())?;
             Pending::layered(space.space_id, record_id, start_ms, end_ms, &planes)
         }
         Encoding::F32 => {
@@ -482,9 +519,19 @@ fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), St
         }
     }
     let records = assembler.records();
+    let mut unreadable = 0usize;
     for record in &records {
-        out.push_str(&record_row(record)?.write());
-        out.push('\n');
+        // A record whose plane 0 never arrived, because the stream was
+        // cut before it, is held but cannot be turned into a vector.
+        // It is counted rather than printed, and it is not a reason to
+        // give up on the rest of the file.
+        match record_row(record) {
+            Ok(row) => {
+                out.push_str(&row.write());
+                out.push('\n');
+            }
+            Err(_) => unreadable += 1,
+        }
     }
     print!("{out}");
 
@@ -497,6 +544,9 @@ fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), St
             .map(|(time, space)| (time, Message::Space(space)))
             .collect();
         for record in &records {
+            if record.values().is_err() {
+                continue;
+            }
             pairs.push((
                 record.carrier_ms.max(0) as u32,
                 Message::Vector(VectorRecord {
@@ -518,6 +568,9 @@ fn read_stream(flags: &Flags, video: &str, index: Option<&str>) -> Result<(), St
             "{video}: {} messages were dropped as unreadable",
             assembler.dropped()
         );
+    }
+    if unreadable > 0 {
+        eprintln!("{video}: {unreadable} records never got their plane 0");
     }
     Ok(())
 }
@@ -563,6 +616,9 @@ fn dump_index(path: &str) -> Result<(), String> {
                             .map_err(|err| format!("{path}: {err}"))?;
                         if let VectorBody::I8(planes) = &body {
                             members.push(("planes", planes_row(planes.present())));
+                            if !planes.escapes().is_empty() {
+                                members.push(("escapes", escapes_row(planes)));
+                            }
                         }
                         let values = body.values().map_err(|err| format!("{path}: {err}"))?;
                         members.push(("vector", vector_row(&values)));
@@ -611,8 +667,25 @@ fn record_row(record: &Record) -> Result<Json, String> {
     if let Some(present) = record.planes {
         members.push(("planes", planes_row(present)));
     }
+    if let VectorBody::I8(planes) = &record.body {
+        if !planes.escapes().is_empty() {
+            members.push(("escapes", escapes_row(planes)));
+        }
+    }
     members.push(("vector", vector_row(&values)));
     Ok(object(members))
+}
+
+/// The escaped components, as index and value pairs. The vector
+/// already holds their values; this says which of them came exactly.
+fn escapes_row(planes: &Planes) -> Json {
+    Json::Array(
+        planes
+            .escapes()
+            .iter()
+            .map(|(index, value)| Json::Array(vec![number(*index), float(f16_to_f32(*value))]))
+            .collect(),
+    )
 }
 
 /// Which planes arrived, as their numbers.
@@ -699,7 +772,7 @@ mod tests {
             r#"{"space_id":1,"record_id":40,"start_ms":0,"end_ms":10,"vector":[0,0,0,0],"available_ms":900}"#,
             "\n",
         );
-        let (spaces, records) = read_rows(text).expect("rows");
+        let (spaces, records) = read_rows(text, 0).expect("rows");
         assert_eq!(spaces.len(), 1);
         assert_eq!(records.len(), 3);
         // Ids count up per space where a row does not give one.
@@ -740,7 +813,7 @@ mod tests {
             ("{not json", "line 1"),
         ];
         for (text, wanted) in cases {
-            let err = read_rows(text).expect_err("a refusal");
+            let err = read_rows(text, 0).expect_err("a refusal");
             assert!(err.contains(wanted), "{text} gave {err}");
         }
     }

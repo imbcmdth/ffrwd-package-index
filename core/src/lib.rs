@@ -53,6 +53,9 @@ pub const MAX_DIMS: u32 = 65536;
 /// Record ids count per space and wrap at this, from section 4.
 pub const RECORD_ID_WRAP: u32 = 65536;
 
+/// How many escapes one I8 record may carry, from section 5.
+pub const MAX_ESCAPES: u8 = 16;
+
 /// What went wrong reading or building bytes of this format.
 ///
 /// One enum for the crate: a reader that hits any of these drops the
@@ -81,6 +84,9 @@ pub enum Error {
     /// Plane data that runs past the message, or a plane set a reader
     /// cannot use.
     Planes,
+    /// More escapes than section 5 allows, or an escape whose index is
+    /// not a component of the vector.
+    Escapes,
     /// Two halves of one record that disagree about dims or scale.
     Mismatch,
     /// A vector component that is not a finite number.
@@ -107,6 +113,10 @@ impl core::fmt::Display for Error {
                 write!(f, "a body of {got} bytes where the space needs {want}")
             }
             Error::Planes => write!(f, "a plane set this record cannot be read with"),
+            Error::Escapes => write!(
+                f,
+                "more escapes than {MAX_ESCAPES} or one outside the vector"
+            ),
             Error::Mismatch => write!(f, "two parts of one record disagree"),
             Error::NotFinite => write!(f, "a vector component that is not a finite number"),
             Error::FragmentBounds => write!(f, "a slice outside the value it slices"),

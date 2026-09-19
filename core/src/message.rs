@@ -444,6 +444,13 @@ impl VectorRecord {
 }
 
 /// A body, once the space that names its encoding is in hand.
+///
+/// The layered variant is the large one: eight plane slots and the
+/// escape list, about two hundred bytes of it, against a vector's
+/// twenty four. Boxing it would buy a smaller move and cost every
+/// reader a pointer hop and an allocation per record, so the variants
+/// stay uneven on purpose.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum VectorBody {
     F32(Vec<f32>),

@@ -405,7 +405,7 @@ mod tests {
 
     fn planes(dims: usize) -> Planes {
         let vector: Vec<f32> = (0..dims).map(|i| (i as f32 * 0.3).sin()).collect();
-        Planes::quantize(&vector).expect("quantized")
+        Planes::quantize(&vector, 0).expect("quantized")
     }
 
     fn records(count: usize) -> Vec<Pending> {
@@ -547,6 +547,48 @@ mod tests {
                 .sum();
             assert!(vectors <= budget, "a carrier took {vectors} bytes");
         }
+    }
+
+    #[test]
+    fn a_budget_counts_the_escapes_that_ride_with_plane_zero() {
+        // Plane 0's message is bigger than the others by the escapes it
+        // carries, and a budget has to know it: the planner asks the
+        // message what it costs rather than assuming the planes are all
+        // the same size.
+        let mut peaked: Vec<f32> = (0..16).map(|i| (i as f32 * 0.7).sin() * 0.2).collect();
+        peaked[2] = 9.0;
+        peaked[9] = -6.0;
+        let escaped = Planes::quantize(&peaked, 2).expect("quantized");
+        assert_eq!(escaped.escapes().len(), 2);
+        let budget = 24usize;
+        let carriers = carriers(60, 15);
+        let plan = plan(
+            Placement::Spread {
+                budget_bytes: budget,
+            },
+            &[space(1)],
+            &[Pending::layered(1, 0, 0, 500, &escaped)],
+            &carriers,
+        );
+        for messages in &plan {
+            let vectors: usize = messages
+                .iter()
+                .filter(|message| !matches!(message, Message::Space(_)))
+                .map(Message::encoded_len)
+                .sum();
+            assert!(vectors <= budget, "a carrier took {vectors} bytes");
+        }
+
+        let mut assembler = crate::assemble::Assembler::default();
+        for (messages, carrier) in plan.iter().zip(&carriers) {
+            assembler.push_unit(carrier.pts_ms, &Unit::new(messages.clone()));
+        }
+        let read = assembler.records();
+        assert_eq!(read.len(), 1);
+        let VectorBody::I8(merged) = &read[0].body else {
+            panic!("the layered encoding came back as something else");
+        };
+        assert_eq!(merged, &escaped, "the escapes did not survive the budget");
     }
 
     #[test]
