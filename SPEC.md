@@ -224,7 +224,10 @@ The slices of one VECTOR value, reassembled in order, are that value, and its
 `start_off` and `end_off` are relative to the carrier of the slice whose offset
 is 0. A FRAGMENT repeats the record's `space_id` and `record_id`, which the
 sliced value also carries, so a reader can file slices that arrive out of
-order. A reader that misses any slice drops the record. A writer should prefer
+order. A FRAGMENT names a record and not one message of it, so a record that is
+sent in slices is sent as one VECTOR value: a writer does not slice a record it
+also sends as several VECTOR messages, whose values a reader could not tell
+apart. A reader that misses any slice drops the record. A writer should prefer
 whole planes in separate VECTOR messages (section 5) to fragments: a lost
 VECTOR message costs precision, a lost fragment costs the record.
 
