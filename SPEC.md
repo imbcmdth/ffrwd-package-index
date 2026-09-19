@@ -114,9 +114,10 @@ use a new id instead.
 a ladder, a live stream already running. So a writer repeats the SPACE message
 of every space it is using on the first carrier it writes to and on every
 keyframe after it. A cut or a segment begins at a keyframe, so whatever begins
-there can be read. A reader holds VECTOR
-messages for a space it has not yet seen declared until the declaration
-arrives, and may drop them if it does not arrive within a bounded wait.
+there can be read. A reader holds VECTOR messages for a space it has not yet
+seen declared until the declaration arrives, and may drop them if it does not
+arrive within a wait of its own choosing. Since every keyframe carries the
+declarations, the longest keyframe interval a reader expects is wait enough.
 
 ## 4. VECTOR
 
@@ -134,6 +135,9 @@ the carrier because absolute times do not survive: remuxing rescales
 timestamps, and a cut or a concatenation made without re-encoding shifts them,
 while a message keeps its distance from the frame it rides on. In a live stream
 a vector exists only after its span has ended, so both offsets are negative.
+The format carries only offsets. However a writer is told a span, the span and
+the carrier's presentation time have to be on one clock before it subtracts,
+and a stream's first frame is often not at zero.
 
 Two VECTOR messages with the same `space_id` and `record_id` are the same
 record. For the layered encoding they may carry different layers, and a reader
@@ -200,7 +204,9 @@ and should send planes in order.
 
 A writer with room sends all planes in one message. A writer with a byte budget
 per carrier sends plane 0 first and the rest in later messages for the same
-record.
+record. A writer may also stop early and never send a record's lower planes,
+where it knows the space does not need them; a reader cannot tell that from a
+loss and does not need to.
 
 ## 6. FRAGMENT
 
@@ -248,7 +254,8 @@ ignore the message. Every stream an x264 encoder writes already carries an SEI
 of this kind, with the encoder's settings in it.
 
 **One unit per carrier.** A writer puts everything it has for a carrier in one
-unit. A reader accepts several.
+unit. When that would pass the size below, it writes several units on the
+carrier instead, splitting between messages. A reader accepts any number.
 
 **Placement.** Where a record goes is the writer's policy, and a reader handles
 all of them the same way:
