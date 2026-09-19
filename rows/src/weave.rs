@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use ffrwd_index_core::message::{Message, Space};
+use ffrwd_index_core::message::{Message, Space, VectorRecord};
 use ffrwd_index_core::placement::{Carrier, Pending, Placement, Planner};
 use ffrwd_index_core::RECORD_ID_WRAP;
 
@@ -39,6 +39,11 @@ pub const MAX_PENDING_RECORDS: usize = 4096;
 /// timestamps never settle hits it and is forced on rather than
 /// growing.
 pub const MAX_HELD_PACKETS: usize = 256;
+
+/// The most a VECTOR message costs on top of its body: the type byte,
+/// the message length, the space id, the record id and the two offsets,
+/// each varint at its widest.
+const VECTOR_OVERHEAD: usize = 1 + 3 + 1 + 3 + 5 + 5;
 
 /// What a caller asks the weaver for.
 #[derive(Clone, Debug)]
@@ -186,13 +191,35 @@ impl Weaver {
         // Only a budget splits a record across carriers, and section 5
         // would rather a writer with room sent every plane in one
         // message than pay for a header eight times.
-        let bodies = bodies(
+        let mut bodies = bodies(
             space,
             &values,
             self.config.escapes,
             self.config.plane_cap,
             matches!(self.config.placement, Placement::Spread { .. }),
         )?;
+        if let Placement::Spread { budget_bytes } = self.config.placement {
+            // A budget too small for even one plane's message gets the
+            // record as ONE value, which the planner then cuts into
+            // slices. Splitting it into planes first would buy nothing
+            // (every plane would be cut anyway) and would cost the
+            // reader dearly: a FRAGMENT names its record and not which
+            // of the record's values it slices, so planes 1 to 7, whose
+            // messages are all the same length, would be
+            // indistinguishable from one another. That only shows up
+            // where slices reach a reader out of presentation order,
+            // which is every elementary stream with B-frames in it.
+            let largest = bodies.iter().map(Vec::len).max().unwrap_or(0);
+            if largest + VECTOR_OVERHEAD > budget_bytes {
+                bodies = self::bodies(
+                    space,
+                    &values,
+                    self.config.escapes,
+                    self.config.plane_cap,
+                    false,
+                )?;
+            }
+        }
         // A record exists when the writer hands it over, which for a
         // live feed is after its span ended and for a file is before
         // the stream even started. A row may say so itself, which is
@@ -380,6 +407,17 @@ fn woven_row(
     let offsets = messages.iter().find_map(|message| match message {
         Message::Vector(record) if (record.space_id, record.record_id) == key => {
             Some((record.start_off, record.end_off))
+        }
+        // A budget too small for one message cuts it into slices, and
+        // the offsets are inside the value being cut rather than on the
+        // slices. They are at the front of it, so the slice that starts
+        // at zero still has them, and that is the record's first row.
+        Message::Fragment(slice)
+            if (slice.space_id, slice.record_id) == key && slice.offset == 0 =>
+        {
+            VectorRecord::decode(&slice.bytes)
+                .ok()
+                .map(|record| (record.start_off, record.end_off))
         }
         _ => None,
     });
@@ -611,7 +649,7 @@ impl<T> Reorder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffrwd_index_core::message::Encoding;
+    use ffrwd_index_core::message::{Encoding, Unit};
 
     fn space(name: &str, id: u8, dims: u32) -> (String, Space) {
         let mut space = Space::new(id, dims, Encoding::I8);
@@ -943,7 +981,9 @@ mod tests {
     #[test]
     fn a_budget_spreads_one_record_over_several_carriers() {
         let mut config = Config::new(vec![space("clip", 0, 64)]);
-        config.placement = Placement::Spread { budget_bytes: 32 };
+        // Room for one plane's message and not for eight, which is the
+        // policy doing what it is for.
+        config.placement = Placement::Spread { budget_bytes: 64 };
         let mut weaver = Weaver::new(config);
         assert_eq!(weaver.row(&row("clip", 0.0, 1.0, 64)), None);
         let mut rows = Vec::new();
@@ -980,6 +1020,53 @@ mod tests {
                 .and_then(Json::as_i64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn a_budget_below_one_plane_sends_the_record_as_one_value() {
+        // A FRAGMENT names the record it slices and not which of the
+        // record's values, so a record cut into slices must have only
+        // one value to cut. Here is why it matters: the slices are
+        // handed to a reader in a DIFFERENT order from the one they
+        // were written in, which is what an elementary stream with
+        // B-frames does to a reader walking it in decode order, and the
+        // record still comes back whole.
+        let mut config = Config::new(vec![space("clip", 0, 64)]);
+        config.placement = Placement::Spread { budget_bytes: 32 };
+        let mut weaver = Weaver::new(config);
+        assert_eq!(weaver.row(&row("clip", 0.0, 1.0, 64)), None);
+        let mut written: Vec<(i64, Vec<Message>)> = Vec::new();
+        for frame in 0..120i64 {
+            weaver.seen(frame * 40);
+            let carried = weaver.carrier(frame, frame * 40, frame % 25 == 0);
+            if !carried.messages.is_empty() {
+                written.push((frame * 40, carried.messages));
+            }
+        }
+        let slices = written
+            .iter()
+            .flat_map(|(_, messages)| messages)
+            .filter(|m| matches!(m, Message::Fragment(_)))
+            .count();
+        assert!(slices > 1, "a 64-dim record fitted one 32-byte carrier");
+        assert!(
+            written
+                .iter()
+                .flat_map(|(_, messages)| messages)
+                .all(|m| !matches!(m, Message::Vector(_))),
+            "a value went whole where the budget could not hold one"
+        );
+
+        // Reversed, so no slice arrives after the one it follows.
+        let mut assembler = ffrwd_index_core::assemble::Assembler::default();
+        for (carrier_ms, messages) in written.iter().rev() {
+            assembler.push_unit(*carrier_ms, &Unit::new(messages.clone()));
+        }
+        assert_eq!(assembler.dropped(), 0, "a slice was refused");
+        let read = assembler.records();
+        assert_eq!(read.len(), 1, "the record did not come back");
+        assert_eq!(read[0].planes, Some(0xff), "a plane was lost");
+        assert_eq!((read[0].start_ms, read[0].end_ms), (0, 1000));
     }
 
     #[test]
