@@ -5,4 +5,7 @@ wit/
 *.h264
 *.h265
 *.ivf
-!tests/data/**
+# A pattern with a slash in it is anchored to this directory, and the
+# committed fixtures live in core/tests/data, so the re-inclusion has
+# to say so.
+!**/tests/data/**
