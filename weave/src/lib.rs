@@ -139,7 +139,11 @@ impl Guest for Weave {
         STATE.with(|state| {
             *state.borrow_mut() = Some(State {
                 weaver: Weaver::new(config.clone()),
-                reorder: Reorder::new(MAX_HELD_PACKETS),
+                // The stream's own reorder depth is the bound on how far
+                // decode order and presentation order differ, and it is
+                // what settles the first packets, whose dts the wire
+                // does not carry.
+                reorder: Reorder::new(MAX_HELD_PACKETS, streams[0].decode_delay),
                 framing,
                 num: i64::from(coded.time_base.num),
                 den: i64::from(coded.time_base.den),
@@ -219,10 +223,14 @@ impl Guest for Weave {
                 let carried = state.weaver.carrier(pts, pts_ms, packet.keyframe);
                 added.push(apply(state.framing, pts, packet, carried, &mut written));
             }
-            // On the final call, whatever no carrier the policy would
-            // choose ever came along for rides the last access unit
-            // rather than being lost. `release` holds that one back
-            // until now for exactly this.
+            // The final call carries the last packets, so whatever no
+            // carrier the policy would choose ever came along for rides
+            // the last access unit of the stream rather than being lost.
+            //
+            // A host that ended with no packets at all would leave
+            // nothing to put them on, and then they are reported late
+            // and not written, which is the honest answer: a filter
+            // cannot invent an access unit to carry them.
             if last {
                 if let Some((pts, packet)) = state.reorder.last_held() {
                     let pts_ms = to_ms(pts, state.num, state.den);

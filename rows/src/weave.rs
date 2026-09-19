@@ -186,13 +186,12 @@ impl Weaver {
         // Only a budget splits a record across carriers, and section 5
         // would rather a writer with room sent every plane in one
         // message than pay for a header eight times.
-        let split = matches!(self.config.placement, Placement::Spread { .. });
         let bodies = bodies(
             space,
             &values,
             self.config.escapes,
             self.config.plane_cap,
-            split,
+            matches!(self.config.placement, Placement::Spread { .. }),
         )?;
         // A record exists when the writer hands it over, which for a
         // live feed is after its span ended and for a file is before
@@ -458,18 +457,33 @@ fn seconds_to_ms(row: &Json, field: &str) -> Result<i64, String> {
 
 /// Packets in decode order, carriers out in presentation order.
 ///
-/// A packet's presentation time is settled the moment some packet's
-/// DECODE time reaches it: `dts` never decreases and no packet is shown
-/// before it is decoded, so once a packet with `dts = T` has arrived,
-/// nothing still to come can be presented before `T`. That is exact and
-/// needs no guess at a reorder depth, which the wire does not carry
-/// here anyway. Where the wire settles no `dts` at all - which it may
-/// not for the first packets of a reordering stream - the cap is what
-/// moves things along.
+/// Two rules settle a packet's place, and either is enough.
+///
+/// The stream's DECODE DELAY is how many packets a decoder holds back
+/// before the first picture leaves it, which is the same thing as how
+/// far decode order and presentation order can differ: once that many
+/// more packets have arrived after a held one, nothing still to come
+/// can be shown before it. That rule works from the first packet, which
+/// is what the head of a reordering stream needs, because the wire
+/// settles no `dts` for exactly those packets.
+///
+/// After them, `dts` says it more tightly: it never decreases and no
+/// packet is shown before it is decoded, so once a packet with
+/// `dts = T` has arrived, nothing still to come can be presented before
+/// `T`. Whichever rule fires first settles the packet.
+///
+/// The cap is the backstop under both, for a stream whose timestamps
+/// say something neither rule can use.
 pub struct Reorder<T> {
     slots: VecDeque<Slot<T>>,
     /// The floor every future packet's presentation time sits on.
     settled: i64,
+    /// How far decode order and presentation order may differ, from the
+    /// stream's own header.
+    decode_delay: u64,
+    /// How many packets have arrived, for the decode delay to count
+    /// against.
+    pushed: u64,
     /// No more packets are coming, so every held packet is settled.
     closed: bool,
     max_held: usize,
@@ -479,14 +493,18 @@ pub struct Reorder<T> {
 struct Slot<T> {
     item: T,
     pts: i64,
+    /// Where this packet arrived in decode order.
+    seq: u64,
     decided: bool,
 }
 
 impl<T> Reorder<T> {
-    pub fn new(max_held: usize) -> Self {
+    pub fn new(max_held: usize, decode_delay: u32) -> Self {
         Self {
             slots: VecDeque::new(),
             settled: i64::MIN,
+            decode_delay: u64::from(decode_delay),
+            pushed: 0,
             closed: false,
             max_held: max_held.max(1),
             forced: 0,
@@ -501,8 +519,10 @@ impl<T> Reorder<T> {
         self.slots.push_back(Slot {
             item,
             pts,
+            seq: self.pushed,
             decided: false,
         });
+        self.pushed += 1;
     }
 
     /// Nothing more is coming: what is held is all there is.
@@ -521,7 +541,11 @@ impl<T> Reorder<T> {
             .filter(|(_, slot)| !slot.decided)
             .min_by_key(|(index, slot)| (slot.pts, *index))
             .map(|(index, _)| index)?;
-        let ready = self.closed || self.slots[pick].pts <= self.settled;
+        let slot = &self.slots[pick];
+        // How many packets arrived after this one, which is what the
+        // decode delay is counted against.
+        let behind = self.pushed.saturating_sub(slot.seq + 1);
+        let ready = self.closed || slot.pts <= self.settled || behind >= self.decode_delay;
         // At the cap, one packet at a time is forced on: the front slot
         // is what blocks the release, so forcing stops the moment it is
         // decided rather than emptying the whole hold and giving up on
@@ -542,15 +566,13 @@ impl<T> Reorder<T> {
     /// Everything at the front that has been decided, in the order it
     /// arrived, which is the order it has to leave in.
     ///
-    /// One packet is always held back until [`Reorder::close`]. The
-    /// final call of an instance's life carries no packets, so a writer
-    /// with a record nobody carried would have nothing left to put it
-    /// on; this is the one access unit that is always still there. It
-    /// costs one call of latency and no more.
+    /// Nothing is held past its turn: the final call of an instance's
+    /// life carries the last packets, so a record nobody carried has a
+    /// real last carrier to ride and there is no reason to keep one out
+    /// of the stream for the whole run.
     pub fn release(&mut self) -> Vec<T> {
-        let keep = usize::from(!self.closed);
         let mut out = Vec::new();
-        while self.slots.len() > keep && self.slots.front().is_some_and(|slot| slot.decided) {
+        while self.slots.front().is_some_and(|slot| slot.decided) {
             out.push(self.slots.pop_front().expect("a decided slot").item);
         }
         out
@@ -1018,47 +1040,75 @@ mod tests {
     // Reorder.
     // ------------------------------------------------------------ //
 
-    /// One IBBP stream in decode order: (pts, dts).
-    fn ibbp(frames: usize) -> Vec<(i64, i64)> {
-        // I0 P3 B1 B2 P6 B4 B5 ..., decoded one frame ahead of display.
-        let mut out = Vec::new();
-        let mut dts = 0i64;
-        out.push((0, dts));
-        dts += 1;
+    /// How deep the streams below reorder, and how many of their first
+    /// packets the wire therefore settles no `dts` for.
+    const DELAY: u32 = 2;
+
+    /// One IBBP stream as a wire hands it over: (pts, dts), in decode
+    /// order, with no dts on the first packets.
+    fn ibbp(frames: usize) -> Vec<(i64, Option<i64>)> {
+        // I0 P3 B1 B2 P6 B4 B5 ..., decoded two frames ahead of display.
+        let mut pts = vec![0i64];
         let mut anchor = 3i64;
-        while out.len() < frames {
-            out.push((anchor, dts));
-            dts += 1;
+        while pts.len() < frames {
+            pts.push(anchor);
             for offset in 1..3 {
-                if out.len() >= frames {
+                if pts.len() >= frames {
                     break;
                 }
-                out.push((anchor - 3 + offset, dts));
-                dts += 1;
+                pts.push(anchor - 3 + offset);
             }
             anchor += 3;
         }
-        out
+        // dts counts up from zero and lags the picture by the delay, so
+        // the first `DELAY` packets have none: the wire has not settled
+        // them, which is exactly where the delay rule earns its keep.
+        pts.iter()
+            .enumerate()
+            .map(|(index, pts)| {
+                let dts = index as i64 - i64::from(DELAY);
+                (*pts, (dts >= 0).then_some(dts))
+            })
+            .collect()
     }
 
-    #[test]
-    fn a_reordered_stream_settles_in_presentation_order_and_leaves_in_decode_order() {
-        let mut reorder = Reorder::new(MAX_HELD_PACKETS);
-        let frames = ibbp(31);
-        let mut settled: Vec<i64> = Vec::new();
-        let mut left: Vec<i64> = Vec::new();
+    /// Drives a whole stream through a hold and answers what settled, in
+    /// the order it settled, and what left, in the order it left.
+    fn through(
+        reorder: &mut Reorder<usize>,
+        frames: &[(i64, Option<i64>)],
+    ) -> (Vec<i64>, Vec<i64>) {
+        let mut settled = Vec::new();
+        let mut left = Vec::new();
+        let mut most = 0usize;
         for (index, (pts, dts)) in frames.iter().enumerate() {
-            reorder.push((index, *pts), *pts, Some(*dts));
+            reorder.push(index, *pts, *dts);
             while let Some((pts, _)) = reorder.settle() {
                 settled.push(pts);
             }
-            left.extend(reorder.release().into_iter().map(|(index, _)| index as i64));
+            left.extend(reorder.release().into_iter().map(|index| index as i64));
+            most = most.max(reorder.held());
         }
         reorder.close();
         while let Some((pts, _)) = reorder.settle() {
             settled.push(pts);
         }
-        left.extend(reorder.release().into_iter().map(|(index, _)| index as i64));
+        left.extend(reorder.release().into_iter().map(|index| index as i64));
+        // A packet settles once `DELAY` more have arrived after it, so
+        // that many are undecided at worst, plus the one at the front
+        // whose turn has not come and the one that just arrived.
+        assert!(
+            most <= usize::try_from(DELAY).expect("a small delay") + 2,
+            "{most} packets held for a reorder of {DELAY}"
+        );
+        (settled, left)
+    }
+
+    #[test]
+    fn a_reordered_stream_settles_in_presentation_order_and_leaves_in_decode_order() {
+        let frames = ibbp(31);
+        let mut reorder = Reorder::new(MAX_HELD_PACKETS, DELAY);
+        let (settled, left) = through(&mut reorder, &frames);
 
         let mut wanted: Vec<i64> = frames.iter().map(|(pts, _)| *pts).collect();
         wanted.sort_unstable();
@@ -1073,23 +1123,42 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_is_held_no_longer_than_the_reordering_needs() {
-        let mut reorder = Reorder::new(MAX_HELD_PACKETS);
-        let mut most = 0usize;
-        for (index, (pts, dts)) in ibbp(60).iter().enumerate() {
-            reorder.push(index, *pts, Some(*dts));
+    fn the_decode_delay_settles_the_head_where_no_dts_does() {
+        // The same stream with no dts at all, which is the head of it
+        // for the whole run. Nothing but the delay can settle a packet,
+        // and it settles every one of them in the right order without
+        // the cap ever coming into it.
+        let frames: Vec<(i64, Option<i64>)> =
+            ibbp(31).into_iter().map(|(pts, _)| (pts, None)).collect();
+        let mut reorder = Reorder::new(MAX_HELD_PACKETS, DELAY);
+        let (settled, left) = through(&mut reorder, &frames);
+        let mut wanted: Vec<i64> = frames.iter().map(|(pts, _)| *pts).collect();
+        wanted.sort_unstable();
+        assert_eq!(settled, wanted, "the delay did not settle in pts order");
+        assert_eq!(left, (0..frames.len() as i64).collect::<Vec<i64>>());
+        assert_eq!(reorder.forced(), 0, "the cap settled what the delay should");
+    }
+
+    #[test]
+    fn a_stream_that_does_not_reorder_settles_every_packet_at_once() {
+        let frames: Vec<(i64, Option<i64>)> = (0..12i64).map(|index| (index, None)).collect();
+        let mut reorder = Reorder::new(MAX_HELD_PACKETS, 0);
+        let mut held = Vec::new();
+        for (index, (pts, dts)) in frames.iter().enumerate() {
+            reorder.push(index, *pts, *dts);
             while reorder.settle().is_some() {}
             reorder.release();
-            most = most.max(reorder.held());
+            held.push(reorder.held());
         }
-        assert!(most <= 4, "{most} packets held for a three-frame reorder");
+        assert!(held.iter().all(|count| *count == 0), "{held:?}");
     }
 
     #[test]
     fn a_stream_that_never_settles_is_forced_on_at_the_cap() {
-        // Every packet's pts ahead of every dts: nothing would ever
-        // settle of itself, and the cap is what stops the hold growing.
-        let mut reorder = Reorder::new(4);
+        // Every packet's pts ahead of every dts, and a reorder depth
+        // deeper than the stream is long: nothing would ever settle of
+        // itself, and the cap is what stops the hold growing.
+        let mut reorder = Reorder::new(4, 1000);
         for index in 0..20i64 {
             reorder.push(index, 1_000_000 + index, Some(index));
             while reorder.settle().is_some() {}
@@ -1100,11 +1169,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_with_no_dts_still_drains() {
-        // The wire settles no decode time at all, so nothing tells the
-        // hold when a packet's place is safe; the cap does, and every
-        // packet still leaves exactly once and in the order it arrived.
-        let mut reorder = Reorder::new(4);
+    fn a_stream_whose_header_says_nothing_true_still_drains() {
+        // No dts on the wire and a declared depth nothing reaches: the
+        // cap is all that is left, and every packet still leaves exactly
+        // once and in the order it arrived.
+        let mut reorder = Reorder::new(4, 1000);
         let mut left = Vec::new();
         for index in 0..10i64 {
             reorder.push(index, index, None);
