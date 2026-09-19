@@ -7,9 +7,14 @@ writes the vectors into the stream itself: SEI messages in H.264 and HEVC, a
 metadata OBU in AV1. A player that has never heard of them plays the video
 unchanged. A reader that has finds, for every span somebody described, the
 vector, the model that made it, and the model that turns a search into the same
-space. For a file it can also write one small index beside the stream so a
+space. For a file it can also write one small index inside the container so a
 search is a single read; for a live stream it writes only the messages, as the
 vectors arrive.
+
+Reading a file is native, without ffmpeg: MP4 and Matroska, fragmented or not,
+with the tool reading the front of the sync samples alone where the records are
+and saying what that cost. Ten seconds of 640x360 comes back out of a sixteen
+hundredth of the file.
 
 The format is in [SPEC.md](SPEC.md). It is not tied to ffrwd.
 
@@ -28,8 +33,11 @@ filter in a query yet. See [Using it from a query](#using-it-from-a-query).
 - `rows/`: the JSON both callers of the codec speak, and what a writer does
   with it: reading a space and a vector, and deciding which access unit a
   record rides. Plain Rust over `core`, tested natively.
-- `tool/`: a native command line over `core` and `rows`, for weaving vectors
-  into a file and reading them back without ffrwd.
+- `container/`: MP4 and Matroska, read natively over `Read + Seek`: the video
+  track, where every sample is and when it is shown, the front of the samples
+  a scan needs, and section 8's index box and attachment.
+- `tool/`: a native command line over the three, for weaving vectors into a
+  file, reading them back and putting an index in the file, without ffrwd.
 - `weave/`: the ffrwd module, a `wasm32-wasip2` cdylib and a thin one.
 - `ffrwd.json`, `src/index.sql`: the package.
 - `notes/`: what placing a packet filter in a query would take.
@@ -44,6 +52,15 @@ one crate over `core` that both compile in. The same crate holds the weaving
 state machine, for the same reason turned around: it is the module's whole
 decision, and it belongs somewhere `cargo test` can reach it on the native
 target rather than inside a wasm cdylib.
+
+Why `container/` is its own crate: a packet filter never sees a file. It runs
+inside a pipeline, before the muxer, and the container it will end up in does
+not exist yet. Everything about MP4 and Matroska belongs to the programs that
+do have a file, and keeping it out of `core` keeps `core` what it says it is:
+the codec, with no I/O, no dependencies, and nothing a wasm build has to carry
+that it will never call. `container` reads through `Read + Seek` rather than a
+path, so every parser in it runs against a `Cursor<Vec<u8>>` and its fuzz tests
+can hand it any bytes at all.
 
 ## The module
 
@@ -301,13 +318,21 @@ same unreleased world the module is built against, and both land together.
 
 ## Building and testing
 
-`core`, `rows` and `tool` are ordinary Rust and need nothing:
+`core`, `rows`, `container` and `tool` are ordinary Rust and need nothing to
+build:
 
 ```
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
+
+The container tests make their fixtures with ffmpeg when the tests run, so
+that nothing binary is committed and nothing is asserted about a file nobody
+has; each one skips with a message saying so when ffmpeg is not on the PATH.
+What is left running without it is every parser against truncations, random
+bytes and files made by hand, which is the part that has to hold whatever is
+installed.
 
 The module needs the `ffrwd:av` wit. `ffrwd:av@0.16.0` is in no released
 `ffrwd/wasm`, so point `FFRWD_WIT_DIR` at the `sidecar/wit` of an ffrwd
