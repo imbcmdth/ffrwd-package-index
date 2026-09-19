@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::message::{
     expand_record_id, Encoding, Message, Space, VectorBody, VectorRecord, TYPE_SPACE, TYPE_VECTOR,
 };
-use crate::wire::{put_varint, Reader};
+use crate::wire::{put_svarint, put_varint, Reader};
 use crate::{Error, Result, VERSION};
 
 /// The four bytes an index opens with.
@@ -27,8 +27,13 @@ pub const MATROSKA_FILE_NAME: &str = "ffrwd-index.bin";
 /// came off.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
-    /// Milliseconds of presentation time from the start of the file.
-    pub time_ms: u32,
+    /// The carrier's presentation time in milliseconds, on the
+    /// container's own clock: the time a player shows that picture at,
+    /// once the container's timestamps and, in an MP4, its edit list
+    /// have been applied. It is signed because an edit list can put a
+    /// carrier before the file's zero, and negative is what every
+    /// reader of that file then reports for it.
+    pub time_ms: i32,
     /// A SPACE or VECTOR message, exactly as it appears in a unit.
     pub message: Message,
 }
@@ -50,7 +55,7 @@ impl FileIndex {
     /// gets a second entry at the time the new definition started. And
     /// the several messages of one record become one entry, at the time
     /// of the first of them, with their planes merged.
-    pub fn build(pairs: impl IntoIterator<Item = (u32, Message)>) -> Self {
+    pub fn build(pairs: impl IntoIterator<Item = (i32, Message)>) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
         let mut spaces: BTreeMap<u8, Space> = BTreeMap::new();
         let mut declared: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
@@ -94,6 +99,12 @@ impl FileIndex {
                 _ => {}
             }
         }
+        // Section 8: entries are in time order, and where two have the
+        // same time a SPACE comes before a VECTOR, because a reader
+        // needs the declaration before the vectors that use it. The
+        // sort is stable, so records sharing a time keep the order
+        // their first messages arrived in.
+        entries.sort_by_key(|entry| (entry.time_ms, entry.message.kind()));
         Self {
             version: VERSION,
             entries,
@@ -107,7 +118,7 @@ impl FileIndex {
         out.push(self.version);
         put_varint(&mut out, self.entries.len() as u32);
         for entry in &self.entries {
-            put_varint(&mut out, entry.time_ms);
+            put_svarint(&mut out, entry.time_ms);
             entry.message.encode_into(&mut out);
         }
         out
@@ -131,7 +142,7 @@ impl FileIndex {
         let count = reader.varint()?;
         let mut entries = Vec::new();
         for _ in 0..count {
-            let time_ms = reader.varint()?;
+            let time_ms = reader.svarint()?;
             let kind = reader.u8()?;
             let length = reader.length()?;
             let value = reader.take(length)?;
@@ -149,7 +160,7 @@ impl FileIndex {
     }
 
     /// The spaces the index declares.
-    pub fn spaces(&self) -> impl Iterator<Item = (u32, &Space)> {
+    pub fn spaces(&self) -> impl Iterator<Item = (i32, &Space)> {
         self.entries
             .iter()
             .filter_map(|entry| match &entry.message {
@@ -159,7 +170,7 @@ impl FileIndex {
     }
 
     /// The records the index holds.
-    pub fn records(&self) -> impl Iterator<Item = (u32, &VectorRecord)> {
+    pub fn records(&self) -> impl Iterator<Item = (i32, &VectorRecord)> {
         self.entries
             .iter()
             .filter_map(|entry| match &entry.message {
@@ -247,6 +258,49 @@ mod tests {
     }
 
     #[test]
+    fn a_carrier_before_the_files_zero_keeps_its_negative_time() {
+        // An MP4's edit list can put a sample before the time the file
+        // starts at, and ffprobe prints a negative `pts_time` for it.
+        // Section 8's time is signed so that an index can say the same.
+        let index = FileIndex::build(vec![
+            (-100, Message::Space(space(1))),
+            (-100, vector(0, 0xff)),
+            (0, vector(1, 0xff)),
+            (2_000_000, vector(2, 0xff)),
+        ]);
+        let bytes = index.encode();
+        let read = FileIndex::parse(&bytes).expect("an index");
+        assert_eq!(read, index);
+        let times: Vec<i32> = read.entries.iter().map(|entry| entry.time_ms).collect();
+        assert_eq!(times, vec![-100, -100, 0, 2_000_000]);
+        // The span a record names is still its carrier plus its own
+        // offsets, and that arithmetic works either side of zero.
+        let (time, record) = read.records().next().expect("a record");
+        assert_eq!(i64::from(time) + i64::from(record.start_off), -600);
+    }
+
+    #[test]
+    fn a_space_comes_before_a_vector_of_the_same_time() {
+        // A reader needs the declaration before the vectors that use
+        // it, so the order is the index's own property rather than a
+        // thing every caller has to remember.
+        let index = FileIndex::build(vec![
+            (1000, vector(0, 0xff)),
+            (1000, Message::Space(space(1))),
+            (500, vector(1, 0xff)),
+        ]);
+        let kinds: Vec<(i32, u8)> = index
+            .entries
+            .iter()
+            .map(|entry| (entry.time_ms, entry.message.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![(500, TYPE_VECTOR), (1000, TYPE_SPACE), (1000, TYPE_VECTOR)]
+        );
+    }
+
+    #[test]
     fn a_repeated_space_appears_once_at_the_time_it_first_applied() {
         let index = FileIndex::build(vec![
             (0, Message::Space(space(1))),
@@ -328,9 +382,9 @@ mod tests {
 
     #[test]
     fn records_whose_ids_wrap_stay_apart() {
-        let mut pairs = vec![(0u32, Message::Space(space(1)))];
+        let mut pairs = vec![(0i32, Message::Space(space(1)))];
         for (index, id) in [65534u16, 65535, 0, 1].iter().enumerate() {
-            pairs.push((index as u32 * 100, vector(*id, 0xff)));
+            pairs.push((index as i32 * 100, vector(*id, 0xff)));
         }
         let index = FileIndex::build(pairs);
         assert_eq!(index.records().count(), 4);

@@ -1104,9 +1104,9 @@ fn the_file_index_says_what_the_stream_says() {
     for stream in Stream::every() {
         let woven = weave(stream, Placement::Spread { budget_bytes: 96 });
         // What a reader would build while walking the file.
-        let mut pairs: Vec<(u32, Message)> = Vec::new();
+        let mut pairs: Vec<(i32, Message)> = Vec::new();
         for (index, units) in stream.units(&woven.bytes).into_iter().enumerate() {
-            let time = (index as i64 * 1000 / FPS) as u32;
+            let time = (index as i64 * 1000 / FPS) as i32;
             for unit in units {
                 for message in Unit::decode(&unit).expect("a unit").messages {
                     // Slices are put back together before they reach an

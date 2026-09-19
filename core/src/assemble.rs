@@ -237,15 +237,18 @@ impl Assembler {
     fn push_vector(&mut self, carrier_ms: i64, record: &VectorRecord) -> Result<()> {
         let sequence = self.expand(record.space_id, record.record_id);
         let key = (record.space_id, sequence);
-        let start_ms = carrier_ms + i64::from(record.start_off);
-        let end_ms = carrier_ms + i64::from(record.end_off);
         match self.held.get_mut(&key) {
             Some(held) => {
-                // Every message of a record describes the same span,
-                // each from its own carrier. They must agree.
-                if held.start_ms != start_ms || held.end_ms != end_ms {
-                    return Err(Error::Mismatch);
-                }
+                // Section 4: a record's span is the one its first
+                // message gives, and a reader does not require the
+                // others to agree with it. They cannot always. Each
+                // names the span from its own carrier, and between a
+                // writer and a reader those carriers' times are
+                // rescaled by remuxing and rounded to the millisecond
+                // at both ends; a stream woven against a frame rate and
+                // read back off a container's own clock can differ by
+                // more. None of that is a reason to throw away a plane,
+                // so a later message adds its body and nothing else.
                 held.bodies.push(record.body.clone());
             }
             None => {
@@ -256,8 +259,8 @@ impl Assembler {
                         space_id: record.space_id,
                         record_id: record.record_id,
                         carrier_ms,
-                        start_ms,
-                        end_ms,
+                        start_ms: carrier_ms + i64::from(record.start_off),
+                        end_ms: carrier_ms + i64::from(record.end_off),
                         bodies: vec![record.body.clone()],
                     },
                 );
@@ -652,7 +655,12 @@ mod tests {
     }
 
     #[test]
-    fn messages_of_one_record_that_disagree_about_the_span_are_refused() {
+    fn messages_of_one_record_that_disagree_about_the_span_still_merge() {
+        // Section 4: the span is the first message's, and the later
+        // ones are not held to it. A writer that computed its offsets
+        // against a frame rate and a reader on a container's own clock
+        // will disagree by more than rounding, and the planes are still
+        // the same record's planes.
         let planes = Planes::quantize(&vector(16), 0).expect("quantized");
         let mut assembler = Assembler::default();
         assembler
@@ -661,10 +669,16 @@ mod tests {
         assembler
             .push(0, &Message::Vector(record(1, 3, &planes, 0b0001, 0, 100)))
             .expect("plane 0");
-        assert_eq!(
-            assembler.push(0, &Message::Vector(record(1, 3, &planes, 0b0010, 0, 200))),
-            Err(Error::Mismatch)
-        );
+        assembler
+            .push(40, &Message::Vector(record(1, 3, &planes, 0b1110, 0, 200)))
+            .expect("the planes after it, from a carrier that says otherwise");
+        assert_eq!(assembler.dropped(), 0);
+        let held = assembler.records();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].planes, Some(0b1111), "every plane made it in");
+        assert_eq!(held[0].start_ms, 0, "the first message's span");
+        assert_eq!(held[0].end_ms, 100);
+        assert_eq!(held[0].carrier_ms, 0, "and the first message's carrier");
     }
 
     #[test]
@@ -699,7 +713,16 @@ mod tests {
         let unit = Unit::new(vec![
             Message::Space(i8_space()),
             Message::Vector(record(1, 1, &planes, 0xff, 0, 10)),
-            Message::Vector(record(1, 1, &planes, 0xff, 50, 60)),
+            // A slice that falls outside the value it slices, which is
+            // section 9's rule and not section 4's: the framing itself
+            // is wrong, and the message goes.
+            Message::Fragment(crate::message::Fragment {
+                space_id: 1,
+                record_id: 2,
+                total: 4,
+                offset: 3,
+                bytes: vec![1, 2, 3],
+            }),
             Message::Unknown {
                 kind: 0x90,
                 value: vec![1, 2],
@@ -707,6 +730,6 @@ mod tests {
         ]);
         assembler.push_unit(0, &unit);
         assert_eq!(assembler.records().len(), 1);
-        assert_eq!(assembler.dropped(), 1, "the disagreeing record");
+        assert_eq!(assembler.dropped(), 1, "the slice outside its value");
     }
 }
