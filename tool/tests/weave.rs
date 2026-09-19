@@ -1,0 +1,1271 @@
+//! The `weave` module, through the real sidecar and real ffmpeg.
+//!
+//! Every test here encodes with ffmpeg, pipes the coded packets through
+//! `ffrwd-wasm` hosting `weave.wasm`, muxes the result with `-c copy`,
+//! and then asks three questions of what came out: do the pictures
+//! decode to the same frames, are the packets the packets that went in,
+//! and do the records read back where they were put. Nothing is
+//! simulated: the interface under test is a host's, and a mock of it
+//! would only prove that the mock agrees with itself.
+//!
+//! `ffrwd:av@0.16.0` is not released, so the sidecar that hosts a
+//! packet filter is a build of the branch that carries it. `FFRWD_WASM`
+//! names that binary and every test here skips without it, loudly.
+//! `FFRWD_INDEX_WASM` names a prebuilt `weave.wasm`; without it the
+//! module is built once, which needs `FFRWD_WIT_DIR` pointing at that
+//! same branch's `sidecar/wit`.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+use ffrwd_index_core::message::{Message, Space, Unit, VectorBody};
+use ffrwd_index_core::obu;
+use ffrwd_index_core::quant::Planes;
+
+/// Names the sidecar built from the `packet-filter` branch.
+const SIDECAR_ENV: &str = "FFRWD_WASM";
+/// Names a `weave.wasm` already built, instead of building one.
+const MODULE_ENV: &str = "FFRWD_INDEX_WASM";
+/// Where the `ffrwd:av` wit comes from when the module is built here.
+const WIT_ENV: &str = "FFRWD_WIT_DIR";
+
+/// Four seconds of testsrc2 at 25 fps, with a keyframe every second.
+const FPS: u32 = 25;
+const SECONDS: u32 = 4;
+const FRAMES: usize = (FPS * SECONDS) as usize;
+
+// ------------------------------------------------------------------ //
+// The harness.
+// ------------------------------------------------------------------ //
+
+fn workspace() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("tool/ has a parent")
+        .to_path_buf()
+}
+
+/// The sidecar to drive, or nothing, having said why.
+fn sidecar() -> Option<PathBuf> {
+    let Some(named) = std::env::var_os(SIDECAR_ENV) else {
+        eprintln!(
+            "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A packet filter needs a \
+             host, ffrwd:av@0.16.0 is not released, so build the sidecar of the ffrwd branch that \
+             carries the interface and point {SIDECAR_ENV} at it."
+        );
+        return None;
+    };
+    let path = PathBuf::from(named);
+    if !path.is_file() {
+        panic!(
+            "{SIDECAR_ENV} names {}, which is not a file",
+            path.display()
+        );
+    }
+    Some(path)
+}
+
+/// `weave.wasm`, built once per test binary.
+///
+/// The build goes to a target directory of its own: this test runs
+/// under a `cargo test` that holds the workspace's build lock, and a
+/// second cargo in the same directory would wait for it forever.
+fn module() -> PathBuf {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            if let Some(named) = std::env::var_os(MODULE_ENV) {
+                let path = PathBuf::from(named);
+                assert!(path.is_file(), "{MODULE_ENV} names no file");
+                return path;
+            }
+            let target = workspace().join("target/wasm-module");
+            let output = Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
+                .args([
+                    "build",
+                    "--release",
+                    "--target",
+                    "wasm32-wasip2",
+                    "-p",
+                    "weave",
+                ])
+                .current_dir(workspace())
+                .env("CARGO_TARGET_DIR", &target)
+                .output()
+                .expect("spawn cargo to build weave.wasm");
+            assert!(
+                output.status.success(),
+                "building weave.wasm failed. Set {MODULE_ENV} to a prebuilt module, or {WIT_ENV} \
+                 to the sidecar/wit of an ffrwd checkout carrying ffrwd:av@0.16.0.\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            target.join("wasm32-wasip2/release/weave.wasm")
+        })
+        .clone()
+}
+
+/// A directory of this test's own, emptied first so a rerun starts
+/// clean and left behind so a failure can be looked at.
+fn scratch(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("ffrwd_index_weave_{name}"));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("a scratch directory");
+    path
+}
+
+fn ffmpeg(args: &[&str]) -> String {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(args)
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        output.status.success(),
+        "ffmpeg {args:?} exited with {:?}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn ffprobe(args: &[&str]) -> String {
+    let output = Command::new("ffprobe")
+        .args(["-hide_banner", "-v", "error"])
+        .args(args)
+        .output()
+        .expect("spawn ffprobe");
+    assert!(
+        output.status.success(),
+        "ffprobe {args:?} exited with {:?}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn text(path: &Path) -> String {
+    path.to_str().expect("a UTF-8 path").to_string()
+}
+
+/// One encode of testsrc2, with B-frames where the codec has them, as a
+/// coded NUT: the shape an encoding ffmpeg hands a packet filter.
+fn encode(dir: &Path, codec: &str) -> PathBuf {
+    let out = dir.join(format!("{codec}.nut"));
+    let source = format!("testsrc2=size=320x240:rate={FPS}:duration={SECONDS}");
+    let mut args: Vec<String> = vec![
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        source,
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+    ];
+    args.extend(
+        match codec {
+            "h264" => vec![
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "25",
+                "-bf",
+                "2",
+            ],
+            "hevc" => vec![
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "keyint=25:bframes=3:log-level=none",
+            ],
+            "av1" => vec!["-c:v", "libsvtav1", "-preset", "10", "-g", "25"],
+            other => panic!("{other} is not a codec these tests encode"),
+        }
+        .into_iter()
+        .map(String::from),
+    );
+    args.extend(["-f".into(), "nut".into(), text(&out)]);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    ffmpeg(&borrowed);
+    out
+}
+
+/// The same packets reframed the way an `avcC` describes them: through
+/// MP4 and back out, which is what puts a configuration record in the
+/// stream header and a length before every NAL.
+fn as_length_prefixed(dir: &Path, nut: &Path) -> PathBuf {
+    let mp4 = dir.join("reframe.mp4");
+    let out = dir.join("length-prefixed.nut");
+    ffmpeg(&["-f", "nut", "-i", &text(nut), "-c", "copy", &text(&mp4)]);
+    ffmpeg(&["-i", &text(&mp4), "-c", "copy", "-f", "nut", &text(&out)]);
+    out
+}
+
+/// Whether a stream's out-of-band header is a configuration record
+/// rather than Annex B, which is what the module reads to decide the
+/// framing, so a test forcing one should check it got one.
+fn length_prefixed(nut: &Path) -> bool {
+    let shown = ffprobe(&[
+        "-show_streams",
+        "-show_data",
+        "-of",
+        "json",
+        "-i",
+        &text(nut),
+    ]);
+    // ffprobe prints extradata as a hex dump; the first byte of the
+    // first line is 01 for avcC and hvcC, 00 for a start code.
+    shown
+        .lines()
+        .find(|line| line.contains("00000000: "))
+        .is_some_and(|line| {
+            line.split("00000000: ")
+                .nth(1)
+                .is_some_and(|rest| rest.starts_with("01"))
+        })
+}
+
+struct Run {
+    rows: Vec<String>,
+    out: PathBuf,
+}
+
+impl Run {
+    /// Every row of an event, as parsed JSON members.
+    fn events(&self, event: &str) -> Vec<BTreeMap<String, String>> {
+        self.rows
+            .iter()
+            .map(|row| members(row))
+            .filter(|row| row.get("event").map(String::as_str) == Some(event))
+            .collect()
+    }
+
+    fn summary(&self) -> BTreeMap<String, String> {
+        let summary = self.events("summary");
+        assert_eq!(summary.len(), 1, "one summary row, not {}", summary.len());
+        assert_eq!(
+            members(self.rows.last().expect("a row")).get("event"),
+            Some(&"summary".to_string()),
+            "the summary is the last row"
+        );
+        summary.into_iter().next().expect("a summary")
+    }
+}
+
+/// One JSON object as a flat map of member name to the member's text.
+/// The rows here are flat, and a test that compared numbers would have
+/// to care whether `0` printed as `0` or `0.0`.
+fn members(row: &str) -> BTreeMap<String, String> {
+    let value = json(row);
+    match value {
+        Json::Object(members) => members
+            .into_iter()
+            .map(|(name, value)| (name, value.text()))
+            .collect(),
+        _ => panic!("a row that is not an object: {row}"),
+    }
+}
+
+/// Just enough JSON to read the module's own rows back. The rows crate
+/// has a reader, but a test that used the code under test to check the
+/// code under test would pass whatever it wrote.
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Object(Vec<(String, Json)>),
+    Array(Vec<Json>),
+    Text(String),
+    Number(f64),
+    Other(String),
+}
+
+impl Json {
+    fn text(&self) -> String {
+        match self {
+            Json::Text(value) => value.clone(),
+            Json::Number(value) => format!("{value}"),
+            Json::Other(value) => value.clone(),
+            Json::Array(values) => values
+                .iter()
+                .map(Json::text)
+                .collect::<Vec<String>>()
+                .join(","),
+            Json::Object(_) => "{}".into(),
+        }
+    }
+
+    fn number(&self) -> f64 {
+        match self {
+            Json::Number(value) => *value,
+            other => panic!("{other:?} is not a number"),
+        }
+    }
+}
+
+fn json(text: &str) -> Json {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut at = 0usize;
+    parse(&bytes, &mut at)
+}
+
+fn parse(bytes: &[char], at: &mut usize) -> Json {
+    while bytes.get(*at).is_some_and(|c| c.is_whitespace()) {
+        *at += 1;
+    }
+    match bytes.get(*at) {
+        Some('{') => {
+            *at += 1;
+            let mut members = Vec::new();
+            loop {
+                while bytes
+                    .get(*at)
+                    .is_some_and(|c| c.is_whitespace() || *c == ',')
+                {
+                    *at += 1;
+                }
+                if bytes.get(*at) == Some(&'}') {
+                    *at += 1;
+                    return Json::Object(members);
+                }
+                let Json::Text(name) = parse(bytes, at) else {
+                    panic!("a member name that is not a string");
+                };
+                while bytes
+                    .get(*at)
+                    .is_some_and(|c| c.is_whitespace() || *c == ':')
+                {
+                    *at += 1;
+                }
+                members.push((name, parse(bytes, at)));
+            }
+        }
+        Some('[') => {
+            *at += 1;
+            let mut values = Vec::new();
+            loop {
+                while bytes
+                    .get(*at)
+                    .is_some_and(|c| c.is_whitespace() || *c == ',')
+                {
+                    *at += 1;
+                }
+                if bytes.get(*at) == Some(&']') {
+                    *at += 1;
+                    return Json::Array(values);
+                }
+                values.push(parse(bytes, at));
+            }
+        }
+        Some('"') => {
+            *at += 1;
+            let mut out = String::new();
+            while let Some(ch) = bytes.get(*at) {
+                *at += 1;
+                match ch {
+                    '"' => return Json::Text(out),
+                    '\\' => {
+                        let escape = bytes.get(*at).copied().unwrap_or('?');
+                        *at += 1;
+                        out.push(match escape {
+                            'n' => '\n',
+                            't' => '\t',
+                            other => other,
+                        });
+                    }
+                    other => out.push(*other),
+                }
+            }
+            panic!("a string that does not end");
+        }
+        _ => {
+            let start = *at;
+            while bytes
+                .get(*at)
+                .is_some_and(|c| !matches!(c, ',' | '}' | ']') && !c.is_whitespace())
+            {
+                *at += 1;
+            }
+            let word: String = bytes[start..*at].iter().collect();
+            match word.parse::<f64>() {
+                Ok(value) => Json::Number(value),
+                Err(_) => Json::Other(word),
+            }
+        }
+    }
+}
+
+/// One run of the sidecar hosting `weave`, with a rows file.
+fn weave(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
+    weave_with_stdin(dir, input, params, &text(rows), &[])
+}
+
+/// The same, with the rows arriving however the caller says: a path, or
+/// `-` for standard input, whose bytes are handed over after the run
+/// has started.
+fn weave_with_stdin(
+    dir: &Path,
+    input: &Path,
+    params: &str,
+    rows_in: &str,
+    stdin_bytes: &[u8],
+) -> Run {
+    let out = dir.join("woven.nut");
+    let mut child = Command::new(sidecar().expect("a sidecar"))
+        .args([
+            "-f",
+            "nut",
+            "-i",
+            &text(input),
+            "-m",
+            &text(&module()),
+            "-params",
+            params,
+            "-rows-in",
+            rows_in,
+            "-f",
+            "nut",
+            &text(&out),
+            "-f",
+            "ndjson",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let bytes = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        if !bytes.is_empty() {
+            // Long enough that the packets are already moving: the point
+            // of a live run is that a row turns up while they do.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = stdin.write_all(&bytes);
+            let _ = stdin.flush();
+        }
+        drop(stdin);
+    });
+    let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
+    writer.join().expect("the rows writer");
+    assert!(
+        finished.status.success(),
+        "ffrwd-wasm exited with {:?}\n{}",
+        finished.status.code(),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    Run {
+        rows: String::from_utf8_lossy(&finished.stdout)
+            .lines()
+            .map(str::to_string)
+            .filter(|line| !line.trim().is_empty())
+            .collect(),
+        out,
+    }
+}
+
+/// ffmpeg's per-frame hashes, the hash column alone.
+///
+/// A muxer derives a sample's duration from its neighbours and two
+/// containers holding the same packets need not write the same table,
+/// so the columns around the hash are the container's business rather
+/// than the filter's. The hashes are the pictures.
+fn frame_hashes(path: &Path) -> Vec<String> {
+    ffmpeg(&["-i", &text(path), "-f", "framemd5", "-"])
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.rsplit(',').next().map(|hash| hash.trim().to_string()))
+        .collect()
+}
+
+/// Every packet's pts, dts and flags, as ffprobe prints them.
+fn packets(args: &[&str]) -> Vec<String> {
+    ffprobe(
+        &[
+            &[
+                "-show_packets",
+                "-of",
+                "csv=p=0",
+                "-show_entries",
+                "packet=pts,dts,flags",
+            ],
+            args,
+        ]
+        .concat(),
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+fn nut_packets(path: &Path) -> Vec<String> {
+    packets(&["-f", "nut", "-i", &text(path)])
+}
+
+/// The woven NUT muxed with `-c copy`, which moves no picture.
+fn mux(nut: &Path, to: &Path) {
+    ffmpeg(&["-f", "nut", "-i", &text(nut), "-c", "copy", &text(to)]);
+}
+
+/// A woven MP4 back as an Annex B elementary stream, which is what the
+/// command line tool reads.
+fn annexb(dir: &Path, mp4: &Path, codec: &str) -> PathBuf {
+    let (bsf, format, extension) = match codec {
+        "h264" => ("h264_mp4toannexb", "h264", "h264"),
+        "hevc" => ("hevc_mp4toannexb", "hevc", "h265"),
+        other => panic!("{other} has no Annex B form the tool reads"),
+    };
+    let out = dir.join(format!("woven.{extension}"));
+    ffmpeg(&[
+        "-i",
+        &text(mp4),
+        "-c",
+        "copy",
+        "-bsf:v",
+        bsf,
+        "-f",
+        format,
+        &text(&out),
+    ]);
+    out
+}
+
+/// What `ffrwd-index read --video` prints, as rows.
+fn read_tool(stream: &Path) -> Vec<BTreeMap<String, String>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-index"))
+        .args(["read", "--video", &text(stream), "--fps", &FPS.to_string()])
+        .output()
+        .expect("spawn ffrwd-index");
+    assert!(
+        output.status.success(),
+        "ffrwd-index read exited with {:?}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(members)
+        .collect()
+}
+
+/// One record of the rows a caller wrote.
+struct Record {
+    start_t: f64,
+    end_t: f64,
+    values: Vec<f32>,
+}
+
+/// A rows file of `count` vectors, one per second, each a different
+/// shape so no two records could be confused.
+fn write_rows(path: &Path, space: &str, dims: usize, count: usize) -> Vec<Record> {
+    let mut records = Vec::new();
+    let mut text = String::new();
+    for index in 0..count {
+        let values: Vec<f32> = (0..dims)
+            .map(|c| ((c + index * 7) as f32 * 0.37).sin() * (1.0 + index as f32 * 0.25))
+            .collect();
+        let printed: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+        let start_t = index as f64;
+        let end_t = start_t + 1.0;
+        text.push_str(&format!(
+            r#"{{"space":"{space}","start_t":{start_t},"end_t":{end_t},"vector":[{}]}}"#,
+            printed.join(",")
+        ));
+        text.push('\n');
+        records.push(Record {
+            start_t,
+            end_t,
+            values,
+        });
+    }
+    std::fs::write(path, text).expect("write the rows");
+    records
+}
+
+const ESCAPES: usize = 2;
+
+/// The params for one i8 space of `dims`.
+fn params(space: &str, dims: usize, placement: &str) -> String {
+    format!(
+        r#"{{"spaces":[{{"name":"{space}","dims":{dims},"encoding":"i8","unit_length":false,"modality":"picture","model":"test:model","producer":"the weave tests"}}],"placement":"{placement}","escapes":{ESCAPES}}}"#
+    )
+}
+
+/// What a reader rebuilds from the record this module would have
+/// written: the vector, quantized and read back, component for
+/// component. A row whose values match this matches the bytes.
+fn expected(values: &[f32]) -> Vec<f32> {
+    Planes::quantize(values, ESCAPES)
+        .expect("a quantized vector")
+        .reconstruct()
+        .expect("a reconstruction")
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+// ------------------------------------------------------------------ //
+// One codec, one framing, end to end.
+// ------------------------------------------------------------------ //
+
+/// Everything test 1 asks of one codec and framing: the pictures, the
+/// records, and the packets.
+fn whole_stream(name: &str, codec: &str, length_prefixed_input: bool) {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch(name);
+    let plain = encode(&dir, codec);
+    let input = if length_prefixed_input {
+        let reframed = as_length_prefixed(&dir, &plain);
+        assert!(
+            length_prefixed(&reframed),
+            "the reframed input is not length-prefixed after all"
+        );
+        reframed
+    } else {
+        assert!(
+            !length_prefixed(&plain),
+            "ffmpeg's NUT carries a configuration record, not Annex B"
+        );
+        plain.clone()
+    };
+
+    let dims = 96;
+    let rows = dir.join("rows.ndjson");
+    let wanted = write_rows(&rows, "clip", dims, 3);
+    let run = weave(&dir, &input, &params("clip", dims, "keyframe"), &rows);
+
+    // Every record went in, and nothing was late or dropped.
+    let woven = run.events("woven");
+    assert_eq!(woven.len(), wanted.len(), "{name}: {:?}", run.rows);
+    let summary = run.summary();
+    assert_eq!(summary["records"], wanted.len().to_string());
+    assert_eq!(summary["late"], "0");
+    assert_eq!(summary["dropped"], "0");
+    assert!(summary["bytes_added"].parse::<u64>().expect("a count") > 0);
+
+    // (c) One packet in, one packet out, every timestamp untouched.
+    assert_eq!(
+        nut_packets(&run.out),
+        nut_packets(&input),
+        "{name}: the packets that left are not the packets that arrived"
+    );
+    assert_eq!(nut_packets(&input).len(), FRAMES);
+
+    // (a) The pictures are the pictures the encoder wrote, through two
+    // containers.
+    let unwoven_mp4 = dir.join("plain.mp4");
+    mux(&plain, &unwoven_mp4);
+    let wanted_hashes = frame_hashes(&unwoven_mp4);
+    assert_eq!(wanted_hashes.len(), FRAMES);
+    let mut muxed = Vec::new();
+    for container in ["mp4", "mkv"] {
+        let path = dir.join(format!("woven.{container}"));
+        mux(&run.out, &path);
+        assert_eq!(
+            frame_hashes(&path),
+            wanted_hashes,
+            "{name}: the woven {container} does not decode to the same frames"
+        );
+        muxed.push(path);
+    }
+
+    // (b) Every record reads back, with the span it was given and the
+    // body the encoding would have written.
+    let read = match codec {
+        "av1" => read_av1(&muxed[0], &dir),
+        _ => {
+            let stream = annexb(&dir, &muxed[0], codec);
+            read_tool(&stream)
+        }
+    };
+    check_records(name, &read, &woven, &wanted, dims);
+}
+
+/// The records a `read` printed against the records that were written,
+/// with the module's own rows as the bridge: the tool reads an
+/// elementary stream, whose clock is decode order and not the
+/// container's presentation time, so what is compared is the OFFSETS,
+/// which are what the format actually carries.
+fn check_records(
+    name: &str,
+    read: &[BTreeMap<String, String>],
+    woven: &[BTreeMap<String, String>],
+    wanted: &[Record],
+    dims: usize,
+) {
+    let records: Vec<&BTreeMap<String, String>> = read
+        .iter()
+        .filter(|row| row.contains_key("record_id"))
+        .collect();
+    assert_eq!(
+        records.len(),
+        wanted.len(),
+        "{name}: read back {} of {} records",
+        records.len(),
+        wanted.len()
+    );
+    // The space declaration came back too, with the fields it went in
+    // with.
+    let spaces: Vec<&BTreeMap<String, String>> = read
+        .iter()
+        .filter(|row| !row.contains_key("record_id"))
+        .collect();
+    assert!(!spaces.is_empty(), "{name}: no space was declared");
+
+    for (index, row) in records.iter().enumerate() {
+        let record_id: usize = row["record_id"].parse().expect("a record id");
+        let want = &wanted[record_id];
+        let reported = woven
+            .iter()
+            .find(|reported| reported["record_id"] == row["record_id"])
+            .unwrap_or_else(|| panic!("{name}: record {record_id} was never reported"));
+
+        // The offsets the stream carries are the offsets the module
+        // said it wrote, and those put the span back where it was.
+        let carrier: f64 = row["carrier_ms"].parse().expect("a carrier time");
+        let start_off: f64 = row["start_ms"].parse::<f64>().expect("a start") - carrier;
+        let end_off: f64 = row["end_ms"].parse::<f64>().expect("an end") - carrier;
+        assert!(
+            close(
+                start_off,
+                reported["start_off_ms"].parse().expect("an offset")
+            ),
+            "{name}: record {record_id} start offset {start_off} is not what was reported"
+        );
+        assert!(
+            close(end_off, reported["end_off_ms"].parse().expect("an offset")),
+            "{name}: record {record_id} end offset {end_off} is not what was reported"
+        );
+        assert!(
+            close(end_off - start_off, (want.end_t - want.start_t) * 1000.0),
+            "{name}: record {record_id} does not span what it was given"
+        );
+        // And the carrier plus the offsets is the span the caller asked
+        // for, on the stream's own presentation clock.
+        assert!(
+            close(
+                reported["carrier_t"].parse::<f64>().expect("a time") + start_off / 1000.0,
+                want.start_t
+            ),
+            "{name}: record {record_id} did not come back at {}",
+            want.start_t
+        );
+
+        // Byte for byte: the components are the components a reader
+        // rebuilds from what the encoding would have written.
+        let values: Vec<f64> = row["vector"]
+            .split(',')
+            .map(|v| v.parse().expect("a component"))
+            .collect();
+        assert_eq!(
+            values.len(),
+            dims,
+            "{name}: record {record_id} lost a component"
+        );
+        for (component, (got, want)) in values.iter().zip(expected(&want.values)).enumerate() {
+            assert!(
+                close(*got, f64::from(want)),
+                "{name}: record {record_id} component {component} is {got}, not {want}"
+            );
+        }
+        // Every plane arrived: the policy puts a whole record on one
+        // carrier.
+        assert_eq!(
+            row["planes"], "0,1,2,3,4,5,6,7",
+            "{name}: record {record_id} lost a plane"
+        );
+        let _ = index;
+    }
+}
+
+/// The same records, read out of an AV1 file's metadata OBUs. The
+/// command line tool reads Annex B alone, and AV1 has no Annex B, so
+/// this is the library doing what the tool would.
+fn read_av1(mp4: &Path, dir: &Path) -> Vec<BTreeMap<String, String>> {
+    let raw = dir.join("woven.obu");
+    ffmpeg(&["-i", &text(mp4), "-c", "copy", "-f", "obu", &text(&raw)]);
+    let bytes = std::fs::read(&raw).expect("read the OBU stream");
+    let units = obu::temporal_units(&bytes).expect("the temporal units");
+    let mut spaces: BTreeMap<u8, Space> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        let carrier_ms = (index as f64 * 1000.0 / f64::from(FPS)).round();
+        for payload in obu::units_obu(&bytes[unit.start..unit.end]) {
+            let Ok(decoded) = Unit::decode(&payload) else {
+                continue;
+            };
+            for message in &decoded.messages {
+                match message {
+                    Message::Space(space) => {
+                        if spaces.insert(space.space_id, space.clone()).is_none() {
+                            out.push(BTreeMap::from([(
+                                "space".to_string(),
+                                "declared".to_string(),
+                            )]));
+                        }
+                    }
+                    Message::Vector(record) => {
+                        let space = spaces.get(&record.space_id).expect("a declared space");
+                        let body = record.decode_body(space).expect("a body");
+                        let VectorBody::I8(planes) = &body else {
+                            panic!("an i8 space came back as something else");
+                        };
+                        let values = body.values().expect("the components");
+                        out.push(BTreeMap::from([
+                            ("record_id".to_string(), record.record_id.to_string()),
+                            ("carrier_ms".to_string(), format!("{carrier_ms}")),
+                            (
+                                "start_ms".to_string(),
+                                format!("{}", carrier_ms + f64::from(record.start_off)),
+                            ),
+                            (
+                                "end_ms".to_string(),
+                                format!("{}", carrier_ms + f64::from(record.end_off)),
+                            ),
+                            (
+                                "planes".to_string(),
+                                (0..8)
+                                    .filter(|k| planes.present() >> k & 1 == 1)
+                                    .map(|k| k.to_string())
+                                    .collect::<Vec<String>>()
+                                    .join(","),
+                            ),
+                            (
+                                "vector".to_string(),
+                                values
+                                    .iter()
+                                    .map(|v| format!("{v}"))
+                                    .collect::<Vec<String>>()
+                                    .join(","),
+                            ),
+                        ]));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn h264_in_annex_b_carries_its_records_and_moves_no_picture() {
+    whole_stream("h264_annexb", "h264", false);
+}
+
+#[test]
+fn h264_length_prefixed_carries_its_records_and_moves_no_picture() {
+    whole_stream("h264_avcc", "h264", true);
+}
+
+#[test]
+fn hevc_carries_its_records_and_moves_no_picture() {
+    whole_stream("hevc", "hevc", false);
+}
+
+#[test]
+fn hevc_length_prefixed_carries_its_records_and_moves_no_picture() {
+    whole_stream("hevc_hvcc", "hevc", true);
+}
+
+#[test]
+fn av1_carries_its_records_and_moves_no_picture() {
+    whole_stream("av1", "av1", false);
+}
+
+// ------------------------------------------------------------------ //
+// Live: rows arriving while the packets do.
+// ------------------------------------------------------------------ //
+
+/// The live placement, where the arrival times are the rows' own.
+///
+/// A host on this machine drains a four-second file in well under a
+/// second, so which packet is in flight when a row lands on a pipe is
+/// not a thing a test can pin. What CAN be pinned is the placement
+/// itself, and `available_t` is how: each row says when its writer had
+/// it, exactly as it would have arrived on a wire, and every record
+/// must then ride a carrier at or after that.
+#[test]
+fn a_record_that_existed_only_after_its_span_rides_a_later_carrier() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("live_placement");
+    let input = encode(&dir, "h264");
+    let dims = 32;
+    let rows = dir.join("rows.ndjson");
+    let mut text = String::new();
+    let mut wanted = Vec::new();
+    for index in 0..3 {
+        let values: Vec<f32> = (0..dims)
+            .map(|c| ((c + index) as f32 * 0.29).cos())
+            .collect();
+        let printed: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+        let start_t = index as f64 * 0.5;
+        let end_t = start_t + 0.5;
+        // A second and a half behind: the span had long ended before
+        // anything described it.
+        let available_t = end_t + 1.5;
+        text.push_str(&format!(
+            r#"{{"space":"clip","start_t":{start_t},"end_t":{end_t},"available_t":{available_t},"vector":[{}]}}"#,
+            printed.join(",")
+        ));
+        text.push('\n');
+        wanted.push((start_t, end_t, available_t));
+    }
+    std::fs::write(&rows, text).expect("write the rows");
+
+    let run = weave(&dir, &input, &params("clip", dims, "next"), &rows);
+    let woven = run.events("woven");
+    assert_eq!(woven.len(), wanted.len(), "{:?}", run.rows);
+    let mut carriers = Vec::new();
+    for row in &woven {
+        let record_id: usize = row["record_id"].parse().expect("a record id");
+        let (start_t, end_t, available_t) = wanted[record_id];
+        let carrier: f64 = row["carrier_t"].parse().expect("a time");
+        assert!(
+            carrier >= available_t - 1e-6,
+            "record {record_id} rode a carrier its writer had not reached: {row:?}"
+        );
+        assert!(
+            row["start_off_ms"].parse::<f64>().expect("an offset") < 0.0
+                && row["end_off_ms"].parse::<f64>().expect("an offset") < 0.0,
+            "a record behind the stream looked forward: {row:?}"
+        );
+        assert!(close(
+            carrier + row["start_off_ms"].parse::<f64>().expect("an offset") / 1000.0,
+            start_t
+        ));
+        assert!(close(
+            carrier + row["end_off_ms"].parse::<f64>().expect("an offset") / 1000.0,
+            end_t
+        ));
+        carriers.push(carrier);
+    }
+    // `next` takes the first carrier at all, not the next keyframe, so
+    // three records a half second apart are on three of them.
+    carriers.sort_by(f64::total_cmp);
+    carriers.dedup_by(|a, b| close(*a, *b));
+    assert_eq!(
+        carriers.len(),
+        wanted.len(),
+        "the live policy put every record on one carrier"
+    );
+    assert_eq!(nut_packets(&run.out), nut_packets(&input));
+}
+
+/// The same policy with the rows arriving on a pipe, which is what a
+/// live run actually does. Where they land depends on how far the
+/// packets have got when each row turns up, and that is a race by
+/// design; what is pinned is that every record was woven, that none of
+/// them looked forward, and that the rows arriving last - on the final
+/// call, after every packet - still found a carrier.
+#[test]
+fn rows_arriving_after_the_packets_ride_the_next_carrier_looking_back() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("live");
+    let input = encode(&dir, "h264");
+    let dims = 32;
+    let rows = dir.join("rows.ndjson");
+    let wanted = write_rows(&rows, "clip", dims, 4);
+    let feed = std::fs::read(&rows).expect("the rows to feed");
+
+    // The rows go in on standard input, written only once the run has
+    // started: a live writer has a vector when the span it describes is
+    // already behind the stream.
+    let run = weave_with_stdin(&dir, &input, &params("clip", dims, "next"), "-", &feed);
+
+    let woven = run.events("woven");
+    assert_eq!(woven.len(), wanted.len(), "{:?}", run.rows);
+    for row in &woven {
+        let start: f64 = row["start_off_ms"].parse().expect("an offset");
+        let end: f64 = row["end_off_ms"].parse().expect("an offset");
+        assert!(
+            start < 0.0 && end <= 0.0,
+            "a record that arrived behind the stream looked forward: {row:?}"
+        );
+        let carrier: f64 = row["carrier_t"].parse().expect("a time");
+        let end_t: f64 = row["end_t"].parse().expect("a time");
+        assert!(
+            carrier >= end_t - 1e-6,
+            "a record rode a carrier before its span had ended: {row:?}"
+        );
+    }
+    // The rows are the run's own account of what it did, and they name
+    // every record exactly once.
+    let mut ids: Vec<String> = woven.iter().map(|row| row["record_id"].clone()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), wanted.len(), "a record was reported twice");
+    let summary = run.summary();
+    assert_eq!(summary["records"], wanted.len().to_string());
+    assert_eq!(summary["late"], "0");
+
+    // And the picture is still the picture.
+    let plain_mp4 = dir.join("plain.mp4");
+    let woven_mp4 = dir.join("woven.mp4");
+    mux(&input, &plain_mp4);
+    mux(&run.out, &woven_mp4);
+    assert_eq!(frame_hashes(&woven_mp4), frame_hashes(&plain_mp4));
+    assert_eq!(nut_packets(&run.out), nut_packets(&input));
+}
+
+// ------------------------------------------------------------------ //
+// Rows nothing can be made of.
+// ------------------------------------------------------------------ //
+
+#[test]
+fn a_broken_row_is_reported_and_the_stream_goes_on() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("broken");
+    let input = encode(&dir, "h264");
+    let dims = 16;
+    let rows = dir.join("rows.ndjson");
+    let good: Vec<String> = (0..dims).map(|c| format!("{}", c as f32 * 0.1)).collect();
+    let good = good.join(",");
+    std::fs::write(
+        &rows,
+        format!(
+            concat!(
+                // A vector of the wrong width.
+                "{{\"space\":\"clip\",\"start_t\":0,\"end_t\":1,\"vector\":[1,2,3]}}\n",
+                // A space nobody declared.
+                "{{\"space\":\"nope\",\"start_t\":0,\"end_t\":1,\"vector\":[{good}]}}\n",
+                // Components that are not finite numbers.
+                "{{\"space\":\"clip\",\"start_t\":1,\"end_t\":2,\"vector\":[{nan}]}}\n",
+                // A row that is not JSON at all.
+                "{{ not a row\n",
+                // A span no offset from any carrier could reach, which
+                // is a row arriving past the last packet by any clock.
+                "{{\"space\":\"clip\",\"start_t\":34560000,\"end_t\":34560001,\"vector\":[{good}]}}\n",
+                // And one good row, after every one of them.
+                "{{\"space\":\"clip\",\"start_t\":2,\"end_t\":3,\"vector\":[{good}]}}\n"
+            ),
+            good = good,
+            nan = vec!["1e400"; dims].join(","),
+        ),
+    )
+    .expect("write the rows");
+
+    let run = weave(&dir, &input, &params("clip", dims, "keyframe"), &rows);
+    let dropped = run.events("dropped");
+    assert_eq!(
+        dropped.len(),
+        4,
+        "four rows could not be read, and these were reported: {:?}",
+        run.rows
+    );
+    for wanted in ["components", "no space is declared", "finite", "JSON"] {
+        assert!(
+            dropped.iter().any(|row| row["reason"].contains(wanted)),
+            "no row was dropped for {wanted}: {dropped:?}"
+        );
+    }
+    // The far-future span parsed, so it was submitted and then found to
+    // be further from every carrier than an offset can say.
+    let late = run.events("late");
+    assert_eq!(late.len(), 1, "{:?}", run.rows);
+    assert_eq!(late[0]["space"], "clip");
+
+    // The good row still went in, and the stream is whole.
+    let woven = run.events("woven");
+    assert_eq!(woven.len(), 1, "{:?}", run.rows);
+    let summary = run.summary();
+    assert_eq!(summary["records"], "1");
+    assert_eq!(summary["dropped"], "4");
+    assert_eq!(summary["late"], "1");
+    assert_eq!(nut_packets(&run.out), nut_packets(&input));
+}
+
+// ------------------------------------------------------------------ //
+// A cut of a woven file.
+// ------------------------------------------------------------------ //
+
+#[test]
+fn a_cut_of_a_woven_file_reads_from_its_first_frame() {
+    let Some(_) = sidecar() else { return };
+    let dir = scratch("cut");
+    let input = encode(&dir, "h264");
+    let dims = 24;
+    let rows = dir.join("rows.ndjson");
+    let wanted = write_rows(&rows, "clip", dims, 3);
+    let run = weave(&dir, &input, &params("clip", dims, "keyframe"), &rows);
+
+    let whole = dir.join("woven.mp4");
+    mux(&run.out, &whole);
+    let cut = dir.join("cut.mp4");
+    ffmpeg(&["-ss", "1", "-i", &text(&whole), "-c", "copy", &text(&cut)]);
+
+    let stream = annexb(&dir, &cut, "h264");
+    let read = read_tool(&stream);
+    // The cut begins at a keyframe, and every keyframe declares every
+    // space, so the first thing the reader finds is the declaration.
+    let declared = read
+        .iter()
+        .filter(|row| !row.contains_key("record_id"))
+        .count();
+    assert!(declared > 0, "the cut declares no space: {read:?}");
+    assert!(
+        !read[0].contains_key("record_id"),
+        "the cut's first row is not a space declaration"
+    );
+    let kept: Vec<&BTreeMap<String, String>> = read
+        .iter()
+        .filter(|row| row.contains_key("record_id"))
+        .collect();
+    assert!(
+        !kept.is_empty() && kept.len() <= wanted.len(),
+        "a cut kept {} of {} records",
+        kept.len(),
+        wanted.len()
+    );
+    // What survives still describes the span it described, as an offset
+    // from a frame that is still there.
+    for row in kept {
+        let record_id: usize = row["record_id"].parse().expect("a record id");
+        let carrier: f64 = row["carrier_ms"].parse().expect("a time");
+        let span = row["end_ms"].parse::<f64>().expect("an end")
+            - row["start_ms"].parse::<f64>().expect("a start");
+        assert!(
+            close(
+                span,
+                (wanted[record_id].end_t - wanted[record_id].start_t) * 1000.0
+            ),
+            "record {record_id} lost its span in the cut"
+        );
+        assert!(carrier >= 0.0);
+    }
+    // And the pictures the cut kept are still the encoder's own.
+    assert!(frame_hashes(&cut).len() < FRAMES);
+}
+
+// ------------------------------------------------------------------ //
+// What the host reads off the module without running it.
+// ------------------------------------------------------------------ //
+
+#[test]
+fn the_sidecar_describes_the_module_as_a_packet_filter() {
+    let Some(binary) = sidecar() else { return };
+    let output = Command::new(binary)
+        .args(["--describe", &text(&module())])
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert!(
+        output.status.success(),
+        "--describe exited with {:?}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let described = members(printed.trim());
+    assert_eq!(described["world"], "ffrwd:av@0.16.0");
+    assert_eq!(described["name"], "weave");
+    assert_eq!(described["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(described["packet_filter"], "true");
+    assert_eq!(described["reads_rows"], "true");
+    assert_eq!(described["video_codecs"], "h264,hevc,av1");
+    assert_eq!(described["audio_codecs"], "");
+    assert_eq!(described["video_streams"], "one");
+    assert_eq!(described["audio_streams"], "none");
+    assert_eq!(described["inputs"], "1");
+    // No decoded payload reaches a packet filter, so no frame format is
+    // named and no capability is asked for.
+    assert_eq!(described["pixel_formats"], "");
+    assert_eq!(described["sample_formats"], "");
+    for capability in ["nn", "http", "udp"] {
+        assert_eq!(described[capability], "false", "{capability} was asked for");
+    }
+
+    // The schemas it publishes are the schemas it reads by.
+    let Json::Object(printed) = json(printed.trim()) else {
+        panic!("--describe printed something that is not an object");
+    };
+    let params = printed
+        .iter()
+        .find(|(name, _)| name == "params_schema")
+        .map(|(_, value)| value)
+        .expect("a params schema");
+    let Json::Object(params) = params else {
+        panic!("the params schema is not an object");
+    };
+    assert!(params.iter().any(|(name, _)| name == "properties"));
+    let rows = printed
+        .iter()
+        .find(|(name, _)| name == "rows_schema")
+        .map(|(_, value)| value)
+        .expect("a rows schema");
+    let Json::Object(rows) = rows else {
+        panic!("the rows schema is not an object");
+    };
+    assert!(rows.iter().any(|(name, _)| name == "properties"));
+}
+
+#[test]
+fn params_that_say_nothing_useful_are_refused_before_a_packet_moves() {
+    let Some(binary) = sidecar() else { return };
+    let dir = scratch("params");
+    let input = encode(&dir, "h264");
+    let rows = dir.join("rows.ndjson");
+    std::fs::write(&rows, "").expect("an empty rows file");
+    for (params, wanted) in [
+        ("{}", "no spaces"),
+        (r#"{"spaces":[]}"#, "at least one space"),
+        (
+            r#"{"spaces":[{"name":"c","dims":8}],"placement":"spread"}"#,
+            "budget",
+        ),
+        (r#"{"spaces":[{"name":"c","dims":8}],"planes":9}"#, "1 to 8"),
+    ] {
+        let output = Command::new(&binary)
+            .args([
+                "-f",
+                "nut",
+                "-i",
+                &text(&input),
+                "-m",
+                &text(&module()),
+                "-params",
+                params,
+                "-rows-in",
+                &text(&rows),
+                "-f",
+                "nut",
+                &text(&dir.join("unwritten.nut")),
+            ])
+            .output()
+            .expect("spawn ffrwd-wasm");
+        assert!(!output.status.success(), "{params} was accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(wanted),
+            "{params} was refused without saying {wanted}:\n{stderr}"
+        );
+    }
+}
+
+/// Numbers in a row print as numbers, which a caller reading the rows
+/// with a JSON parser depends on.
+#[test]
+fn the_test_harness_reads_the_rows_it_checks() {
+    let row = r#"{"event":"woven","space":"clip","record_id":3,"carrier_t":1.08,"planes":[0,1],"bytes":40}"#;
+    let read = members(row);
+    assert_eq!(read["event"], "woven");
+    assert_eq!(read["record_id"], "3");
+    assert_eq!(read["planes"], "0,1");
+    let Json::Object(parsed) = json(row) else {
+        panic!("not an object");
+    };
+    assert!(close(
+        parsed
+            .iter()
+            .find(|(name, _)| name == "carrier_t")
+            .expect("a time")
+            .1
+            .number(),
+        1.08
+    ));
+}
