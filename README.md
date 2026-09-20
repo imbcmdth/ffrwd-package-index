@@ -141,15 +141,14 @@ a row says so, naming the argument and the spaces it could have been. Rows the
 `ffrwd-index` tool reads name their own space and are untouched by any of
 this.
 
-**All three are written at every call.** They were declared `DEFAULT NULL`,
-which is the natural spelling for "this run has no producer for that one", and
-ffrwd refuses it today: a defaulted annotation column on a module that is not
-windowed is read as a per-frame filter left with no producer under it, and a
-packet filter is neither. So `src/index.sql` declares the three required, and a
-call writes `NULL` for each argument it has nothing for, which the module reads
-as no rows at all. When ffrwd exempts packet filters from that rule the
-`DEFAULT NULL`s go back and a call may stop at the last argument it fills;
-nothing about the module changes either way.
+**All three are written at every call.** Each carries `DEFAULT NULL`, which is
+what a rows column carries whether the declaration writes it or not, and an
+argument written `NULL` hands the filter no rows for it at all. What a call
+cannot do is leave one off: `spaces` is required and comes after the three,
+arguments bind by position, and there is no way to reach `spaces` past an
+argument that was not written. That is the trade worth making, because a run
+with no space table is then refused where the query is compiled rather than
+when the filter opens.
 
 A declaration is fixed arity, and these three are named for `ffrwd/describe`'s
 three spaces. A producer with other spaces, or more of them, writes its own

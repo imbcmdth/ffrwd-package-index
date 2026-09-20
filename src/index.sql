@@ -32,8 +32,17 @@
 -- the argument's own name is what names the space: the host writes
 -- `"_arg": "<argument>"` onto every row it delivers, and a row with
 -- no `space` field of its own is put in the space that name declares.
--- A run declaring one space takes rows that name neither. An argument
--- written NULL hands the filter no rows at all.
+-- A run declaring one space takes rows that name neither.
+--
+-- All three carry `DEFAULT NULL`, which is what a rows column carries
+-- whether it is written or not: an argument a call has no producer for
+-- hands the filter no rows at all. A call still writes NULL for each
+-- of them rather than stopping short, because `spaces` is required and
+-- comes after the three, and a rows column starting no run of defaults
+-- is what lets it: arguments bind by position and there is no way to
+-- reach `spaces` past an argument that was left off. Requiring it is
+-- the trade worth making, since a run with no space table is refused
+-- where the query is compiled rather than when the filter opens.
 --
 -- The three are named for ffrwd/describe's three spaces, which is the
 -- producer this package was written against. A DECLARATION IS FIXED
@@ -57,27 +66,13 @@
 -- filesystem and runs before the muxer, so the index is not this
 -- function's to write. A live destination gets no index and needs
 -- none.
---
--- WHY THE THREE ROWS ARGUMENTS CARRY NO DEFAULT. They were written
--- `DEFAULT NULL`, which is what says "this producer has nothing for
--- this run". The CLI refuses that today: a defaulted annotation column
--- on a module that is not windowed is read as a per-frame filter left
--- without a producer under it, and a packet filter is neither. So the
--- three are required here and a call writes NULL for the arguments it
--- has no producer for, which the module reads as no rows at all:
---
---   weave(f.video[1], clips(...).shots, NULL, NULL, '[...]')
---
--- When the CLI exempts packet filters from that rule, `DEFAULT NULL`
--- goes back on all three and a call may stop at the last argument it
--- fills. Nothing about the module changes either way.
 CREATE FUNCTION weave(v video_stream,
                       clip   STRUCT(start_t number, end_t number,
-                                    vector vector)[],
+                                    vector vector)[] DEFAULT NULL,
                       sound  STRUCT(start_t number, end_t number,
-                                    vector vector)[],
+                                    vector vector)[] DEFAULT NULL,
                       speech STRUCT(start_t number, end_t number,
-                                    vector vector)[],
+                                    vector vector)[] DEFAULT NULL,
                       spaces text,
                       placement text DEFAULT NULL,
                       budget number DEFAULT NULL,
