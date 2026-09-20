@@ -214,6 +214,27 @@ same sentence embedder and the same 384 components, kept apart because
 a SPACE message carries one modality and a reader that wanted to search
 only what was said could not tell them apart if they shared an id.
 
+**1, 2 and 3 are this converter's numbering and nobody else's.**
+`rows-from-describe` writes those ids into the rows it hands the tool,
+and `--space 3` above is a search of a file whose rows said 3. A file
+written through `ffrwd.index.weave` instead gets its ids from the
+positions of that call's own `spaces` table, counted from zero, so the
+same sound space would be 2 there. An id is a position in one writer's
+table and never a property of the file, which is why a query selects a
+space by `modality` or `model` through `ffrwd.index.spaces` rather than
+by number:
+
+```sql
+FROM input('film.indexed.mp4') f, ffrwd.index.records(f.video[1]) v
+     JOIN ffrwd.index.spaces(f.video[1]) s ON v.space = s.space
+WHERE s.modality = 'sound-text'
+```
+
+The tool has less to work with. `--space` takes an id or any part of
+the `model` URI, and these two spaces share a model, so only the id
+tells them apart there; `read` prints every declaration, which is how
+to find out what a file's ids mean before searching it.
+
 ## What released ffrwd could not do
 
 **The prompt's vector cannot go to a table destination.** Step 5 writes

@@ -42,7 +42,9 @@ package's own text tower embedded, and prints what the encoding cost against
 the same search over the original binary32.
 
 Working against an unreleased ffrwd: three wasm modules, all
-`ffrwd:av@0.16.0`, which no released ffrwd hosts.
+`ffrwd:av@0.16.0`, which no released ffrwd hosts. [Developing against an
+unreleased ffrwd](#developing-against-an-unreleased-ffrwd) is the route to
+running them.
 
 `weave` writes. It is a packet filter: encoded packets in, the same packets
 out, with the vectors woven into them and every timestamp untouched. Rows can
@@ -66,22 +68,59 @@ COPY (
 
 The arguments and the params are their own section below.
 
-`records` and `spaces` read. They are packet sinks: `records` answers one row
-per record, with the span in seconds of the stream's own clock and the vector
-itself, and `spaces` answers one row per embedding space the stream declares.
-Both run today as COPY destinations, with their rows on the sidecar's stdout:
+`records` and `spaces` read. They are packet sinks read in FROM: the compiler
+stream-copies one stream of the file into the module while the query compiles
+and binds what the module wrote as a row table. `records` answers one row per
+record, with the span in seconds of the stream's own clock and the vector
+itself; `spaces` answers one row per embedding space the stream declares. A
+search is joins and predicates over those rows, decided before ffmpeg is
+started:
 
 ```sql
-COPY (SELECT f.video[1] FROM input('film.indexed.mp4') f) TO ffrwd.index.records()
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1],
+                                               start => v.start_t,
+                                               end => v.end_t)))
+  FROM input('film.indexed.mp4') f, ffrwd.index.records(f.video[1]) v
+       JOIN ffrwd.index.spaces(f.video[1]) s ON v.space = s.space
+  WHERE s.modality = 'picture'
+    AND cos_similarity(v.vector, ffrwd.describe.embed_clip_text('a dog')) > 0.25
+) TO 'found.mp4'
 ```
 
-What they exist for is the other thing: reading a woven file at COMPILE time,
-so that `f.embeddings` is a relation a query can join and filter. Nothing in
-the dialect spells it yet. Each says in its meta how much of a stream it has to
-be handed, which is what will make that read cheap: `records` asks for the
-keyframes, which is where section 7 puts every record of a file, and `spaces`
-asks for the first packet, which section 3 now puts every space declaration on.
-That is a request and never a promise, and both read whatever they are given.
+**Join `spaces`; do not name an id.** A record carries a space id and nothing
+else, and an id is a position in one writer's table: `weave` hands them out in
+the order its `spaces` param declares them, from zero, and the `ffrwd-index`
+tool hands out whatever its rows say. A file outlives the run that wrote it, so
+the thing to select on is `modality`, or `model`, or `dims`, which are fields of
+the format and mean the same in every file. `records(...) v JOIN spaces(...) s
+ON v.space = s.space` is how a query gets at them, and it is what the
+`ffrwd/describe` recipes do.
+
+Each module says in its meta how much of a stream it has to be handed, which is
+what makes the read cheap: `records` asks for the keyframes, which is where
+section 7 puts every record of a file, and `spaces` asks for the first packet,
+which section 3 now puts every space declaration on. That is a request and never
+a promise, and both read whatever they are given. The read is memoized per file,
+stream, module and params, so a query naming columns of both reads each once.
+
+The columns are what each module writes, and `src/index.sql` names every one of
+them. `records` answers `index`, `space`, `record_id`, `start_t` and `end_t` as
+numbers (the two times in seconds), and `planes` and `vector` as vectors.
+`spaces` answers `space`, `dims` and `source` as numbers, `unit_length` as a
+boolean, and `name`,
+`encoding`, `modality`, `model`, `model_hash`, `query`, `query_hash` and
+`producer` as text.
+
+`planes` is which of the eight bit-planes of an `i8` record arrived; it reads
+NULL for the float encodings, which arrive whole or not at all. It is an array,
+and `vector` is the one array type the dialect has, so `vector` is what it is
+declared. It is not an embedding and nothing should score it.
+
+The same wasm file declared `RETURNS sink` and written after `TO` is a run-time
+destination instead, with its rows on the sidecar's stdout. That declaration is
+a query's own to write; this package ships the FROM one, because that is the one
+a search needs.
 
 The reading modules and the writing one are the same code: `rows/` holds both
 state machines over `core/`, and the wasm crates are shims.
@@ -101,6 +140,16 @@ declared space, where a run declares exactly one; else the row is dropped and
 a row says so, naming the argument and the spaces it could have been. Rows the
 `ffrwd-index` tool reads name their own space and are untouched by any of
 this.
+
+**All three are written at every call.** They were declared `DEFAULT NULL`,
+which is the natural spelling for "this run has no producer for that one", and
+ffrwd refuses it today: a defaulted annotation column on a module that is not
+windowed is read as a per-frame filter left with no producer under it, and a
+packet filter is neither. So `src/index.sql` declares the three required, and a
+call writes `NULL` for each argument it has nothing for, which the module reads
+as no rows at all. When ffrwd exempts packet filters from that rule the
+`DEFAULT NULL`s go back and a call may stop at the last argument it fills;
+nothing about the module changes either way.
 
 A declaration is fixed arity, and these three are named for `ffrwd/describe`'s
 three spaces. A producer with other spaces, or more of them, writes its own
@@ -134,11 +183,62 @@ own JSON as a literal:
 ```
 
 `name` and `dims` are required and the rest have defaults; the fields are
-section 3's, the same ones the tool's own `{"space": {...}}` rows spell, and
-the wire ids are handed out in declaration order. The array itself is still
-read wherever it appears, so `ffrwd-wasm -params` and `-params-from` and the
-native tool go on passing the array, and nothing that already worked had to be
-rewritten.
+section 3's, the same ones the tool's own `{"space": {...}}` rows spell. The
+array itself is still read wherever it appears, so `ffrwd-wasm -params` and
+`-params-from` and the native tool go on passing the array, and nothing that
+already worked had to be rewritten.
+
+**The wire ids are this array's own positions, from zero.** The first space
+declared is id 0, the second id 1, and a run that declares a different table
+gives the same model a different id. The `ffrwd-index` tool's rows hand out
+whatever the rows themselves say, which is a third numbering again. None of
+that is a property of the file, so nothing downstream should read it: a
+consumer joins `spaces` and selects on `modality`, `model` or `dims`, which
+section 3 makes mean the same thing in every file. The one place an id belongs
+is the join itself, `records(...) v JOIN spaces(...) s ON v.space = s.space`.
+
+## Developing against an unreleased ffrwd
+
+`ffrwd.json` depends on `ffrwd/wasm` 0.16.0, which is the wit the three modules
+are built against and is not in the registry. That pin is right for release and
+wrong for today, so `ffrwd link` here stops at
+
+```
+UNSUPPORTED_SQL: the registry has no version 0.16.0 of 'ffrwd/wasm'
+(hint: published: 0.9.0, ... 0.15.0)
+```
+
+`ffrwd/wasm` carries nothing but the wit a `build.rs` reads, and `FFRWD_WIT_DIR`
+supplies that directly, so the way through is a copy of this checkout with the
+dependency dropped. The dependency stays in the manifest; the copy is what gets
+linked.
+
+1. Build the unreleased ffrwd and its sidecar into a virtualenv of their own,
+   and point `FFRWD_WASM` at the built `ffrwd-wasm`. Give the session an ffrwd
+   home of its own too (`HOME`, and `USERPROFILE` on Windows): `ffrwd link`
+   records the link machine-wide, in `~/.cache/ffrwd/ffrwd.links`, and a home of
+   your own keeps it out of the real one.
+2. Copy this checkout somewhere. In the copy, delete `dependencies` from
+   `ffrwd.json`.
+3. Build the three modules in the copy, against that sidecar's own wit:
+
+   ```
+   FFRWD_WIT_DIR=<ffrwd>/sidecar/wit \
+     cargo build --release --target wasm32-wasip2 -p weave -p records -p spaces
+   ```
+
+   They have to land in the copy's own `target/wasm32-wasip2/release/`, which is
+   the path `src/index.sql` names and a linked package resolves in place.
+4. `ffrwd link` in the copy. It writes the copy's own `ffrwd.lock` and records
+   `ffrwd/index -> <copy>` in the links file.
+5. `ffrwd link ffrwd/index` in the consuming project. The name goes in that
+   project's `ffrwd.links`, never its lockfile, and shadows whatever version its
+   manifest pins. Every command afterwards says so, which is the point:
+   `warning: package 'ffrwd/index' is linked to <copy>, so this command depends
+   on files no lockfile pins`.
+
+`ffrwd unlink ffrwd/index` puts the pin back. When `ffrwd/wasm` 0.16.0 ships,
+none of this is needed: `ffrwd install` and `cargo build` are the whole of it.
 
 ## Layout
 

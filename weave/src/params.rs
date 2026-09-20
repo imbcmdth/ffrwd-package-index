@@ -32,6 +32,13 @@ use ffrwd_index_rows::weave::Config;
 /// one, so a `spaces` declared as an array is a param no SQL could ever
 /// fill. The text is the array's own JSON, which a producer package
 /// passes as a literal.
+///
+/// Every `enum` here carries an explicit `"type"` beside it. A host
+/// reads a member's `type` to decide what the column or the argument
+/// is, and an enum alone leaves it with nothing to read: ffrwd's
+/// compiler reported one as `encoding (no type)` and refused the
+/// declaration over it. The values were always strings; now the schema
+/// says so.
 pub const PARAMS_SCHEMA: &str = r#"{
   "type": "object",
   "required": ["spaces"],
@@ -55,9 +62,9 @@ pub const PARAMS_SCHEMA: &str = r#"{
       "properties": {
         "name": {"type": "string", "minLength": 1},
         "dims": {"type": "integer", "minimum": 1, "maximum": 65536},
-        "encoding": {"enum": ["i8", "f16", "f32"], "default": "i8"},
+        "encoding": {"type": "string", "enum": ["i8", "f16", "f32"], "default": "i8"},
         "unit_length": {"type": "boolean", "default": false},
-        "modality": {"oneOf": [{"enum": ["unspecified", "picture", "sound", "speech", "sound-text", "scene-text", "description"]}, {"type": "integer", "minimum": 0, "maximum": 255}]},
+        "modality": {"oneOf": [{"type": "string", "enum": ["unspecified", "picture", "sound", "speech", "sound-text", "scene-text", "description"]}, {"type": "integer", "minimum": 0, "maximum": 255}]},
         "source": {"type": "integer", "minimum": 0, "maximum": 255},
         "model": {"type": "string"},
         "model_hash": {"type": "string"},

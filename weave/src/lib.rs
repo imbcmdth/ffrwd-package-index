@@ -54,7 +54,7 @@ const ROWS_SCHEMA: &str = r#"{
   "additionalProperties": false,
   "description": "One row per record put into the stream, one per record nothing could carry, one per row that could not be read, and one summary at the end. A later step builds the file index of SPEC section 8 from the woven rows; this module writes no index, having no filesystem and running before the muxer.",
   "properties": {
-    "event": {"enum": ["woven", "late", "dropped", "summary"]},
+    "event": {"type": "string", "enum": ["woven", "late", "dropped", "summary"]},
     "space": {"type": "string"},
     "record_id": {"type": "integer"},
     "carrier_pts": {"type": "integer", "description": "The presentation timestamp of the access unit that carried it, in the stream's own time base."},

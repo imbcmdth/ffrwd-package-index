@@ -57,13 +57,27 @@
 -- filesystem and runs before the muxer, so the index is not this
 -- function's to write. A live destination gets no index and needs
 -- none.
+--
+-- WHY THE THREE ROWS ARGUMENTS CARRY NO DEFAULT. They were written
+-- `DEFAULT NULL`, which is what says "this producer has nothing for
+-- this run". The CLI refuses that today: a defaulted annotation column
+-- on a module that is not windowed is read as a per-frame filter left
+-- without a producer under it, and a packet filter is neither. So the
+-- three are required here and a call writes NULL for the arguments it
+-- has no producer for, which the module reads as no rows at all:
+--
+--   weave(f.video[1], clips(...).shots, NULL, NULL, '[...]')
+--
+-- When the CLI exempts packet filters from that rule, `DEFAULT NULL`
+-- goes back on all three and a call may stop at the last argument it
+-- fills. Nothing about the module changes either way.
 CREATE FUNCTION weave(v video_stream,
                       clip   STRUCT(start_t number, end_t number,
-                                    vector vector)[] DEFAULT NULL,
+                                    vector vector)[],
                       sound  STRUCT(start_t number, end_t number,
-                                    vector vector)[] DEFAULT NULL,
+                                    vector vector)[],
                       speech STRUCT(start_t number, end_t number,
-                                    vector vector)[] DEFAULT NULL,
+                                    vector vector)[],
                       spaces text,
                       placement text DEFAULT NULL,
                       budget number DEFAULT NULL,
@@ -86,17 +100,34 @@ RETURNS packets
 -- and which model turns a search into the same space. `name` is a
 -- label this sink derives, not a field of the format.
 --
--- Both are packet sinks, so both are COPY destinations and their rows
--- ride the hosting sidecar's own stdout:
+-- Both are packet sinks, and a packet sink means two things depending
+-- on where it is written. Declared over a stream with an array of
+-- records for its RETURNS, as they are here, it is a FROM item: the
+-- compiler stream-copies that one stream of the file into the module
+-- while the query compiles and binds what the module wrote as a row
+-- table, so a search is joins and predicates over rows that exist
+-- before ffmpeg is started.
 --
---   COPY (SELECT f.video[1] FROM input('woven.mp4') f) TO records();
---   COPY (SELECT f.video[1] FROM input('woven.mp4') f) TO spaces();
+--   SELECT v.start_t, v.end_t
+--   FROM input('woven.mp4') f, records(f.video[1]) v
+--        JOIN spaces(f.video[1]) s ON v.space = s.space
+--   WHERE s.modality = 'picture'
 --
--- That is what runs today. What these exist for is the other thing:
--- reading a woven file at COMPILE time, so that `f.embeddings` is a
--- relation a query can join and filter. Nothing in the dialect spells
--- a packet sink whose rows are a compile-time relation yet; that is
--- being built separately, and these two are what it will run.
+-- WHICH SPACE IS WHICH, AND NOT BY ID. A record carries a space id and
+-- nothing else, and an id is a position in one writer's space table:
+-- `weave` hands them out in the order its `spaces` param declares
+-- them, FROM ZERO, and the `ffrwd-index` tool's own rows hand out
+-- whatever the rows say. A file outlives the run that wrote it, so a
+-- consumer joins `spaces` on `v.space = s.space` and selects on
+-- `modality`, or on `model`, or on `dims`: those are fields of the
+-- format and mean the same thing in every file. A query that hard-codes
+-- `v.space = 1` is reading a position it did not write.
+--
+-- The same module declared RETURNS sink and written after TO is the
+-- run-time destination it has always been, with its rows on the
+-- hosting sidecar's own stdout. That is a second declaration a query
+-- writes for itself; this package ships the FROM one, because that is
+-- the one a search needs.
 --
 -- Each says in its meta how much of a stream it has to be handed:
 -- `records` asks for `keyframes`, since section 7's `keyframe` policy
@@ -106,10 +137,21 @@ RETURNS packets
 -- more than was asked for and never less, and both read whatever they
 -- get: a space a writer learned of after the stream began rides its
 -- own first carrier, and a host handing over more is what finds it.
+--
+-- Each column below is one the module writes, checked against its own
+-- rows_schema when the call compiles. `planes` is an array, and the
+-- one array type the dialect has is `vector`: it is which of the eight
+-- bit-planes arrived for an i8 record, not an embedding, and it is
+-- absent for the float encodings.
 CREATE FUNCTION records(v video_stream)
-RETURNS sink
+RETURNS STRUCT(index number, space number, record_id number,
+               start_t number, end_t number, planes vector,
+               vector vector)[]
   AS 'target/wasm32-wasip2/release/records.wasm', 'records' LANGUAGE wasm;
 
 CREATE FUNCTION spaces(v video_stream)
-RETURNS sink
+RETURNS STRUCT(space number, name text, dims number, encoding text,
+               unit_length boolean, modality text, source number,
+               model text, model_hash text, query text,
+               query_hash text, producer text)[]
   AS 'target/wasm32-wasip2/release/spaces.wasm', 'spaces' LANGUAGE wasm;

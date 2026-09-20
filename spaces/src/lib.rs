@@ -54,7 +54,7 @@ const ROWS_SCHEMA: &str = r#"{
     "space": {"type": "integer", "minimum": 0, "maximum": 255, "description": "The space id the stream's VECTOR messages name."},
     "name": {"type": "string", "description": "A label, not a field of the format: the producer where the writer gave one, else the model URI, else 'space <id>'."},
     "dims": {"type": "integer", "minimum": 1, "maximum": 65536},
-    "encoding": {"enum": ["i8", "f16", "f32"]},
+    "encoding": {"type": "string", "enum": ["i8", "f16", "f32"]},
     "unit_length": {"type": "boolean", "description": "Whether the vectors were unit length before they were encoded."},
     "modality": {"type": "string", "description": "What was embedded: unspecified, picture, sound, speech, sound-text, scene-text, description, or the number of one this version does not name."},
     "source": {"type": "integer", "minimum": 0, "maximum": 255},
