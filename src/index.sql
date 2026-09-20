@@ -3,7 +3,7 @@
 --
 -- Three modules. `weave` is a packet filter and writes; `records` and
 -- `spaces` are packet sinks and read. All three are `ffrwd:av@0.16.0`,
--- which is unreleased, so none of them runs under a released ffrwd.
+-- which ffrwd hosts from 0.18.0 on, so that is the floor.
 
 -- ---------------------------------------------------------------- --
 -- Writing.

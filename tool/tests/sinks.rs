@@ -11,11 +11,12 @@
 //! second is what a compile-time read will actually do, and section 7
 //! is what makes it complete.
 //!
-//! `ffrwd:av@0.16.0` is not released, so the sidecar is a build of
-//! ffrwd's own tree. `FFRWD_WASM` names that binary and every test here
-//! skips without it, loudly. `FFRWD_INDEX_RECORDS` and
-//! `FFRWD_INDEX_SPACES` name prebuilt modules; without them the modules
-//! are built once, which needs `FFRWD_WIT_DIR`.
+//! A packet sink needs a host, and the host is `ffrwd-wasm` 0.18.0 or
+//! later. `FFRWD_WASM` names that binary and every test here skips
+//! without it, loudly. `FFRWD_INDEX_RECORDS` and `FFRWD_INDEX_SPACES`
+//! name prebuilt modules; without them the modules are built once,
+//! which needs the wit that `ffrwd path ffrwd/wasm` or `FFRWD_WIT_DIR`
+//! points at.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,8 +42,8 @@ fn sidecar() -> Option<PathBuf> {
     let Some(named) = std::env::var_os(SIDECAR_ENV) else {
         eprintln!(
             "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A packet sink needs a \
-             host, ffrwd:av@0.16.0 is not released, so build the sidecar of an ffrwd checkout \
-             that carries the interface and point {SIDECAR_ENV} at it."
+             host that speaks ffrwd:av@0.16.0, so install ffrwd-wasm 0.18.0 or later and point \
+             {SIDECAR_ENV} at it."
         );
         return None;
     };

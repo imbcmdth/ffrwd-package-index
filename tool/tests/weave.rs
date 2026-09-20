@@ -8,12 +8,11 @@
 //! simulated: the interface under test is a host's, and a mock of it
 //! would only prove that the mock agrees with itself.
 //!
-//! `ffrwd:av@0.16.0` is not released, so the sidecar that hosts a
-//! packet filter is a build of the branch that carries it. `FFRWD_WASM`
-//! names that binary and every test here skips without it, loudly.
-//! `FFRWD_INDEX_WASM` names a prebuilt `weave.wasm`; without it the
-//! module is built once, which needs `FFRWD_WIT_DIR` pointing at that
-//! same branch's `sidecar/wit`.
+//! A packet filter needs a host, and the host is `ffrwd-wasm` 0.18.0 or
+//! later. `FFRWD_WASM` names that binary and every test here skips
+//! without it, loudly. `FFRWD_INDEX_WASM` names a prebuilt
+//! `weave.wasm`; without it the module is built once, which needs the
+//! wit that `ffrwd path ffrwd/wasm` or `FFRWD_WIT_DIR` points at.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -54,8 +53,8 @@ fn sidecar() -> Option<PathBuf> {
     let Some(named) = std::env::var_os(SIDECAR_ENV) else {
         eprintln!(
             "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A packet filter needs a \
-             host, ffrwd:av@0.16.0 is not released, so build the sidecar of the ffrwd branch that \
-             carries the interface and point {SIDECAR_ENV} at it."
+             host that speaks ffrwd:av@0.16.0, so install ffrwd-wasm 0.18.0 or later and point \
+             {SIDECAR_ENV} at it."
         );
         return None;
     };

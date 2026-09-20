@@ -7,9 +7,10 @@
 // into the repository, so a module and the ffrwd it is hosted by cannot
 // drift apart without the build saying so.
 //
-// `ffrwd:av@0.16.0` is not in any released `ffrwd/wasm` yet, so until
-// one ships, FFRWD_WIT_DIR is how this builds: point it at the `sidecar/wit`
-// of an ffrwd checkout on the branch that carries the packet filter.
+// `ffrwd install` puts `ffrwd/wasm` 0.16.0 where `ffrwd path` finds it,
+// which is the ordinary route and needs `ffrwd` on the PATH. FFRWD_WIT_DIR
+// is the other one: point it at the `sidecar/wit` of an ffrwd checkout to
+// build against a host that has not shipped.
 use std::env;
 use std::fs;
 use std::path::PathBuf;
