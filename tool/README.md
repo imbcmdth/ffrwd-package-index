@@ -302,9 +302,9 @@ ffrwd-index search --mp4 film.mp4 --space xclip --query prompt.json --top 5
 
 **It does not embed text.** A space says which model turns a query into
 its own space, and `search` prints that model on stderr; getting a
-vector out of it is the caller's business.
-[examples/describe](../examples/describe) does it with the same
-package's own text tower.
+vector out of it is the caller's business. `ffrwd/describe` exposes the
+text tower that answers for its own spaces, which is what its `find`
+recipe embeds a prompt with.
 
 **The query** is a JSON file, or `-` for standard input. Any of these is
 read: an array of numbers, a base64 string of little-endian binary32,
@@ -413,7 +413,9 @@ one modality and these are two: a label for what was heard and a
 transcript of what was said. A reader that wanted to search only what
 was said could not tell them apart if they shared an id.
 
-The whole path, run on a real file, is in
+`ffrwd/describe`'s own `describe` and `find` recipes run the whole path
+without this subcommand. What it cost one real ranking to put the
+vectors in the pictures is in
 [examples/describe](../examples/describe).
 
 ## The file index

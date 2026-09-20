@@ -24,27 +24,28 @@ measured on real vectors.
 
 ## Status
 
-The format is a draft and nothing here is released.
+The format is a draft. The package is installable:
 
-Working today, without ffrwd: the `ffrwd-index` tool weaves rows of vectors
-into H.264, HEVC and AV1 elementary streams, reads them back from a stream or
-straight out of an MP4 or Matroska file, and writes and reads the file index.
-On a 15 MB test file a search reads 0.07% of the bytes to get every vector from
-the keyframes, and 0.03% when the file has an index. It also ranks: `search`
-scores a query vector against one space of a file by cosine and prints the
-spans, and `watch` reads a growing stream from a pipe and prints a match before
-the frames after it arrive. See [tool/README.md](tool/README.md).
+```
+ffrwd install ffrwd/index
+```
 
-Working today, with released ffrwd: [examples/describe](examples/describe)
-takes one video through `ffrwd/describe`, turns its vectors into rows, weaves
-them into the file's own pictures, indexes it and searches it with a prompt the
-package's own text tower embedded, and prints what the encoding cost against
-the same search over the original binary32.
+The three modules are `ffrwd:av@0.16.0`, which ffrwd hosts from 0.18.0 on, so
+that is the floor. They ship built, and an install compiles nothing.
 
-Working against an unreleased ffrwd: three wasm modules, all
-`ffrwd:av@0.16.0`, which no released ffrwd hosts. [Developing against an
-unreleased ffrwd](#developing-against-an-unreleased-ffrwd) is the route to
-running them.
+The `ffrwd-index` tool is the same format without ffrwd: it weaves rows of
+vectors into H.264, HEVC and AV1 elementary streams, reads them back from a
+stream or straight out of an MP4 or Matroska file, and writes and reads the
+file index. On a 15 MB test file a search reads 0.07% of the bytes to get every
+vector from the keyframes, and 0.03% when the file has an index. It also ranks:
+`search` scores a query vector against one space of a file by cosine and prints
+the spans, and `watch` reads a growing stream from a pipe and prints a match
+before the frames after it arrive. See [tool/README.md](tool/README.md).
+
+`ffrwd/describe` is the producer these modules were written against, and its
+own `describe` and `find` recipes run the whole path.
+[examples/describe](examples/describe) is what the encoding costs a ranking,
+measured against those recipes' own vectors.
 
 `weave` writes. It is a packet filter: encoded packets in, the same packets
 out, with the vectors woven into them and every timestamp untouched. Rows can
@@ -196,48 +197,32 @@ consumer joins `spaces` and selects on `modality`, `model` or `dims`, which
 section 3 makes mean the same thing in every file. The one place an id belongs
 is the join itself, `records(...) v JOIN spaces(...) s ON v.space = s.space`.
 
-## Developing against an unreleased ffrwd
-
-`ffrwd.json` depends on `ffrwd/wasm` 0.16.0, which is the wit the three modules
-are built against and is not in the registry. That pin is right for release and
-wrong for today, so `ffrwd link` here stops at
+## Building the modules
 
 ```
-UNSUPPORTED_SQL: the registry has no version 0.16.0 of 'ffrwd/wasm'
-(hint: published: 0.9.0, ... 0.15.0)
+ffrwd install
+cargo build --release --target wasm32-wasip2 -p weave -p records -p spaces
 ```
 
-`ffrwd/wasm` carries nothing but the wit a `build.rs` reads, and `FFRWD_WIT_DIR`
-supplies that directly, so the way through is a copy of this checkout with the
-dependency dropped. The dependency stays in the manifest; the copy is what gets
-linked.
+`ffrwd install` puts `ffrwd/wasm` 0.16.0 in the cache, and each crate's
+`build.rs` asks `ffrwd path ffrwd/wasm` where its wit is, so `ffrwd` has to be
+on the PATH for the build. `FFRWD_WIT_DIR` names a directory holding `av.wit`
+instead, which is how a module is built against an ffrwd checkout rather than a
+release. Either way the files land in `target/wasm32-wasip2/release/`, the path
+`src/index.sql` names.
 
-1. Build the unreleased ffrwd and its sidecar into a virtualenv of their own,
-   and point `FFRWD_WASM` at the built `ffrwd-wasm`. Give the session an ffrwd
-   home of its own too (`HOME`, and `USERPROFILE` on Windows): `ffrwd link`
-   records the link machine-wide, in `~/.cache/ffrwd/ffrwd.links`, and a home of
-   your own keeps it out of the real one.
-2. Copy this checkout somewhere. In the copy, delete `dependencies` from
-   `ffrwd.json`.
-3. Build the three modules in the copy, against that sidecar's own wit:
+To run a consuming query against the checkout, `ffrwd link` here and `ffrwd
+link ffrwd/index` in that project. The first is recorded in
+`~/.cache/ffrwd/ffrwd.links` for the whole machine and the second in the
+project's own `ffrwd.links`; neither is version control's business, and every
+command afterwards says what it is reading:
 
-   ```
-   FFRWD_WIT_DIR=<ffrwd>/sidecar/wit \
-     cargo build --release --target wasm32-wasip2 -p weave -p records -p spaces
-   ```
+```
+warning: package 'ffrwd/index' is linked to <path>, so this command depends on
+files no lockfile pins
+```
 
-   They have to land in the copy's own `target/wasm32-wasip2/release/`, which is
-   the path `src/index.sql` names and a linked package resolves in place.
-4. `ffrwd link` in the copy. It writes the copy's own `ffrwd.lock` and records
-   `ffrwd/index -> <copy>` in the links file.
-5. `ffrwd link ffrwd/index` in the consuming project. The name goes in that
-   project's `ffrwd.links`, never its lockfile, and shadows whatever version its
-   manifest pins. Every command afterwards says so, which is the point:
-   `warning: package 'ffrwd/index' is linked to <copy>, so this command depends
-   on files no lockfile pins`.
-
-`ffrwd unlink ffrwd/index` puts the pin back. When `ffrwd/wasm` 0.16.0 ships,
-none of this is needed: `ffrwd install` and `cargo build` are the whole of it.
+`ffrwd unlink ffrwd/index` puts the pinned version back.
 
 ## Layout
 
@@ -271,8 +256,8 @@ two containers' own business.
 - `weave/`: the ffrwd packet filter that writes, a thin `wasm32-wasip2` layer
   over `rows/`.
 - `records/`, `spaces/`: the two ffrwd packet sinks that read, the same way.
-- `examples/describe/`: one video through `ffrwd/describe` and out again as a
-  search, with the real commands and their real output.
+- `examples/describe/`: what the 8-bit encoding cost one real ranking, against
+  the same search over the vectors `ffrwd/describe` produced.
 - `ffrwd.json`, `src/index.sql`: the ffrwd package.
 
 ## License
