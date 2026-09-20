@@ -274,7 +274,6 @@ two containers' own business.
 - `examples/describe/`: one video through `ffrwd/describe` and out again as a
   search, with the real commands and their real output.
 - `ffrwd.json`, `src/index.sql`: the ffrwd package.
-- `notes/`: design notes that belong to other repositories.
 
 ## License
 

@@ -78,7 +78,7 @@ Run on a 60-second clip with cuts, on 2026-09-19, with ffrwd 0.17.3,
 except that the absolute path of `out/` is shortened.
 
 ```
-$ ./run.sh E:/projects/chunkyseal-spike/clips/film_dark.mp4 'a car driving at night'
+$ ./run.sh film_dark.mp4 'a car driving at night'
 source:  /e/projects/chunkyseal-spike/clips/film_dark.mp4
 codec:   h264 at 24000/1001 (23.976024 fps)
 audio:   none
