@@ -242,16 +242,32 @@ none of this is needed: `ffrwd install` and `cargo build` are the whole of it.
 
 ## Layout
 
+This repository holds the format and nothing below it. The byte level it rides
+on is two crates of its own, shared with the other ffrwd packages that used to
+carry a copy of the same code each:
+
+- [`ffrwd-nal`](https://github.com/imbcmdth/ffrwd-nal): where the NAL units and
+  OBUs of H.264, HEVC and AV1 begin and end, which of them open a picture, and
+  how to put a payload into one or read one out without moving anything else.
+- [`ffrwd-bmff`](https://github.com/imbcmdth/ffrwd-bmff): ISO base media files,
+  read and written. Where every sample of a track is, when it is shown, and a
+  top-level box found, appended or replaced in a file in place.
+
+Both are dependency-free, forbid unsafe code and build for `wasm32-wasip2`,
+which is what the empty dependency lists here were protecting. What is left
+below is this format: its UUID, its messages, where a writer puts them, and the
+two containers' own business.
+
 - `SPEC.md`: the format.
-- `core/`: the codec, plain Rust with no dependencies and no I/O: messages, the
-  layered 8-bit encoding, SEI and OBU wrapping, inserting into and reading from
-  H.264, HEVC and AV1 streams, placement, and the file index.
-- `rows/`: the JSON rows a producer hands over (spaces and vectors), which
-  framing a packet is in, and the two state machines over `core/`: weaving
-  vectors into packets and reading them back out. Shared by the tool and the
-  three modules, and tested natively.
-- `container/`: reading MP4 and Matroska far enough to find the samples that
-  carry vectors, and putting the index into a file.
+- `core/`: the codec, plain Rust and no I/O: messages, the layered 8-bit
+  encoding, placement, the file index, and the thin `carriage` layer that names
+  `ffrwd-nal`'s SEI and OBU calls with this format's UUID.
+- `rows/`: the JSON rows a producer hands over (spaces and vectors) and the two
+  state machines over `core/`: weaving vectors into packets and reading them
+  back out. Shared by the tool and the three modules, and tested natively.
+- `container/`: Matroska, which nothing else here reads, and the prefix scan
+  that finds the samples carrying vectors without reading the pictures. MP4 is
+  `ffrwd-bmff`, and so is putting the index box into a file.
 - `tool/`: `ffrwd-index`, a native command line over all of it.
 - `weave/`: the ffrwd packet filter that writes, a thin `wasm32-wasip2` layer
   over `rows/`.

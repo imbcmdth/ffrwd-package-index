@@ -180,17 +180,6 @@ impl FileIndex {
     }
 }
 
-/// An MP4 `uuid` box holding an index, for the top level of a file.
-pub fn mp4_uuid_box(index: &[u8]) -> Vec<u8> {
-    let size = 8 + 16 + index.len();
-    let mut out = Vec::with_capacity(size);
-    out.extend_from_slice(&(size as u32).to_be_bytes());
-    out.extend_from_slice(b"uuid");
-    out.extend_from_slice(&crate::UUID);
-    out.extend_from_slice(index);
-    out
-}
-
 /// Folds a later message of one record into the entry already held.
 ///
 /// The entry keeps the first message's time and offsets, which name the
@@ -444,19 +433,5 @@ mod tests {
             }
             let _ = FileIndex::parse(&bytes);
         }
-    }
-
-    #[test]
-    fn the_mp4_box_is_a_uuid_box_of_this_format() {
-        let index = FileIndex::build(vec![(0, Message::Space(space(1)))]);
-        let bytes = index.encode();
-        let boxed = mp4_uuid_box(&bytes);
-        assert_eq!(&boxed[4..8], b"uuid");
-        assert_eq!(&boxed[8..24], &crate::UUID);
-        assert_eq!(
-            u32::from_be_bytes(boxed[..4].try_into().expect("four bytes")) as usize,
-            boxed.len()
-        );
-        assert_eq!(FileIndex::parse(&boxed[24..]).expect("an index"), index);
     }
 }

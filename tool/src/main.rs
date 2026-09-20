@@ -26,19 +26,23 @@ use std::collections::BTreeMap;
 
 use std::path::Path;
 
+use ffrwd_bmff::patch::{self, Placed};
+use ffrwd_bmff::source::{Source, Tally};
+use ffrwd_bmff::track::{self, Pick};
 use ffrwd_index_container::scan::{carriages, Scan};
-use ffrwd_index_container::{mkv, mp4, write, Kind, Source, Tally, VideoTrack};
+use ffrwd_index_container::{mkv, Kind, Video, INDEX_BOX};
 use ffrwd_index_core::assemble::{Assembler, Limits, Record};
-use ffrwd_index_core::avc::{self, Codec};
+use ffrwd_index_core::carriage;
 use ffrwd_index_core::index::{FileIndex, MATROSKA_FILE_NAME, MATROSKA_MIME};
-use ffrwd_index_core::live::{Feed, StreamKind};
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody, VectorRecord};
-use ffrwd_index_core::obu;
 use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
 use ffrwd_index_core::quant::{f16_to_f32, Planes};
+use ffrwd_index_core::METADATA_TYPE;
 use ffrwd_index_rows::json::{float, number, object, Json};
 use ffrwd_index_rows::space::{read_space, space_row};
 use ffrwd_index_rows::vector::{bodies, plane_numbers, read_values};
+use ffrwd_nal::feed::StreamKind;
+use ffrwd_nal::{h26x, obu, Codec};
 
 const USAGE: &str = "\
 ffrwd-index: embedding vectors in a video's own stream.
@@ -310,7 +314,7 @@ struct Spot {
 /// The carriers of an elementary stream.
 fn spots(stream: &[u8], kind: Stream) -> Result<Vec<Spot>, String> {
     Ok(match kind {
-        Stream::Nal(codec) => avc::access_units(stream, codec)
+        Stream::Nal(codec) => h26x::access_units(stream, codec)
             .into_iter()
             .map(|unit| Spot {
                 start: unit.start,
@@ -342,18 +346,18 @@ fn framed(kind: Stream, unit: &[u8], temporal_id_plus1: u8) -> Vec<u8> {
     match kind {
         Stream::Nal(codec) => {
             let mut out = vec![0, 0, 0, 1];
-            out.extend_from_slice(&avc::wrap_unit_at(unit, codec, temporal_id_plus1));
+            out.extend_from_slice(&carriage::wrap_unit_at(unit, codec, temporal_id_plus1));
             out
         }
-        Stream::Av1 => obu::write_metadata_obu(unit),
+        Stream::Av1 => obu::write_metadata(METADATA_TYPE, unit),
     }
 }
 
 /// Every unit of this format in one carrier's bytes.
 fn units_in(bytes: &[u8], kind: Stream) -> Vec<Vec<u8>> {
     match kind {
-        Stream::Nal(codec) => avc::units_annexb(bytes, codec),
-        Stream::Av1 => obu::units_obu(bytes),
+        Stream::Nal(codec) => carriage::units_annexb(bytes, codec),
+        Stream::Av1 => carriage::units_obu(bytes),
     }
 }
 
@@ -583,7 +587,7 @@ fn stream_carriers(flags: &Flags, video: &str) -> Result<Vec<Carried>, String> {
 /// it have been taken off.
 fn piped_carriers(kind: Stream, fps: f64) -> Result<Vec<Carried>, String> {
     use std::io::Read;
-    let mut feed = Feed::new(match kind {
+    let mut feed = carriage::feed(match kind {
         Stream::Nal(codec) => StreamKind::Nal(codec),
         Stream::Av1 => StreamKind::Av1,
     });
@@ -602,7 +606,7 @@ fn piped_carriers(kind: Stream, fps: f64) -> Result<Vec<Carried>, String> {
         for carrier in carried {
             out.push(Carried {
                 time_ms: pts_ms(carrier.index as usize, fps),
-                units: carrier.units,
+                units: carrier.payloads,
             });
         }
         if got == 0 {
@@ -633,7 +637,7 @@ fn walk<R: std::io::Read + std::io::Seek>(
     src: &mut Source<R>,
     kind: Option<Kind>,
     scan: Scan,
-) -> Result<(VideoTrack, Vec<Carried>), ffrwd_index_container::Error> {
+) -> Result<(Video, Vec<Carried>), ffrwd_index_container::Error> {
     // What the file says it is decides, even when a flag named a
     // container: a `--mp4` pointed at an elementary stream should hear
     // that rather than a complaint about a box.
@@ -647,7 +651,7 @@ fn walk<R: std::io::Read + std::io::Seek>(
     }
     let kind = found;
     let track = match kind {
-        Kind::Mp4 => mp4::read(src)?,
+        Kind::Mp4 => Video::of_track(&track::read(src, Pick::Video)?)?,
         Kind::Matroska => mkv::read(src, scan)?,
     };
     let carried = carriages(src, &track, scan)?
@@ -671,7 +675,7 @@ fn name_of(kind: Kind) -> &'static str {
 ///
 /// The ratio is the point: section 7's `keyframe` policy exists so that
 /// reading a file's records is not reading the file.
-fn accounting(track: &VideoTrack, carried: &[Carried], scan: Scan, tally: Tally) -> String {
+fn accounting(track: &Video, carried: &[Carried], scan: Scan, tally: Tally) -> String {
     format!(
         "scan {}: {} of {} samples, {} of {} bytes read ({:.2}% of the file), {} seeks",
         scan.name(),
@@ -797,7 +801,7 @@ fn dump_index(path: &str) -> Result<(), String> {
         let kind =
             ffrwd_index_container::kind_of(&mut src).map_err(|err| format!("{path}: {err}"))?;
         let found = match kind {
-            Kind::Mp4 => mp4::read_index(&mut src),
+            Kind::Mp4 => patch::read(&mut src, INDEX_BOX).map_err(Into::into),
             Kind::Matroska => mkv::read_index(&mut src),
         }
         .map_err(|err| format!("{path}: {err}"))?;
@@ -972,7 +976,7 @@ fn install_mp4(file: &str, bytes: &[u8], rewrite: bool) -> Result<(), String> {
         let temporary = format!("{file}.ffrwd-index-rewrite");
         let mut out =
             std::fs::File::create(&temporary).map_err(|err| format!("{temporary}: {err}"))?;
-        let done = write::rewrite(&mut src, &mut out, bytes);
+        let done = patch::rewrite(&mut src, &mut out, INDEX_BOX, bytes);
         drop(out);
         drop(src);
         if let Err(err) = done {
@@ -988,20 +992,35 @@ fn install_mp4(file: &str, bytes: &[u8], rewrite: bool) -> Result<(), String> {
         .write(true)
         .open(file)
         .map_err(|err| format!("{file}: {err}"))?;
-    let placed = write::install(handle, bytes).map_err(|err| format!("{file}: {err}"))?;
+    let placed = patch::install(handle, INDEX_BOX, bytes).map_err(|err| refusal(file, err))?;
     eprintln!(
         "{file}: {}",
         match placed {
-            write::Placed::Appended { at } => format!("the index box was appended at byte {at}"),
-            write::Placed::Replaced { at } =>
+            Placed::Appended { at } => format!("the index box was appended at byte {at}"),
+            Placed::Replaced { at } =>
                 format!("the index box already there was written over, at byte {at}"),
-            write::Placed::BeforeMfra { at, moved } => format!(
+            Placed::BeforeMfra { at, moved } => format!(
                 "the index box went in at byte {at}, in front of the {moved}-byte mfra, \
                  which was written again after it so that it stays last"
             ),
         }
     );
     Ok(())
+}
+
+/// What `patch::install` would not do, and what to do about it.
+///
+/// The shared crate refuses a box that is not last and says why, with
+/// the byte it found the old one at. It does not know this tool's flags
+/// and says nothing about them, so the sentence naming `--rewrite` is
+/// added here, where the flag lives.
+fn refusal(file: &str, err: ffrwd_bmff::Error) -> String {
+    match &err {
+        ffrwd_bmff::Error::Unsupported(fault) => {
+            format!("{file}: {fault}. Pass --rewrite to copy the file without it")
+        }
+        _ => format!("{file}: {err}"),
+    }
 }
 
 /// Matroska's attachment, through ffmpeg.

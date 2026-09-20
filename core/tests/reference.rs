@@ -37,13 +37,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ffrwd_index_core::assemble::{Assembler, Limits};
-use ffrwd_index_core::avc::{self, Codec};
+use ffrwd_index_core::carriage;
 use ffrwd_index_core::index::FileIndex;
 use ffrwd_index_core::message::{Encoding, Message, Modality, Space, Unit, VectorRecord};
-use ffrwd_index_core::obu;
 use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
 use ffrwd_index_core::quant::Planes;
-use ffrwd_index_core::UUID;
+use ffrwd_index_core::{METADATA_TYPE, UUID};
+use ffrwd_nal::h26x::{self, Codec};
+use ffrwd_nal::{annexb, obu, sei};
 
 const FPS: i64 = 30;
 
@@ -119,7 +120,7 @@ impl Stream {
     /// goes in it, and what time it is.
     fn carriers(self, bytes: &[u8]) -> Vec<Spot> {
         match self.codec() {
-            Some(codec) => avc::access_units(bytes, codec)
+            Some(codec) => h26x::access_units(bytes, codec)
                 .into_iter()
                 .enumerate()
                 .map(|(index, unit)| Spot {
@@ -162,9 +163,13 @@ impl Stream {
             match self.codec() {
                 Some(codec) => {
                     out.extend_from_slice(&[0, 0, 0, 1]);
-                    out.extend_from_slice(&avc::wrap_unit_at(unit, codec, spot.temporal_id_plus1));
+                    out.extend_from_slice(&carriage::wrap_unit_at(
+                        unit,
+                        codec,
+                        spot.temporal_id_plus1,
+                    ));
                 }
-                None => out.extend_from_slice(&obu::write_metadata_obu(unit)),
+                None => out.extend_from_slice(&obu::write_metadata(METADATA_TYPE, unit)),
             }
             at = spot.insert_at;
         }
@@ -179,8 +184,8 @@ impl Stream {
             .map(|spot| {
                 let inside = &bytes[spot.start..spot.end];
                 match self.codec() {
-                    Some(codec) => avc::units_annexb(inside, codec),
-                    None => obu::units_obu(inside),
+                    Some(codec) => carriage::units_annexb(inside, codec),
+                    None => carriage::units_obu(inside),
                 }
             })
             .collect()
@@ -599,17 +604,17 @@ fn the_fixtures_are_what_the_tests_assume() {
     // x264 writes its own user_data_unregistered SEI, and it is not
     // ours: a reader must walk straight past it.
     let h264 = Stream::H264.bytes();
-    let sei: Vec<avc::SeiMessage> = avc::scan_nals(&h264)
+    let messages: Vec<sei::SeiMessage> = annexb::scan_nals(&h264)
         .iter()
         .filter(|nal| Codec::H264.is_prefix_sei(nal.bytes))
-        .flat_map(|nal| avc::parse_sei(nal.bytes, Codec::H264).expect("SEI messages"))
+        .flat_map(|nal| sei::parse_sei(nal.bytes, Codec::H264).expect("SEI messages"))
         .collect();
     assert!(
-        sei.iter().any(|message| message.payload_type == 5),
+        messages.iter().any(|message| message.payload_type == 5),
         "the fixture has no x264 settings SEI"
     );
     assert!(
-        sei.iter().any(|message| {
+        messages.iter().any(|message| {
             message.payload_type == 5 && String::from_utf8_lossy(&message.payload).contains("x264")
         }),
         "the x264 SEI does not name x264"
@@ -635,8 +640,8 @@ fn records_woven_into_a_stream_read_back_byte_for_byte() {
             // The second, independent reader finds the same units.
             let theirs = by_hand(stream, &woven.bytes);
             let ours: Vec<Vec<u8>> = match stream.codec() {
-                Some(codec) => avc::units_annexb(&woven.bytes, codec),
-                None => obu::units_obu(&woven.bytes),
+                Some(codec) => carriage::units_annexb(&woven.bytes, codec),
+                None => carriage::units_obu(&woven.bytes),
             };
             assert_eq!(theirs, ours, "{} with {policy:?}", stream.name());
             assert!(!ours.is_empty());
@@ -659,10 +664,10 @@ fn weaving_adds_nothing_but_the_units() {
         let woven = weave(stream, Placement::Keyframe);
         match stream.codec() {
             Some(codec) => {
-                let before: Vec<&[u8]> = avc::split_nals(&woven.original);
-                let after: Vec<&[u8]> = avc::split_nals(&woven.bytes)
+                let before: Vec<&[u8]> = annexb::split_nals(&woven.original);
+                let after: Vec<&[u8]> = annexb::split_nals(&woven.bytes)
                     .into_iter()
-                    .filter(|nal| avc::units_in_nal(nal, codec).is_empty())
+                    .filter(|nal| carriage::units_in_nal(nal, codec).is_empty())
                     .collect();
                 assert_eq!(after, before, "{}: a NAL changed", stream.name());
             }
@@ -675,7 +680,7 @@ fn weaving_adds_nothing_but_the_units() {
                 let after: Vec<Vec<u8>> = obu::scan_obus(&woven.bytes)
                     .expect("obus")
                     .iter()
-                    .filter(|unit| obu::unit_in_obu(unit).is_none())
+                    .filter(|unit| carriage::unit_in_obu(unit).is_none())
                     .map(|unit| woven.bytes[unit.start..unit.end].to_vec())
                     .collect();
                 assert_eq!(after, before, "{}: an OBU changed", stream.name());
@@ -770,10 +775,10 @@ fn ffmpeg_and_ffprobe_say_nothing_new_about_the_woven_stream() {
 fn x264s_own_sei_is_still_there_and_untouched() {
     let woven = weave(Stream::H264, Placement::Keyframe);
     let theirs = |bytes: &[u8]| -> Vec<Vec<u8>> {
-        avc::scan_nals(bytes)
+        annexb::scan_nals(bytes)
             .iter()
             .filter(|nal| Codec::H264.is_prefix_sei(nal.bytes))
-            .flat_map(|nal| avc::parse_sei(nal.bytes, Codec::H264).expect("SEI messages"))
+            .flat_map(|nal| sei::parse_sei(nal.bytes, Codec::H264).expect("SEI messages"))
             .filter(|message| !message.payload.starts_with(&UUID))
             .map(|message| message.payload)
             .collect()

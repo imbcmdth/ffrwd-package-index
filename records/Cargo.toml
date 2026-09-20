@@ -9,10 +9,13 @@ description = "An ffrwd packet sink: one row per record woven into a video strea
 name = "records"
 crate-type = ["cdylib"]
 
-# wit-bindgen and the two crates of this workspace, and nothing else.
+# wit-bindgen, the two crates of this workspace, and `ffrwd-nal` for
+# the framing of a coded packet, which is shared with the other ffrwd
+# packages rather than copied here and has no dependencies of its own.
 # The JSON is `ffrwd-index-rows`, which the tool and `weave` already
 # read and write the same rows with.
 [dependencies]
 wit-bindgen = "0.57.1"
 ffrwd-index-core = { path = "../core" }
 ffrwd-index-rows = { path = "../rows" }
+ffrwd-nal = { workspace = true }

@@ -24,13 +24,18 @@
 //!   that "a keyframe scan reads under a tenth of the file" is a claim
 //!   about a file with real pictures in it |
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use ffrwd_bmff::patch::{self, Placed};
+use ffrwd_bmff::source::Source;
+use ffrwd_bmff::track::{self, Pick, Sample};
 use ffrwd_index_container::scan::{carriages, Scan};
-use ffrwd_index_container::{kind_of, mkv, mp4, write, Kind, Sample, Source, TrackCodec};
+use ffrwd_index_container::{kind_of, mkv, Kind, Video, INDEX_BOX};
+use ffrwd_nal::config::Framing;
+use ffrwd_nal::Codec;
 
 // ---------------------------------------------------------------- //
 // ffmpeg.
@@ -292,11 +297,18 @@ fn source(name: &str) -> Source<Cursor<Vec<u8>>> {
     Source::new(Cursor::new(bytes)).expect("a source")
 }
 
-fn track_of(name: &str, scan: Scan) -> ffrwd_index_container::VideoTrack {
+fn track_of(name: &str, scan: Scan) -> Video {
     let mut src = source(name);
-    match kind_of(&mut src).expect("a container") {
-        Kind::Mp4 => mp4::read(&mut src).expect("an MP4 track"),
-        Kind::Matroska => mkv::read(&mut src, scan).expect("a Matroska track"),
+    video_of(&mut src, scan)
+}
+
+/// The video track of whatever container the bytes are, as a scan
+/// sees it.
+fn video_of<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Video {
+    match kind_of(src).expect("a container") {
+        Kind::Mp4 => Video::of_track(&track::read(src, Pick::Video).expect("an MP4 track"))
+            .expect("a codec this format carries"),
+        Kind::Matroska => mkv::read(src, scan).expect("a Matroska track"),
     }
 }
 
@@ -384,21 +396,21 @@ fn the_files_that_do_not_start_at_zero_say_so() {
 #[test]
 fn the_codec_and_its_framing_come_out_of_the_file() {
     skip_without_ffmpeg!();
-    for (name, codec, length_size) in [
-        ("h264.mp4", TrackCodec::H264, Some(4)),
-        ("hevc.mp4", TrackCodec::H265, Some(4)),
-        ("av1.mp4", TrackCodec::Av1, None),
-        ("h264.mkv", TrackCodec::H264, Some(4)),
-        ("hevc.mkv", TrackCodec::H265, Some(4)),
-        ("av1.webm", TrackCodec::Av1, None),
+    let nals = |codec| Framing::LengthPrefixed {
+        codec,
+        length_size: 4,
+    };
+    for (name, framing) in [
+        ("h264.mp4", nals(Codec::H264)),
+        ("hevc.mp4", nals(Codec::H265)),
+        ("av1.mp4", Framing::Av1),
+        ("h264.mkv", nals(Codec::H264)),
+        ("hevc.mkv", nals(Codec::H265)),
+        ("av1.webm", Framing::Av1),
     ] {
         let track = track_of(name, Scan::Keyframes);
-        assert_eq!(track.codec, codec, "{name}");
-        assert_eq!(track.length_size, length_size, "{name}");
-        assert!(
-            !track.codec_private.is_empty(),
-            "{name}: no out-of-band header"
-        );
+        assert_eq!(track.framing, framing, "{name}");
+        assert!(!track.config.is_empty(), "{name}: no out-of-band header");
     }
 }
 
@@ -472,10 +484,7 @@ fn a_keyframe_scan_reads_a_small_part_of_a_real_file() {
     for name in ["big.mp4", "big.mkv"] {
         let mut src = source(name);
         let scan = Scan::Keyframes;
-        let track = match kind_of(&mut src).expect("a container") {
-            Kind::Mp4 => mp4::read(&mut src).expect("a track"),
-            Kind::Matroska => mkv::read(&mut src, scan).expect("a track"),
-        };
+        let track = video_of(&mut src, scan);
         let found = carriages(&mut src, &track, scan).expect("a scan");
         let tally = src.tally();
         assert!(
@@ -494,10 +503,7 @@ fn a_keyframe_scan_reads_a_small_part_of_a_real_file() {
         // And the full scan really is the expensive one, so the ratio
         // above is a saving rather than an accident of the fixture.
         let mut src = source(name);
-        let track = match kind_of(&mut src).expect("a container") {
-            Kind::Mp4 => mp4::read(&mut src).expect("a track"),
-            Kind::Matroska => mkv::read(&mut src, Scan::All).expect("a track"),
-        };
+        let track = video_of(&mut src, Scan::All);
         let every = carriages(&mut src, &track, Scan::All).expect("a scan");
         assert!(every.len() > found.len() * 4, "{name}");
         assert!(src.tally().bytes_read > tally.bytes_read * 4, "{name}");
@@ -519,13 +525,13 @@ fn an_index_goes_into_every_shape_of_mp4_and_comes_back_out() {
     for name in ["h264.mp4", "h264-fast.mp4", "h264-frag.mp4", "av1.mp4"] {
         let before = std::fs::read(at(name)).expect("a fixture");
         let mut file = Cursor::new(before.clone());
-        let placed = write::install(&mut file, &index).expect("a write");
+        let placed = patch::install(&mut file, INDEX_BOX, &index).expect("a write");
         let after = file.into_inner();
         assert!(after.len() > before.len(), "{name}");
 
         let mut src = Source::new(Cursor::new(after.clone())).expect("a source");
         assert_eq!(
-            mp4::read_index(&mut src)
+            patch::read(&mut src, INDEX_BOX)
                 .expect("a read")
                 .expect("an index"),
             index,
@@ -542,10 +548,10 @@ fn an_index_goes_into_every_shape_of_mp4_and_comes_back_out() {
         // from a fragmented file's mfra, which moves by the box's own
         // length so that it stays last.
         match placed {
-            write::Placed::Appended { at } => {
+            Placed::Appended { at } => {
                 assert_eq!(&after[..at as usize], &before[..], "{name}")
             }
-            write::Placed::BeforeMfra { at, moved } => {
+            Placed::BeforeMfra { at, moved } => {
                 assert_eq!(&after[..at as usize], &before[..at as usize], "{name}");
                 assert_eq!(
                     &after[after.len() - moved as usize..],
@@ -560,8 +566,8 @@ fn an_index_goes_into_every_shape_of_mp4_and_comes_back_out() {
         let mut before_src = Source::new(Cursor::new(before)).expect("a source");
         let mut after_src = Source::new(Cursor::new(after)).expect("a source");
         assert_eq!(
-            mp4::read(&mut before_src).expect("a track"),
-            mp4::read(&mut after_src).expect("a track"),
+            track::read(&mut before_src, Pick::Video).expect("a track"),
+            track::read(&mut after_src, Pick::Video).expect("a track"),
             "{name}"
         );
     }
@@ -571,19 +577,25 @@ fn an_index_goes_into_every_shape_of_mp4_and_comes_back_out() {
 // Bad bytes.
 // ---------------------------------------------------------------- //
 
-/// Every entry point, over whatever bytes it is given.
+/// Every entry point this crate has, over whatever bytes it is given.
+///
+/// The box walk itself is not here: `ffrwd-bmff` truncates and damages
+/// its own fixtures through every one of its parsers, and a second copy
+/// of that loop would only say the same thing more slowly. What is here
+/// is what this crate reads: which container a file is, Matroska, the
+/// prefix scan over the samples either container reports, and the one
+/// box read the tool makes.
 fn every_parser(bytes: Vec<u8>) {
     let mut src = Source::new(Cursor::new(bytes)).expect("a source");
     let _ = kind_of(&mut src);
-    let _ = mp4::top_level(&mut src);
-    let _ = mp4::find_index_box(&mut src);
-    let _ = mp4::read_index(&mut src);
-    let _ = mp4::spot(&mut src);
+    let _ = patch::read(&mut src, INDEX_BOX);
     let _ = mkv::segment(&mut src);
     let _ = mkv::read_index(&mut src);
     for scan in [Scan::Keyframes, Scan::All] {
-        if let Ok(track) = mp4::read(&mut src) {
-            let _ = carriages(&mut src, &track, scan);
+        if let Ok(track) = track::read(&mut src, Pick::Video) {
+            if let Ok(video) = Video::of_track(&track) {
+                let _ = carriages(&mut src, &video, scan);
+            }
         }
         if let Ok(track) = mkv::read(&mut src, scan) {
             let _ = carriages(&mut src, &track, scan);

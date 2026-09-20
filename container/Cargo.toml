@@ -5,8 +5,13 @@ edition = "2021"
 description = "Reading the samples and the file index of MP4 and Matroska, natively, for ffrwd-index-core"
 license = "Apache-2.0"
 
-# No dependencies, for the reason `core` has none and one of its own:
-# this parses files nobody here wrote, and every byte it touches should
-# be answerable to a test in this workspace.
+# The boxes of an ISO base media file are `ffrwd-bmff`'s and the NAL
+# units and OBUs inside a sample are `ffrwd-nal`'s; both are
+# dependency-free, forbid unsafe code and are fuzzed and truncated
+# against real files in their own repositories. What is left here is
+# Matroska, which nothing else on this machine reads, and the prefix
+# scan, which is the one place the two layers meet.
 [dependencies]
+ffrwd-bmff = { workspace = true }
 ffrwd-index-core = { path = "../core" }
+ffrwd-nal = { workspace = true }

@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use ffrwd_index_core::carriage;
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody};
-use ffrwd_index_core::obu;
 use ffrwd_index_core::quant::Planes;
+use ffrwd_nal::{h26x, obu, Codec};
 
 /// Names the sidecar built from the `packet-filter` branch.
 const SIDECAR_ENV: &str = "FFRWD_WASM";
@@ -958,7 +959,7 @@ fn read_av1(mp4: &Path, dir: &Path) -> Vec<BTreeMap<String, String>> {
     let mut out = Vec::new();
     for (index, unit) in units.iter().enumerate() {
         let carrier_ms = (index as f64 * 1000.0 / f64::from(FPS)).round();
-        for payload in obu::units_obu(&bytes[unit.start..unit.end]) {
+        for payload in carriage::units_obu(&bytes[unit.start..unit.end]) {
             let Ok(decoded) = Unit::decode(&payload) else {
                 continue;
             };
@@ -1300,11 +1301,8 @@ fn a_budget_spreads_a_record_across_carriers_as_slices() {
 fn fragments(stream: &Path) -> usize {
     let bytes = std::fs::read(stream).expect("read the stream");
     let mut count = 0usize;
-    for au in ffrwd_index_core::avc::access_units(&bytes, ffrwd_index_core::avc::Codec::H264) {
-        for raw in ffrwd_index_core::avc::units_annexb(
-            &bytes[au.start..au.end],
-            ffrwd_index_core::avc::Codec::H264,
-        ) {
+    for au in h26x::access_units(&bytes, Codec::H264) {
+        for raw in carriage::units_annexb(&bytes[au.start..au.end], Codec::H264) {
             let Ok(unit) = Unit::decode(&raw) else {
                 continue;
             };

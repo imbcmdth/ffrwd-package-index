@@ -13,7 +13,7 @@
 //! carrier a record rides is `ffrwd_index_rows::weave`, the bytes are
 //! `ffrwd_index_core`, and both are tested on the native target where a
 //! failure says something. What is here is the wit boundary, the params
-//! ([`params`]) and the framing ([`stream`]).
+//! ([`params`]) and the framing (`ffrwd_nal::config::Framing`).
 //!
 //! Two things the interface asks for and this module owes it:
 //!
@@ -43,10 +43,10 @@ use exports::ffrwd::av::packet_filter::{
 
 use ffrwd_index_core::message::{Message, Unit};
 use ffrwd_index_core::placement::Placement;
-use ffrwd_index_core::UNIT_SOFT_LIMIT;
+use ffrwd_index_core::{SELECT, UNIT_SOFT_LIMIT};
 use ffrwd_index_rows::weave::{Config, Reorder, Weaver, MAX_HELD_PACKETS};
 
-use ffrwd_index_rows::stream::{self, Framing};
+use ffrwd_nal::config::{framing_of, Framing, CODECS};
 
 const ROWS_SCHEMA: &str = r#"{
   "type": "object",
@@ -140,7 +140,7 @@ impl Guest for Weave {
                 channel_counts: vec![],
                 rows_language: vec![],
             },
-            video_codecs: stream::CODECS.iter().map(|name| name.to_string()).collect(),
+            video_codecs: CODECS.iter().map(|name| name.to_string()).collect(),
             audio_codecs: vec![],
             video: Arity::One,
             audio: Arity::Zero,
@@ -159,7 +159,8 @@ impl Guest for Weave {
         }
         let config = params::read(&params)?;
         let coded = streams[0].coded.clone();
-        let framing = stream::framing_of(&coded.codec, &coded.extradata)?;
+        let framing = framing_of(&coded.codec, &coded.extradata)
+            .map_err(|_| format!("weave writes {} and not {}", CODECS.join(", "), coded.codec))?;
         if coded.time_base.den <= 0 || coded.time_base.num <= 0 {
             return Err(format!(
                 "a time base of {}/{} is not a fraction of a second",
@@ -368,7 +369,9 @@ fn weave_into(framing: Framing, packet: &[u8], messages: &[Message]) -> Result<V
     let mut out = packet.to_vec();
     for batch in batches(messages) {
         let unit = Unit::new(batch).encode();
-        out = stream::insert(framing, &out, &unit)?;
+        out = framing
+            .insert(&out, &unit, SELECT)
+            .map_err(|err| err.to_string())?;
     }
     Ok(out)
 }

@@ -21,31 +21,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "ffrwd-bmff"
+version = "0.1.0"
+source = "git+https://github.com/imbcmdth/ffrwd-bmff?tag=v0.1.0#23b93ab305baed9adc2d92fa13047f14a45ec7c7"
+
+[[package]]
 name = "ffrwd-index"
 version = "0.1.0"
 dependencies = [
+ "ffrwd-bmff",
  "ffrwd-index-container",
  "ffrwd-index-core",
  "ffrwd-index-rows",
+ "ffrwd-nal",
 ]
 
 [[package]]
 name = "ffrwd-index-container"
 version = "0.1.0"
 dependencies = [
+ "ffrwd-bmff",
  "ffrwd-index-core",
+ "ffrwd-nal",
 ]
 
 [[package]]
 name = "ffrwd-index-core"
 version = "0.1.0"
+dependencies = [
+ "ffrwd-nal",
+]
 
 [[package]]
 name = "ffrwd-index-rows"
 version = "0.1.0"
 dependencies = [
  "ffrwd-index-core",
+ "ffrwd-nal",
 ]
+
+[[package]]
+name = "ffrwd-nal"
+version = "0.1.0"
+source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b8364369bbc0b24df7220b96eb8"
 
 [[package]]
 name = "foldhash"
@@ -155,6 +173,7 @@ version = "0.1.0"
 dependencies = [
  "ffrwd-index-core",
  "ffrwd-index-rows",
+ "ffrwd-nal",
  "wit-bindgen",
 ]
 
@@ -212,6 +231,7 @@ version = "0.1.0"
 dependencies = [
  "ffrwd-index-core",
  "ffrwd-index-rows",
+ "ffrwd-nal",
  "wit-bindgen",
 ]
 
@@ -289,6 +309,7 @@ version = "0.1.0"
 dependencies = [
  "ffrwd-index-core",
  "ffrwd-index-rows",
+ "ffrwd-nal",
  "wit-bindgen",
 ]
 

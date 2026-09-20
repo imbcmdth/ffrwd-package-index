@@ -1,9 +1,15 @@
 [workspace]
-# `core` is the codec: plain Rust, no I/O, no dependencies. `rows` is
-# the JSON both callers of it speak, which is theirs and not the
-# format's, plus the two state machines over it: weaving and reading.
-# `container` is MP4 and Matroska, which only a program with a file
-# needs. `weave`, `records` and `spaces` are the ffrwd modules, thin
+# `core` is the codec: the index format's messages, quantisation and
+# placement, and nothing below them. The byte level it rides on lives
+# in two shared crates, `ffrwd-nal` for NAL units and OBUs and
+# `ffrwd-bmff` for ISO base media boxes; both are dependency-free and
+# build for the same wasm32 targets these modules do, and this
+# workspace holds only the format. `rows` is the JSON both callers of
+# `core` speak, which is theirs and not the format's, plus the two
+# state machines over it: weaving and reading. `container` is what is
+# left of reading a file once `ffrwd-bmff` has the boxes: the Matroska
+# reader and the sample-prefix scan, which needs NAL knowledge.
+# `weave`, `records` and `spaces` are the ffrwd modules, thin
 # wasm32-wasip2 cdylibs over the first two: one packet filter that
 # writes and two packet sinks that read. `tool` is the native command
 # line over all of it, which reads and writes files and so is never
@@ -29,6 +35,13 @@ default-members = [
     "tool",
 ]
 resolver = "2"
+
+# The byte level, shared with the other ffrwd packages that used to
+# carry their own copy of it. Pinned to a tag: these are the bytes on
+# disk this workspace's tests are written against.
+[workspace.dependencies]
+ffrwd-bmff = { git = "https://github.com/imbcmdth/ffrwd-bmff", tag = "v0.1.0" }
+ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }
 
 [profile.release]
 opt-level = 3

@@ -42,7 +42,7 @@ use exports::ffrwd::av::packet_sink::{
 };
 
 use ffrwd_index_rows::read::Reader;
-use ffrwd_index_rows::stream::{framing_of, Framing, CODECS};
+use ffrwd_nal::config::{framing_of, Framing, CODECS};
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 
@@ -183,7 +183,11 @@ fn open(streams: &[InputStream], params: &str, name: &str) -> Result<Framing, St
         ));
     }
     let coded = &streams[0].coded;
+    // `ffrwd-nal` refuses a codec it has no framing for without
+    // formatting a string; which module is asking is this module's to
+    // say.
     framing_of(&coded.codec, &coded.extradata)
+        .map_err(|_| format!("{name} reads {} and not {}", CODECS.join(", "), coded.codec))
 }
 
 fn no_params(params: &str, name: &str) -> Result<(), String> {

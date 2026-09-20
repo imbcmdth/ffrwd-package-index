@@ -26,6 +26,14 @@
 //! unpacking it would mean deciding which of several frames a record
 //! rode. A laced video block is refused by name.
 //!
+//! **What is shared.** The reader is `ffrwd_bmff::source::Source`, the
+//! same counted reader the MP4 side uses, so a keyframe scan's cost is
+//! counted the same way whichever container it read; a block becomes
+//! `ffrwd_bmff::track::Sample`, so one prefix scan serves both; and the
+//! NAL length an `avcC` or `hvcC` declares is read by `ffrwd_nal`.
+//! Nothing about EBML is in either crate, and nothing about Matroska is
+//! here twice.
+//!
 //! **Unknown sizes.** A live writer does not know how long a `Segment`
 //! or a `Cluster` will be and writes the all-ones length for it.
 //! `ffmpeg -live 1` writes an unknown-size `Segment`; some writers do
@@ -36,10 +44,11 @@
 
 use std::io::{Read, Seek};
 
-use ffrwd_index_core::avc::{avcc_length_size, hvcc_length_size};
+use ffrwd_bmff::source::Source;
+use ffrwd_bmff::track::Sample;
 use ffrwd_index_core::index::MATROSKA_MIME;
 
-use crate::{Error, Result, Sample, Scan, Source, TrackCodec, VideoTrack};
+use crate::{Error, Result, Scan, Video};
 
 pub const ID_EBML: u32 = 0x1A45_DFA3;
 pub const ID_SEGMENT: u32 = 0x1853_8067;
@@ -338,7 +347,7 @@ fn body_of<R: Read + Seek>(src: &mut Source<R>, span: (u64, u64)) -> Result<Vec<
             "an element larger than this reader will hold",
         ));
     }
-    src.span(span.0, len)
+    Ok(src.span(span.0, len)?)
 }
 
 /// One child of a body already in hand: what it is, where in that body
@@ -387,10 +396,14 @@ fn field<'a>(list: &[Child<'a>], wanted: u32) -> Option<&'a [u8]> {
 }
 
 /// What the `Tracks` element says about the video track.
+///
+/// `entry` is the four characters the same codec's MP4 sample entry
+/// would carry, so that one function decides the framing for both
+/// containers.
 #[derive(Clone, Debug)]
 struct TrackInfo {
     number: u64,
-    codec: TrackCodec,
+    entry: [u8; 4],
     private: Vec<u8>,
 }
 
@@ -413,10 +426,10 @@ fn track_info(tracks: &[u8]) -> Result<TrackInfo> {
                     .to_string()
             })
             .unwrap_or_default();
-        let codec = match name.as_str() {
-            "V_MPEG4/ISO/AVC" => TrackCodec::H264,
-            "V_MPEGH/ISO/HEVC" => TrackCodec::H265,
-            "V_AV1" => TrackCodec::Av1,
+        let entry = match name.as_str() {
+            "V_MPEG4/ISO/AVC" => *b"avc1",
+            "V_MPEGH/ISO/HEVC" => *b"hvc1",
+            "V_AV1" => *b"av01",
             other => {
                 return Err(Error::Unsupported(format!(
                     "the video track is {other}, which this format has no carriage for"
@@ -428,7 +441,7 @@ fn track_info(tracks: &[u8]) -> Result<TrackInfo> {
         // laced is what gets refused, in `block_header`.
         return Ok(TrackInfo {
             number,
-            codec,
+            entry,
             private: field(&fields, ID_CODEC_PRIVATE)
                 .unwrap_or_default()
                 .to_vec(),
@@ -574,12 +587,22 @@ fn walk_cluster<R: Read + Seek>(
     Ok(out)
 }
 
+/// One block as a sample.
+///
+/// Matroska stores presentation time and nothing else, so `dts` is
+/// `pts`: there is no composition offset to take back off, and a
+/// reader that wants decode order has the order the blocks are in.
+/// `duration` is left at zero, which is what "the file did not say"
+/// means in the shared `Sample`.
 fn sample_of(block: RawBlock, cluster_timestamp: i64) -> Sample {
+    let pts = cluster_timestamp + block.relative;
     Sample {
         index: 0,
         offset: block.offset,
         size: block.size,
-        pts: cluster_timestamp + block.relative,
+        dts: pts,
+        pts,
+        duration: 0,
         keyframe: block.keyframe,
     }
 }
@@ -626,7 +649,7 @@ fn cue_clusters(cues: &[u8], segment_body: u64, track: u64) -> Result<Vec<(u64, 
 /// full walk of every block into one seek per cued cluster. A file with
 /// no cues, which is what a live writer produces, falls back to the
 /// full walk and keeps the keyframes.
-pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrack> {
+pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<Video> {
     let seg = segment(src)?;
     let map = outline(src, seg)?;
     let tracks = map
@@ -694,7 +717,7 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
                     keyframes_only,
                     None,
                 )?);
-                if samples.len() > crate::mp4::MAX_SAMPLES {
+                if samples.len() > ffrwd_bmff::MAX_SAMPLES {
                     return Err(Error::Format("more samples than this reader will hold"));
                 }
             }
@@ -706,18 +729,13 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<VideoTrac
     for (index, sample) in samples.iter_mut().enumerate() {
         sample.index = index as u32;
         sample.pts *= multiplier;
+        sample.dts = sample.pts;
     }
 
-    let length_size = match info.codec {
-        TrackCodec::H264 => Some(avcc_length_size(&info.private)),
-        TrackCodec::H265 => Some(hvcc_length_size(&info.private)),
-        TrackCodec::Av1 => None,
-    };
-    Ok(VideoTrack {
-        codec: info.codec,
+    Ok(Video {
+        framing: crate::framing_of(&info.entry, &info.private)?,
         timescale,
-        length_size,
-        codec_private: info.private,
+        config: info.private,
         samples,
         start_shift: 0,
     })
@@ -876,8 +894,13 @@ mod tests {
         {
             let mut src = source(file(segment_unknown, cluster_unknown));
             let track = read(&mut src, Scan::All).expect("a track");
-            assert_eq!(track.codec, TrackCodec::H264);
-            assert_eq!(track.length_size, Some(4));
+            assert_eq!(
+                track.framing,
+                ffrwd_nal::config::Framing::LengthPrefixed {
+                    codec: ffrwd_nal::Codec::H264,
+                    length_size: 4
+                }
+            );
             assert_eq!(track.timescale, 1000, "a millisecond a tick");
             let times: Vec<i64> = track.samples.iter().map(|sample| sample.pts).collect();
             assert_eq!(

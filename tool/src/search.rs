@@ -18,8 +18,10 @@
 
 use std::collections::BTreeMap;
 
+use ffrwd_bmff::patch;
+use ffrwd_bmff::source::{Source, Tally};
 use ffrwd_index_container::scan::Scan;
-use ffrwd_index_container::{mkv, mp4, Kind, Source, Tally};
+use ffrwd_index_container::{mkv, Kind, INDEX_BOX};
 use ffrwd_index_core::assemble::{Assembler, Limits};
 use ffrwd_index_core::index::FileIndex;
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody};
@@ -342,7 +344,7 @@ fn index_of(path: &str) -> Result<Option<(FileIndex, Tally)>, String> {
     let mut src = Source::new(file).map_err(|err| format!("{path}: {err}"))?;
     let kind = ffrwd_index_container::kind_of(&mut src).map_err(|err| format!("{path}: {err}"))?;
     let found = match kind {
-        Kind::Mp4 => mp4::read_index(&mut src),
+        Kind::Mp4 => patch::read(&mut src, INDEX_BOX).map_err(Into::into),
         Kind::Matroska => mkv::read_index(&mut src),
     }
     .map_err(|err| format!("{path}: {err}"))?;

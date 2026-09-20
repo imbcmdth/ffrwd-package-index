@@ -175,7 +175,9 @@ for the shape), shipped in the `ffrwd/index` package and run by the sidecar at
 compile time. The sidecar is the wasm host; it already reads coded NUT with
 each packet's pts and hands packets to a sink, so nothing native is added to
 it, nothing is published to crates.io, and ffrwd needs no extra binary. `core`
-has no dependencies and compiles to wasm as it is.
+compiles to wasm as it is: its one dependency is `ffrwd-nal`, which is the
+byte level shared with the other ffrwd packages and has no dependencies of its
+own.
 
 The pipe format is NUT for the same reason it is everywhere else in ffrwd: it
 carries timestamps. A raw elementary stream (`-f h264`) has none, and a reader

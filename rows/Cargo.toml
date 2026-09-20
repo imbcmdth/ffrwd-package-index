@@ -7,3 +7,4 @@ description = "The JSON rows the tool and the weave module read and write, over 
 
 [dependencies]
 ffrwd-index-core = { path = "../core" }
+ffrwd-nal = { workspace = true }

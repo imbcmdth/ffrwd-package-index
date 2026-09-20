@@ -22,12 +22,15 @@
 //! - [`space`]: a SPACE message as a JSON object, both ways.
 //! - [`read`]: packets in, rows out, which is what the two reading
 //!   sinks both do.
-//! - [`stream`]: which framing a pad's packets are in, and getting
-//!   units into and out of one.
 //! - [`vector`]: a vector as JSON numbers or as base64 f32, and the
 //!   body that goes on the wire.
 //! - [`weave`]: rows in, messages on carriers out - the module's whole
 //!   decision, kept here so it is tested on the native target.
+//!
+//! Which framing a pad's packets are in, and getting a payload into
+//! and out of one, is `ffrwd_nal::config::Framing`: the same question
+//! every ffrwd package that touches a coded packet asks, answered once
+//! in a crate with no dependencies of its own.
 //!
 //! Nothing here opens a file or allocates unboundedly on bad input, so
 //! the wasm module compiles it in as happily as the tool does.
@@ -37,6 +40,5 @@
 pub mod json;
 pub mod read;
 pub mod space;
-pub mod stream;
 pub mod vector;
 pub mod weave;

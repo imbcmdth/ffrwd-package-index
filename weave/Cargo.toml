@@ -9,7 +9,9 @@ description = "The ffrwd/index packet filter: embedding vectors woven into an en
 name = "weave"
 crate-type = ["cdylib"]
 
-# wit-bindgen and the two crates of this workspace, and nothing else.
+# wit-bindgen, the two crates of this workspace, and `ffrwd-nal` for
+# the framing of a coded packet, which is shared with the other ffrwd
+# packages rather than copied here and has no dependencies of its own.
 # There is no serde here: `ffrwd-index-rows` already reads and writes
 # the JSON this module speaks, and a second reader of the same rows is
 # a second thing to keep in step.
@@ -17,3 +19,4 @@ crate-type = ["cdylib"]
 wit-bindgen = "0.57.1"
 ffrwd-index-core = { path = "../core" }
 ffrwd-index-rows = { path = "../rows" }
+ffrwd-nal = { workspace = true }

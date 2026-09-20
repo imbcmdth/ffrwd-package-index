@@ -3,7 +3,7 @@
 //!
 //! This is the live case the `next` placement exists for. The stream
 //! grows, never seeks and has no end, so nothing here may wait for one:
-//! bytes are cut into carriers as they arrive ([`live::Feed`]), each
+//! bytes are cut into carriers as they arrive (`ffrwd_nal::feed::Feed`), each
 //! carrier's messages go into the assembler, and only the records that
 //! carrier touched are scored. A record that passes the threshold is
 //! printed and flushed at once, and is not printed again when a later
@@ -32,9 +32,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 
 use ffrwd_index_core::assemble::{Assembler, Limits};
-use ffrwd_index_core::live::{Feed, StreamKind};
+use ffrwd_index_core::carriage;
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody};
 use ffrwd_index_rows::json::{number, object, string, Json};
+use ffrwd_nal::feed::StreamKind;
 
 use crate::search::{cosine, read_query};
 use crate::{planes_row, Flags, Stream};
@@ -113,7 +114,7 @@ fn run(
     threshold: f32,
     min_planes: u8,
 ) -> Result<(), String> {
-    let mut feed = Feed::new(kind);
+    let mut feed = carriage::feed(kind);
     // The live ceilings, not a file reader's: this holds while a stream
     // runs and nothing here may grow with it.
     let mut assembler = Assembler::new(Limits::default());
@@ -139,7 +140,7 @@ fn run(
                 &mut assembler,
                 &mut declared,
                 &mut said,
-                &carrier.units,
+                &carrier.payloads,
                 time_ms,
                 queries,
                 threshold,

@@ -5,7 +5,12 @@ edition = "2021"
 description = "The ffrwd index format: messages, the layered 8-bit encoding, and carriage in H.264, HEVC and AV1"
 license = "Apache-2.0"
 
-# No dependencies on purpose. The f16 conversions are twenty lines and
-# the crate has to build for wasm32 targets a packet filter runs on,
-# where every added crate is a build to keep working.
+# One dependency: the byte level of H.264, HEVC and AV1, which used to
+# be copied in here and now lives in `ffrwd-nal`, shared with the other
+# ffrwd packages that had their own copy of it. That crate has no
+# dependencies of its own, forbids unsafe code and builds for the
+# wasm32 targets a packet filter runs on, which is what the empty list
+# here was protecting. Everything else stays hand-written: the f16
+# conversions are twenty lines.
 [dependencies]
+ffrwd-nal = { workspace = true }

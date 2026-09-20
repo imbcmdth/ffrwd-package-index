@@ -3,7 +3,8 @@
 //! A packet sink is handed the encoder's own output, one access unit at
 //! a time with the timestamp the container will carry. Taking this
 //! format back out of it is the mirror of weaving it in: find the units
-//! in front of the picture ([`crate::stream::units_in`]), push their
+//! in front of the picture (`ffrwd_nal::config::Framing::payloads`),
+//! push their
 //! messages at [`Assembler`], and answer rows for what comes back
 //! together. The bytes of the picture are never looked at.
 //!
@@ -31,9 +32,11 @@ use std::collections::BTreeMap;
 use ffrwd_index_core::assemble::{Assembler, Limits, Record};
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody};
 
+use ffrwd_index_core::SELECT;
+use ffrwd_nal::config::Framing;
+
 use crate::json::{float, number, object, string, Json};
 use crate::space::hex;
-use crate::stream::{units_in, Framing};
 use crate::vector::plane_numbers;
 
 /// How many records a sink holds while their planes arrive.
@@ -77,7 +80,7 @@ impl Spaces {
     pub fn packet(&mut self, data: &[u8]) -> Vec<Space> {
         self.packets += 1;
         let mut fresh = Vec::new();
-        for bytes in units_in(self.framing, data) {
+        for bytes in self.framing.payloads(data, SELECT) {
             let Ok(unit) = Unit::decode(&bytes) else {
                 continue;
             };
@@ -148,7 +151,7 @@ impl Reader {
         self.packets += 1;
         let carrier_ms = to_ms(pts, self.num, self.den);
         let mut fresh = Vec::new();
-        for bytes in units_in(self.framing, data) {
+        for bytes in self.framing.payloads(data, SELECT) {
             // A unit of a version this build does not know, or one that
             // belongs to somebody else, is not an error: it is somebody
             // else's business.
@@ -301,10 +304,11 @@ fn seconds(ms: i64) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffrwd_index_core::avc::{self, Codec};
+    use ffrwd_index_core::carriage;
     use ffrwd_index_core::message::Encoding;
     use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
     use ffrwd_index_core::quant::Planes;
+    use ffrwd_nal::Codec;
 
     fn space(id: u8, dims: u32) -> Space {
         let mut space = Space::new(id, dims, Encoding::I8);
@@ -326,7 +330,10 @@ mod tests {
         let mut out: Vec<u8> = vec![0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a, 0x96];
         if !messages.is_empty() {
             out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&avc::wrap_unit(&Unit::new(messages).encode(), Codec::H264));
+            out.extend_from_slice(&carriage::wrap_unit(
+                &Unit::new(messages).encode(),
+                Codec::H264,
+            ));
         }
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.push(if keyframe { 0x65 } else { 0x41 });

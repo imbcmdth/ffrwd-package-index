@@ -6,6 +6,15 @@
 //! filter that will weave inside a pipeline and the command line tool
 //! in `tool/` can both compile it in.
 //!
+//! Where the bytes of a coded stream begin and end is not this crate's
+//! question and is not answered here. `ffrwd-nal` cuts H.264, HEVC and
+//! AV1 into NAL units, OBUs, access units and temporal units, finds and
+//! places `user_data_unregistered` SEI messages and metadata OBUs of
+//! any payload, and has no dependencies, no unsafe code and no opinion
+//! about what a payload means. What this crate brings is the format:
+//! the [`UUID`] a unit opens with, the [`METADATA_TYPE`] the AV1
+//! spelling rides in, and the [`SELECT`] built from the two.
+//!
 //! The modules follow the spec:
 //!
 //! - [`wire`]: varint, svarint, str, and a bounds-checked reader.
@@ -13,10 +22,7 @@
 //! - [`quant`]: the layered 8-bit encoding, section 5.
 //! - [`fragment`]: slicing a VECTOR value to a budget, section 6.
 //! - [`assemble`]: what a reader feeds messages to.
-//! - [`avc`]: H.264 and HEVC carriage, section 7.
-//! - [`obu`]: AV1 carriage, section 7.
-//! - [`live`]: the same carriage read a chunk at a time, for a stream
-//!   that is still being written.
+//! - [`carriage`]: section 7 named for this format, over `ffrwd-nal`.
 //! - [`placement`]: where a writer puts what, section 7.
 //! - [`index`]: the file index, section 8.
 //!
@@ -27,12 +33,10 @@
 #![forbid(unsafe_code)]
 
 pub mod assemble;
-pub mod avc;
+pub mod carriage;
 pub mod fragment;
 pub mod index;
-pub mod live;
 pub mod message;
-pub mod obu;
 pub mod placement;
 pub mod quant;
 pub mod wire;
@@ -42,6 +46,17 @@ pub mod wire;
 pub const UUID: [u8; 16] = [
     0x04, 0x1f, 0x74, 0xa3, 0x80, 0x90, 0x5e, 0x08, 0xbc, 0xfc, 0x76, 0x4d, 0xf2, 0xdc, 0xd4, 0x66,
 ];
+
+/// The AV1 `metadata_type` this format's units ride in, from section 7.
+///
+/// 25 is inside the range 6 to 31 the AV1 specification leaves for
+/// unregistered private use, so no registration is needed and the
+/// [`UUID`] inside tells this format's OBUs from anyone else's.
+pub const METADATA_TYPE: u64 = 25;
+
+/// Which of a stream's payloads are this format's, for the one
+/// `ffrwd-nal` call that needs both halves of the answer.
+pub const SELECT: ffrwd_nal::Select = ffrwd_nal::Select::new(UUID, METADATA_TYPE);
 
 /// The format version this crate writes and reads.
 pub const VERSION: u8 = 1;
@@ -130,6 +145,26 @@ impl core::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// What `ffrwd-nal` says went wrong, in this crate's words.
+///
+/// The shared crate carries the offset the trouble was found at and
+/// this one does not: a reader of this format drops the message it was
+/// in and carries on, and where in a NAL that message sat tells it
+/// nothing it can act on. The offsets are still there for a caller that
+/// holds the `ffrwd_nal::Error` itself.
+impl From<ffrwd_nal::Error> for Error {
+    fn from(err: ffrwd_nal::Error) -> Self {
+        match err {
+            ffrwd_nal::Error::Truncated { .. } => Error::Truncated,
+            ffrwd_nal::Error::TooLarge { .. } => Error::TooLarge,
+            ffrwd_nal::Error::Malformed { what, .. } => Error::Malformed(what),
+            ffrwd_nal::Error::UnknownCodec => {
+                Error::Malformed("a codec this format has no carriage for")
+            }
+        }
+    }
+}
 
 /// The crate's result.
 pub type Result<T> = core::result::Result<T, Error>;

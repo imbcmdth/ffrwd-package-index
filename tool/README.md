@@ -7,6 +7,14 @@ stream. The rows below are read by the same code the `weave` module
 reads its spaces and vectors with, so a space declared to one means the
 same thing to the other.
 
+The bytes under all of that are two shared crates rather than this
+repository's own code: [`ffrwd-nal`](https://github.com/imbcmdth/ffrwd-nal)
+cuts a coded stream into NAL units and OBUs and carries a payload in
+one, and [`ffrwd-bmff`](https://github.com/imbcmdth/ffrwd-bmff) reads an
+MP4's samples and puts the index box into a file. Neither has
+dependencies of its own. What is here is the format: which UUID, which
+messages, where they go, and what a row means.
+
 ```
 ffrwd-index weave --video IN --vectors ROWS.ndjson --out OUT
                   [--placement keyframe|next|spread:BYTES]
@@ -438,6 +446,11 @@ and the `mdat` stay where they are, the pictures are the same bytes,
 and writing it costs one append whatever the file's size. Reading it
 back is one read near the end of the file, and only if that misses are
 the top-level boxes walked.
+
+Finding, appending, replacing and rewriting the box is
+`ffrwd_bmff::patch`, which takes a selector and a payload and knows
+nothing about this format. What this repository says about MP4 is one
+constant: the selector is this format's UUID.
 
 Checked against real ffmpeg, on a plain file, a `+faststart` file and a
 fragmented one: `framemd5` is unchanged to the byte, `ffprobe` at
