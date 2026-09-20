@@ -1,0 +1,16 @@
+{
+  "format_version": 3,
+  "reproducible": true,
+  "dependencies": {
+    "ffrwd/wasm": "0.16.0"
+  },
+  "packages": [
+    {
+      "kind": "registry",
+      "name": "ffrwd/wasm",
+      "version": "0.16.0",
+      "sha256": "1df62507e7a9d59ccecde4f12e7f432895dc60b40e328ffb8d7298af07a6de9f",
+      "store": "v1/1d/1df62507e7a9d59ccecde4f12e7f432895dc60b40e328ffb8d7298af07a6de9f"
+    }
+  ]
+}

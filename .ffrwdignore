@@ -1,0 +1,24 @@
+# What sits at the package root and is not package content. The archive is
+# the manifest's closure plus "files", so none of this would ship anyway;
+# naming it here is what says the omission was decided rather than forgotten.
+
+# The Rust workspace. The three .wasm files src/index.sql names are pulled
+# back in by the closure; the sources that built them, and the native tool,
+# are read on GitHub.
+Cargo.toml
+Cargo.lock
+core/
+rows/
+container/
+weave/
+records/
+spaces/
+tool/
+
+# The worked example, which is a pointer to ffrwd/describe's own recipes and
+# a set of numbers, not something an installed package runs.
+examples/
+
+# Local development state: which archive of each dependency this checkout
+# resolved to, which a consumer solves for itself.
+ffrwd.lock

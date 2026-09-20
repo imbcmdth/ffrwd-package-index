@@ -7,6 +7,10 @@
   "dependencies": {
     "ffrwd/wasm": "0.16.0"
   },
+  "files": [
+    "SPEC.md",
+    "MEASUREMENTS.md"
+  ],
   "keywords": [
     "embedding",
     "vector",
