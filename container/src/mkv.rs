@@ -908,7 +908,8 @@ mod tests {
             let track = read(&mut src, Scan::All).expect("a track");
             assert_eq!(&track.entry.kind, b"avc1");
             assert_eq!(
-                crate::framing_of(&track.entry.kind, &track.entry.config).expect("a framing"),
+                ffrwd_nal::config::framing_of_entry(&track.entry.kind, &track.entry.config)
+                    .expect("a framing"),
                 ffrwd_nal::config::Framing::LengthPrefixed {
                     codec: ffrwd_nal::Codec::H264,
                     length_size: 4
@@ -959,6 +960,40 @@ mod tests {
                 "the sync samples alone, segment unknown {segment_unknown},                  cluster unknown {cluster_unknown}"
             );
         }
+    }
+
+    /// A record too short to declare its NAL width is refused, with the
+    /// byte it gave up at, where it used to be read as four bytes wide.
+    ///
+    /// The track still reads: where the samples are and when they are
+    /// shown is Matroska's own business and no record was needed for it.
+    /// It is the scan that stops, because walking a length-prefixed
+    /// sample by a width nothing in the file supports is a guess, and a
+    /// guess here reads a picture as a NAL header.
+    #[test]
+    fn a_configuration_record_too_short_to_read_stops_the_scan() {
+        let mut body = element(ID_INFO, &element(ID_TIMESTAMP_SCALE, &[0x0f, 0x42, 0x40]));
+        // An avcC of two bytes: a configuration version and a profile,
+        // and nothing where the length size lives at byte 4.
+        body.extend_from_slice(&tracks("V_MPEG4/ISO/AVC", &[1, 0x64]));
+        let mut cluster = element(ID_TIMESTAMP, &[0]);
+        cluster.extend_from_slice(&simple_block(1, 0, true, &[0, 0, 0, 4, 0x65, 1, 2, 3]));
+        body.extend_from_slice(&element(ID_CLUSTER, &cluster));
+        let mut bytes = element(ID_EBML, &[0x42, 0x86, 0x81, 0x01]);
+        bytes.extend_from_slice(&element(ID_SEGMENT, &body));
+
+        let mut src = source(bytes);
+        let track = read(&mut src, Scan::All).expect("a track");
+        assert_eq!(track.samples.len(), 1, "the samples still read");
+        assert_eq!(&track.entry.kind, b"avc1");
+
+        let err = crate::carriages(&mut src, &track, Scan::All).expect_err("a refusal");
+        let said = format!("{err}");
+        assert!(said.contains("avc1"), "{said}");
+        assert!(
+            said.contains("byte 4"),
+            "the refusal does not say where the record gave up: {said}"
+        );
     }
 
     #[test]

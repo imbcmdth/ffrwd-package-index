@@ -33,8 +33,8 @@ use ffrwd_bmff::patch::{self, Placed};
 use ffrwd_bmff::source::Source;
 use ffrwd_bmff::track::{self, Pick, Sample, Track};
 use ffrwd_index_container::scan::{carriages, Scan};
-use ffrwd_index_container::{framing_of, kind_of, mkv, Kind, INDEX_BOX};
-use ffrwd_nal::config::Framing;
+use ffrwd_index_container::{kind_of, mkv, Kind, INDEX_BOX};
+use ffrwd_nal::config::{framing_of_entry, Framing};
 use ffrwd_nal::Codec;
 
 // ---------------------------------------------------------------- //
@@ -409,7 +409,7 @@ fn the_codec_and_its_framing_come_out_of_the_file() {
     ] {
         let track = track_of(name, Scan::Keyframes);
         assert_eq!(
-            framing_of(&track.entry.kind, &track.entry.config).expect("a framing"),
+            framing_of_entry(&track.entry.kind, &track.entry.config).expect("a framing"),
             framing,
             "{name}"
         );

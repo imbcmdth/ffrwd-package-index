@@ -24,14 +24,15 @@
 //! Finding where the leading units end is the only part of this that
 //! `ffrwd-nal` does not do, and deliberately: that crate is handed
 //! whole packets, and a half-read sample is the container reader's own
-//! problem. Everything after the cut is the shared crate's.
+//! problem. Everything after the cut is the shared crate's, the framing
+//! the sample entry declares included.
 
 use std::io::{Read, Seek};
 
 use ffrwd_bmff::source::Source;
 use ffrwd_bmff::track::{Sample, Track};
 use ffrwd_index_core::SELECT;
-use ffrwd_nal::config::Framing;
+use ffrwd_nal::config::{self, Framing};
 use ffrwd_nal::{obu, Codec};
 
 use crate::{Error, Result};
@@ -111,7 +112,7 @@ pub fn carriages<R: Read + Seek>(
     track: &Track,
     scan: Scan,
 ) -> Result<Vec<Carriage>> {
-    let framing = crate::framing_of(&track.entry.kind, &track.entry.config)?;
+    let framing = framing_of(track)?;
     let mut out = Vec::new();
     for sample in scan.samples(track) {
         out.push(Carriage {
@@ -124,13 +125,39 @@ pub fn carriages<R: Read + Seek>(
     Ok(out)
 }
 
+/// How a track's samples are framed, or why they cannot be read.
+///
+/// `ffrwd_nal::config::framing_of_entry` answers both: which framing
+/// the four characters and the record declare, and, when the record
+/// will not read, the byte it gave up at. What it does not have is the
+/// four characters to print, because it was handed them and kept only
+/// the answer. This crate has them, so the sentence is built here.
+///
+/// A record too short or too damaged to declare its width is refused
+/// rather than read as four bytes wide, which is what the private copy
+/// of this function used to do. A sample entry has already said the
+/// samples are length-prefixed; a broken record means the width is
+/// unknown, and a scan that guessed it would walk a sample by numbers
+/// nothing in the file supports.
+fn framing_of(track: &Track) -> Result<Framing> {
+    let kind = String::from_utf8_lossy(&track.entry.kind);
+    config::framing_of_entry(&track.entry.kind, &track.entry.config).map_err(|err| match err {
+        ffrwd_nal::Error::UnknownCodec => Error::Unsupported(format!(
+            "the video track is {kind}, which this format has no carriage for"
+        )),
+        other => Error::Unsupported(format!(
+            "the {kind} track's configuration record does not say how its samples are framed:              {other}"
+        )),
+    })
+}
+
 /// The units in front of one sample's picture.
 pub fn units_of<R: Read + Seek>(
     src: &mut Source<R>,
     track: &Track,
     sample: &Sample,
 ) -> Result<Vec<Vec<u8>>> {
-    let framing = crate::framing_of(&track.entry.kind, &track.entry.config)?;
+    let framing = framing_of(track)?;
     prefix_units(src, framing, sample)
 }
 
@@ -180,8 +207,9 @@ fn lead_end(prefix: &[u8], complete: bool, framing: Framing) -> Result<Option<us
             lead_end_nals(prefix, complete, length_size, codec)
         }
         Framing::Av1 => lead_end_obus(prefix, complete),
-        // A sample entry never says Annex B, and `crate::framing_of` is
-        // where a scan's framing comes from, so this is unreachable
+        // A sample entry never says Annex B: `framing_of_entry` reads
+        // the entry and answers one of the other two or refuses, and it
+        // is where a scan's framing comes from. This is unreachable
         // rather than a case with bytes behind it.
         Framing::AnnexB(_) => Err(Error::Format(
             "a container track framed as an elementary stream",
@@ -417,6 +445,21 @@ mod tests {
         );
         let found = units_of(&mut src, &track, &track.samples[0]).expect("units");
         assert_eq!(found, vec![unit()]);
+    }
+
+    /// What this crate still owns of the question `ffrwd-nal` answers:
+    /// the four characters to print. The shared function is handed them
+    /// and keeps only the answer, so a track it has no carriage for
+    /// comes back as `UnknownCodec` with nothing in it, and the refusal
+    /// a reader sees is built here.
+    #[test]
+    fn a_track_this_format_cannot_carry_is_refused_by_its_entry() {
+        let track = one_track(b"vp09", vec![], vec![sample_at(16)]);
+        let mut src = Source::new(Cursor::new(vec![0u8; 16])).expect("a source");
+        let err = units_of(&mut src, &track, &track.samples[0]).expect_err("a refusal");
+        let said = format!("{err}");
+        assert!(said.contains("vp09"), "{said}");
+        assert!(said.contains("no carriage for"), "{said}");
     }
 
     #[test]

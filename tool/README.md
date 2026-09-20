@@ -138,6 +138,15 @@ big.mp4: scan all: 300 of 300 samples, 83557 of 15564719 bytes read
   (0.54% of the file), 304 seeks
 ```
 
+How wide the length in front of each NAL is comes out of the track's
+own `avcC` or `hvcC`. A record too short or too damaged to say is
+refused, naming the four characters of the sample entry and the byte
+the read gave up at, where it used to be taken as four bytes wide.
+Every record a muxer writes says so, and four is what every one of them
+says; a file where it does not is damaged, and a scan that guessed
+would walk the sample by a number nothing in the file supports and read
+a picture as a NAL header.
+
 Ten seconds of 640x360 with noise over it, fourteen sync samples, six
 records. A keyframe scan of it reads a fifteen hundredth of the file, a
 full scan a two hundredth, and reading the index instead is 4422 bytes
