@@ -163,7 +163,7 @@ impl Stream {
             match self.codec() {
                 Some(codec) => {
                     out.extend_from_slice(&[0, 0, 0, 1]);
-                    out.extend_from_slice(&carriage::wrap_unit_at(
+                    out.extend_from_slice(&sei::write_user_data_at(
                         unit,
                         codec,
                         spot.temporal_id_plus1,

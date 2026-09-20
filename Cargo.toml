@@ -40,7 +40,7 @@ resolver = "2"
 # carry their own copy of it. Pinned to a tag: these are the bytes on
 # disk this workspace's tests are written against.
 [workspace.dependencies]
-ffrwd-bmff = { git = "https://github.com/imbcmdth/ffrwd-bmff", tag = "v0.1.0" }
+ffrwd-bmff = { git = "https://github.com/imbcmdth/ffrwd-bmff", tag = "v0.1.1" }
 ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }
 
 [profile.release]

@@ -31,9 +31,9 @@ use std::sync::OnceLock;
 
 use ffrwd_bmff::patch::{self, Placed};
 use ffrwd_bmff::source::Source;
-use ffrwd_bmff::track::{self, Pick, Sample};
+use ffrwd_bmff::track::{self, Pick, Sample, Track};
 use ffrwd_index_container::scan::{carriages, Scan};
-use ffrwd_index_container::{kind_of, mkv, Kind, Video, INDEX_BOX};
+use ffrwd_index_container::{framing_of, kind_of, mkv, Kind, INDEX_BOX};
 use ffrwd_nal::config::Framing;
 use ffrwd_nal::Codec;
 
@@ -297,17 +297,16 @@ fn source(name: &str) -> Source<Cursor<Vec<u8>>> {
     Source::new(Cursor::new(bytes)).expect("a source")
 }
 
-fn track_of(name: &str, scan: Scan) -> Video {
+fn track_of(name: &str, scan: Scan) -> Track {
     let mut src = source(name);
     video_of(&mut src, scan)
 }
 
-/// The video track of whatever container the bytes are, as a scan
-/// sees it.
-fn video_of<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Video {
+/// The video track of whatever container the bytes are. Both readers
+/// answer the same type, which is the point of `Track::from_parts`.
+fn video_of<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Track {
     match kind_of(src).expect("a container") {
-        Kind::Mp4 => Video::of_track(&track::read(src, Pick::Video).expect("an MP4 track"))
-            .expect("a codec this format carries"),
+        Kind::Mp4 => track::read(src, Pick::Video).expect("an MP4 track"),
         Kind::Matroska => mkv::read(src, scan).expect("a Matroska track"),
     }
 }
@@ -409,8 +408,15 @@ fn the_codec_and_its_framing_come_out_of_the_file() {
         ("av1.webm", Framing::Av1),
     ] {
         let track = track_of(name, Scan::Keyframes);
-        assert_eq!(track.framing, framing, "{name}");
-        assert!(!track.config.is_empty(), "{name}: no out-of-band header");
+        assert_eq!(
+            framing_of(&track.entry.kind, &track.entry.config).expect("a framing"),
+            framing,
+            "{name}"
+        );
+        assert!(
+            !track.entry.config.is_empty(),
+            "{name}: no out-of-band header"
+        );
     }
 }
 
@@ -458,8 +464,8 @@ fn a_matroska_keyframe_scan_finds_what_a_full_walk_would() {
             .map(|sample| sample.pts)
             .collect();
         let fast = track_of(name, Scan::Keyframes);
-        let found: Vec<i64> = fast
-            .scanned(Scan::Keyframes)
+        let found: Vec<i64> = Scan::Keyframes
+            .samples(&fast)
             .iter()
             .map(|sample| sample.pts)
             .collect();
@@ -467,7 +473,7 @@ fn a_matroska_keyframe_scan_finds_what_a_full_walk_would() {
         // And they really are the same blocks, not ones that happen to
         // be shown at the same time.
         let keys: Vec<&Sample> = all.samples.iter().filter(|s| s.keyframe).collect();
-        for (taken, want) in fast.scanned(Scan::Keyframes).iter().zip(keys) {
+        for (taken, want) in Scan::Keyframes.samples(&fast).iter().zip(keys) {
             assert_eq!(taken.offset, want.offset, "{name}");
             assert_eq!(taken.size, want.size, "{name}");
         }
@@ -593,9 +599,7 @@ fn every_parser(bytes: Vec<u8>) {
     let _ = mkv::read_index(&mut src);
     for scan in [Scan::Keyframes, Scan::All] {
         if let Ok(track) = track::read(&mut src, Pick::Video) {
-            if let Ok(video) = Video::of_track(&track) {
-                let _ = carriages(&mut src, &video, scan);
-            }
+            let _ = carriages(&mut src, &track, scan);
         }
         if let Ok(track) = mkv::read(&mut src, scan) {
             let _ = carriages(&mut src, &track, scan);

@@ -9,28 +9,19 @@
 //! that the rest of the workspace says "units" where it means units.
 //!
 //! Anything here that does not bind one of those constants is not here.
-//! A caller that wants access units, temporal units, reframing or the
-//! length an `avcC` declares calls `ffrwd_nal` for it directly, because
-//! a wrapper that only renames a function is a second name to keep in
-//! step with the first.
+//! A caller that wants access units, temporal units, reframing, the
+//! length an `avcC` declares, or an SEI built around a payload calls
+//! `ffrwd_nal` for it directly, because a wrapper that only renames a
+//! function is a second name to keep in step with the first. Writing
+//! is `sei::write_user_data{,_at}` and `obu::write_metadata`, and
+//! neither needs this format's UUID: the payload already opens with
+//! it.
 
 use ffrwd_nal::feed::{Feed, StreamKind};
 use ffrwd_nal::obu::ObuRef;
 use ffrwd_nal::{obu, sei, Codec};
 
 use crate::{Result, METADATA_TYPE, SELECT, UUID};
-
-/// A unit as an SEI NAL unit, ready to splice into an access unit at
-/// `temporal_id_plus1`, which `ffrwd_nal::h26x::AccessUnit` carries.
-pub fn wrap_unit_at(unit: &[u8], codec: Codec, temporal_id_plus1: u8) -> Vec<u8> {
-    sei::write_user_data_at(unit, codec, temporal_id_plus1)
-}
-
-/// A unit as an SEI NAL unit for an access unit of the base temporal
-/// layer, which is every access unit of a stream without sub-layers.
-pub fn wrap_unit(unit: &[u8], codec: Codec) -> Vec<u8> {
-    sei::write_user_data(unit, codec)
-}
 
 /// The units in one SEI NAL unit: the `user_data_unregistered` messages
 /// that open with this format's UUID, and no others.
@@ -108,9 +99,8 @@ mod tests {
     #[test]
     fn a_unit_goes_out_and_comes_back_in_every_spelling() {
         for codec in [Codec::H264, Codec::H265] {
-            let nal = wrap_unit(&unit(), codec);
+            let nal = sei::write_user_data(&unit(), codec);
             assert_eq!(units_in_nal(&nal, codec), vec![unit()]);
-            assert_eq!(wrap_unit_at(&unit(), codec, 1), nal);
 
             let mut annexb = vec![0, 0, 0, 1];
             annexb.extend_from_slice(&nal);
@@ -137,7 +127,7 @@ mod tests {
         let mut stream = Vec::new();
         for slice in [0x65u8, 0x41] {
             stream.extend_from_slice(&[0, 0, 0, 1]);
-            stream.extend_from_slice(&wrap_unit(&unit(), Codec::H264));
+            stream.extend_from_slice(&sei::write_user_data(&unit(), Codec::H264));
             stream.extend_from_slice(&[0, 0, 0, 1]);
             stream.extend_from_slice(&sei::write_user_data(&[0xab; 20], Codec::H264));
             stream.extend_from_slice(&[0, 0, 0, 1, slice, 0x88, 0x84, 0x00]);

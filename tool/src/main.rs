@@ -28,9 +28,9 @@ use std::path::Path;
 
 use ffrwd_bmff::patch::{self, Placed};
 use ffrwd_bmff::source::{Source, Tally};
-use ffrwd_bmff::track::{self, Pick};
+use ffrwd_bmff::track::{self, Pick, Track};
 use ffrwd_index_container::scan::{carriages, Scan};
-use ffrwd_index_container::{mkv, Kind, Video, INDEX_BOX};
+use ffrwd_index_container::{mkv, Kind, INDEX_BOX};
 use ffrwd_index_core::assemble::{Assembler, Limits, Record};
 use ffrwd_index_core::carriage;
 use ffrwd_index_core::index::{FileIndex, MATROSKA_FILE_NAME, MATROSKA_MIME};
@@ -42,7 +42,7 @@ use ffrwd_index_rows::json::{float, number, object, Json};
 use ffrwd_index_rows::space::{read_space, space_row};
 use ffrwd_index_rows::vector::{bodies, plane_numbers, read_values};
 use ffrwd_nal::feed::StreamKind;
-use ffrwd_nal::{h26x, obu, Codec};
+use ffrwd_nal::{h26x, obu, sei, Codec};
 
 const USAGE: &str = "\
 ffrwd-index: embedding vectors in a video's own stream.
@@ -346,7 +346,7 @@ fn framed(kind: Stream, unit: &[u8], temporal_id_plus1: u8) -> Vec<u8> {
     match kind {
         Stream::Nal(codec) => {
             let mut out = vec![0, 0, 0, 1];
-            out.extend_from_slice(&carriage::wrap_unit_at(unit, codec, temporal_id_plus1));
+            out.extend_from_slice(&sei::write_user_data_at(unit, codec, temporal_id_plus1));
             out
         }
         Stream::Av1 => obu::write_metadata(METADATA_TYPE, unit),
@@ -637,7 +637,7 @@ fn walk<R: std::io::Read + std::io::Seek>(
     src: &mut Source<R>,
     kind: Option<Kind>,
     scan: Scan,
-) -> Result<(Video, Vec<Carried>), ffrwd_index_container::Error> {
+) -> Result<(Track, Vec<Carried>), ffrwd_index_container::Error> {
     // What the file says it is decides, even when a flag named a
     // container: a `--mp4` pointed at an elementary stream should hear
     // that rather than a complaint about a box.
@@ -651,7 +651,7 @@ fn walk<R: std::io::Read + std::io::Seek>(
     }
     let kind = found;
     let track = match kind {
-        Kind::Mp4 => Video::of_track(&track::read(src, Pick::Video)?)?,
+        Kind::Mp4 => track::read(src, Pick::Video)?,
         Kind::Matroska => mkv::read(src, scan)?,
     };
     let carried = carriages(src, &track, scan)?
@@ -675,7 +675,7 @@ fn name_of(kind: Kind) -> &'static str {
 ///
 /// The ratio is the point: section 7's `keyframe` policy exists so that
 /// reading a file's records is not reading the file.
-fn accounting(track: &Video, carried: &[Carried], scan: Scan, tally: Tally) -> String {
+fn accounting(track: &Track, carried: &[Carried], scan: Scan, tally: Tally) -> String {
     format!(
         "scan {}: {} of {} samples, {} of {} bytes read ({:.2}% of the file), {} seeks",
         scan.name(),

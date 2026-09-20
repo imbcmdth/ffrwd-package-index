@@ -12,7 +12,9 @@
 //!
 //! **Matroska**, which no other package here reads, and which is not an
 //! ISO base media file: its own elements, its own timestamps, its own
-//! attachment carrying the file index.
+//! attachment carrying the file index. It hands back the same
+//! `ffrwd_bmff::track::Track` the MP4 reader does, built with
+//! `Track::from_parts`, so one scan serves both containers.
 //!
 //! **The prefix scan**, which is the one place the box layer and the
 //! byte layer meet. Section 7 puts whole records on keyframes for
@@ -29,6 +31,13 @@
 //!
 //! - [`mkv`]: Matroska and WebM.
 //! - [`scan`]: the sample prefixes, and the units in them.
+//!
+//! Three small things sit beside them, each because it is about having
+//! two containers rather than about either one: [`kind_of`], which says
+//! which of them a file is; [`framing_of`], which turns a sample entry
+//! into the framing a scan reads by; and [`Error`], which is where
+//! Matroska's own faults, `ffrwd-bmff`'s and the format's meet. The one
+//! thing this crate says about a box is [`INDEX_BOX`].
 
 #![forbid(unsafe_code)]
 
@@ -41,7 +50,6 @@ use std::io::{Read, Seek};
 
 use ffrwd_bmff::patch::Selector;
 use ffrwd_bmff::source::Source;
-use ffrwd_bmff::track::{Sample, Track};
 use ffrwd_nal::config::{avcc_length_size, hvcc_length_size, Framing};
 use ffrwd_nal::Codec;
 
@@ -108,76 +116,26 @@ impl From<ffrwd_nal::Error> for Error {
 /// The crate's result.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// A video track of a file, whichever container it came out of.
+/// How a track's samples are framed, from its sample entry.
 ///
-/// This is the small union the scan needs and nothing more: an MP4
-/// track is `ffrwd_bmff::track::Track` and a Matroska track is not a
-/// `Track` at all, so what the two have in common is stated here rather
-/// than one of them being bent into the other's shape.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Video {
-    /// How the samples are framed, which the sample entry decides.
-    pub framing: Framing,
-    /// Ticks a second, the denominator ffprobe calls the time base.
-    pub timescale: u32,
-    /// The codec's own out-of-band header (`avcC`, `hvcC` or `av1C`),
-    /// exactly as the file carried it. Both containers have one and
-    /// neither reads it: parsing it is `ffrwd-nal`'s job.
-    pub config: Vec<u8>,
-    /// Every sample, in decode order.
-    pub samples: Vec<Sample>,
-    /// What the file said about its edit list, for a reader that wants
-    /// to say why a time is what it is.
-    pub start_shift: i64,
-}
-
-impl Video {
-    /// The video track of an ISO base media file, as a scan sees it.
-    pub fn of_track(track: &Track) -> Result<Video> {
-        Ok(Video {
-            framing: framing_of(&track.entry.kind, &track.entry.config)?,
-            timescale: track.timescale,
-            config: track.entry.config.clone(),
-            samples: track.samples.clone(),
-            start_shift: track.start_shift,
-        })
-    }
-
-    /// A tick count as milliseconds of presentation time.
-    pub fn ms(&self, ticks: i64) -> i64 {
-        ffrwd_bmff::time::ms(ticks, self.timescale)
-    }
-
-    /// The samples a scan of this mode visits.
-    ///
-    /// The keyframe scan is the sync samples and nothing else. Section 7
-    /// puts every record of a `keyframe` file on a keyframe, the last
-    /// one included: a record whose span ends after the last keyframe
-    /// rides that keyframe with an `end_off` that looks forward. There
-    /// is nothing after the sync samples for a reader to go and find,
-    /// which is what lets the same read work on a transport stream,
-    /// where the end of the file is not a thing to seek to.
-    pub fn scanned(&self, scan: Scan) -> Vec<Sample> {
-        match scan {
-            Scan::All => self.samples.clone(),
-            Scan::Keyframes => self
-                .samples
-                .iter()
-                .copied()
-                .filter(|sample| sample.keyframe)
-                .collect(),
-        }
-    }
-}
-
-/// How a sample entry's samples are framed.
+/// Not `ffrwd_nal::config::framing_of`, which answers a different
+/// question and is right for the caller it was written for. That one
+/// takes ffmpeg's codec name and decides between Annex B and a length
+/// prefix by looking at the extradata, which is what a pipeline's pad
+/// has to do. A container's sample entry already says both things and
+/// says them better:
 ///
-/// A container's samples are never Annex B: both NAL sample entries
-/// carry a record that declares a length prefix, and AV1 samples are
-/// bare OBUs. That is why the entry decides here rather than the
-/// extradata sniffing a pipeline's pad needs. A track this format has
-/// no carriage for is refused by name rather than scanned for bytes
-/// that would mean nothing.
+/// - The four characters a sample entry carries are not codec names.
+///   `framing_of` knows `avc1`, `hvc1` and `hev1` because they happen
+///   to spell codecs too, and has no case for `avc3` or `av01`, which
+///   `ffprobe` will hand out of real files all day.
+/// - A sample in either container is never Annex B. `framing_of` reads
+///   a short or damaged record as Annex B, which for a track is not a
+///   guess worth making: the entry said length-prefixed, and a damaged
+///   `avcC` means the width is unknown, not that the framing changed.
+///
+/// A track this format has no carriage for is refused by name rather
+/// than scanned for bytes that would mean nothing.
 pub fn framing_of(kind: &[u8; 4], config: &[u8]) -> Result<Framing> {
     match kind {
         b"avc1" | b"avc3" => Ok(Framing::LengthPrefixed {
@@ -291,5 +249,40 @@ mod tests {
         );
         let err = framing_of(b"vp09", &[]).expect_err("a refusal");
         assert!(format!("{err}").contains("vp09"), "{err}");
+    }
+
+    /// Why this is not `ffrwd_nal::config::framing_of` with the four
+    /// characters passed through. That function answers a pipeline
+    /// pad's question, from ffmpeg's codec name and the extradata, and
+    /// on a sample entry it gets two things wrong that matter here.
+    #[test]
+    fn the_shared_framing_answers_a_pads_question_and_not_a_tracks() {
+        use ffrwd_nal::config::framing_of as pad_framing_of;
+
+        // Two of the five entry types a track really carries are not
+        // codec names and have no case there.
+        for kind in [b"avc3", b"av01"] {
+            let name = std::str::from_utf8(kind).expect("four ascii characters");
+            assert_eq!(
+                pad_framing_of(name, &[]),
+                Err(ffrwd_nal::Error::UnknownCodec)
+            );
+            assert!(framing_of(kind, &[0x81, 0x05]).is_ok(), "{name}");
+        }
+
+        // And a record too short to read is Annex B to a pad, which is
+        // the right guess for a stream with no extradata and the wrong
+        // one for a sample entry that said length-prefixed.
+        assert_eq!(
+            pad_framing_of("avc1", &[1, 0x64]).expect("a framing"),
+            Framing::AnnexB(Codec::H264)
+        );
+        assert_eq!(
+            framing_of(b"avc1", &[1, 0x64]).expect("a framing"),
+            Framing::LengthPrefixed {
+                codec: Codec::H264,
+                length_size: 4
+            }
+        );
     }
 }

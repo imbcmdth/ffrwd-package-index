@@ -29,12 +29,12 @@
 use std::io::{Read, Seek};
 
 use ffrwd_bmff::source::Source;
-use ffrwd_bmff::track::Sample;
+use ffrwd_bmff::track::{Sample, Track};
 use ffrwd_index_core::SELECT;
 use ffrwd_nal::config::Framing;
 use ffrwd_nal::{obu, Codec};
 
-use crate::{Error, Result, Video};
+use crate::{Error, Result};
 
 /// Which samples a read visits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -66,6 +66,27 @@ impl Scan {
             Scan::All => "all",
         }
     }
+
+    /// The samples of a track this scan visits.
+    ///
+    /// The keyframe scan is the sync samples and nothing else. Section 7
+    /// puts every record of a `keyframe` file on a keyframe, the last
+    /// one included: a record whose span ends after the last keyframe
+    /// rides that keyframe with an `end_off` that looks forward. There
+    /// is nothing after the sync samples for a reader to go and find,
+    /// which is what lets the same read work on a transport stream,
+    /// where the end of the file is not a thing to seek to.
+    pub fn samples(self, track: &Track) -> Vec<Sample> {
+        match self {
+            Scan::All => track.samples.clone(),
+            Scan::Keyframes => track
+                .samples
+                .iter()
+                .copied()
+                .filter(|sample| sample.keyframe)
+                .collect(),
+        }
+    }
 }
 
 /// How much of a sample is read before anything is known about it.
@@ -87,16 +108,17 @@ pub struct Carriage {
 /// Every unit in the samples this scan visits.
 pub fn carriages<R: Read + Seek>(
     src: &mut Source<R>,
-    track: &Video,
+    track: &Track,
     scan: Scan,
 ) -> Result<Vec<Carriage>> {
+    let framing = crate::framing_of(&track.entry.kind, &track.entry.config)?;
     let mut out = Vec::new();
-    for sample in track.scanned(scan) {
+    for sample in scan.samples(track) {
         out.push(Carriage {
             sample: sample.index,
             pts_ms: track.ms(sample.pts),
             keyframe: sample.keyframe,
-            units: units_of(src, track, &sample)?,
+            units: prefix_units(src, framing, &sample)?,
         });
     }
     Ok(out)
@@ -105,7 +127,16 @@ pub fn carriages<R: Read + Seek>(
 /// The units in front of one sample's picture.
 pub fn units_of<R: Read + Seek>(
     src: &mut Source<R>,
-    track: &Video,
+    track: &Track,
+    sample: &Sample,
+) -> Result<Vec<Vec<u8>>> {
+    let framing = crate::framing_of(&track.entry.kind, &track.entry.config)?;
+    prefix_units(src, framing, sample)
+}
+
+fn prefix_units<R: Read + Seek>(
+    src: &mut Source<R>,
+    framing: Framing,
     sample: &Sample,
 ) -> Result<Vec<Vec<u8>>> {
     let size = sample.size as usize;
@@ -120,14 +151,14 @@ pub fn units_of<R: Read + Seek>(
         let grew = !more.is_empty();
         prefix.extend_from_slice(&more);
         let complete = prefix.len() >= size || !grew;
-        match lead_end(&prefix, complete, track)? {
-            Some(cut) => return Ok(units_in(&prefix[..cut], track)),
+        match lead_end(&prefix, complete, framing)? {
+            Some(cut) => return Ok(units_in(&prefix[..cut], framing)),
             None if complete => {
                 // The whole sample has been read and no coded slice
                 // turned up in it. Whatever is there is all there is,
                 // so take the units out of it and move on: a sample of
                 // parameter sets alone is a real thing.
-                return Ok(units_in(&prefix, track));
+                return Ok(units_in(&prefix, framing));
             }
             None => step = step.saturating_mul(2),
         }
@@ -138,8 +169,8 @@ pub fn units_of<R: Read + Seek>(
 ///
 /// `None` means the prefix ran out inside something that is not one of
 /// those, so a longer prefix would say more.
-fn lead_end(prefix: &[u8], complete: bool, track: &Video) -> Result<Option<usize>> {
-    match track.framing {
+fn lead_end(prefix: &[u8], complete: bool, framing: Framing) -> Result<Option<usize>> {
+    match framing {
         Framing::LengthPrefixed { codec, length_size } => {
             if !(1..=4).contains(&length_size) {
                 return Err(Error::Format(
@@ -149,8 +180,9 @@ fn lead_end(prefix: &[u8], complete: bool, track: &Video) -> Result<Option<usize
             lead_end_nals(prefix, complete, length_size, codec)
         }
         Framing::Av1 => lead_end_obus(prefix, complete),
-        // A sample entry never says Annex B; `crate::framing_of` is the
-        // only thing that builds a `Video`'s framing and it never does.
+        // A sample entry never says Annex B, and `crate::framing_of` is
+        // where a scan's framing comes from, so this is unreachable
+        // rather than a case with bytes behind it.
         Framing::AnnexB(_) => Err(Error::Format(
             "a container track framed as an elementary stream",
         )),
@@ -245,37 +277,47 @@ fn lead_end_obus(prefix: &[u8], complete: bool) -> Result<Option<usize>> {
 }
 
 /// The units of this format in bytes already cut at a boundary.
-fn units_in(bytes: &[u8], track: &Video) -> Vec<Vec<u8>> {
+fn units_in(bytes: &[u8], framing: Framing) -> Vec<Vec<u8>> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    track.framing.payloads(bytes, SELECT)
+    framing.payloads(bytes, SELECT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffrwd_index_core::carriage;
+    use ffrwd_bmff::track::{Handler, SampleEntry};
     use ffrwd_index_core::message::Encoding;
     use ffrwd_index_core::message::{Message, Space, Unit};
     use ffrwd_index_core::METADATA_TYPE;
+    use ffrwd_nal::sei;
     use std::io::Cursor;
 
-    fn one_track(framing: Framing, samples: Vec<Sample>) -> Video {
-        Video {
-            framing,
-            timescale: 1000,
-            config: Vec::new(),
+    /// A one-sample track of a kind this format carries. The four
+    /// characters and the record are what the scan's framing comes
+    /// from, so they are what a fixture has to get right.
+    fn one_track(kind: &[u8; 4], config: Vec<u8>, samples: Vec<Sample>) -> Track {
+        Track::from_parts(
+            Handler::Video,
+            1000,
+            SampleEntry {
+                kind: *kind,
+                config,
+                ..SampleEntry::default()
+            },
             samples,
-            start_shift: 0,
-        }
+        )
     }
 
-    fn nals(length_size: usize) -> Framing {
-        Framing::LengthPrefixed {
-            codec: Codec::H264,
-            length_size,
-        }
+    /// An `avcC` declaring a four-byte length prefix, which is what
+    /// every muxer writes.
+    fn avcc() -> Vec<u8> {
+        vec![1, 0x64, 0x00, 0x0d, 0xff, 0xe1, 0x00]
+    }
+
+    fn h264_track(samples: Vec<Sample>) -> Track {
+        one_track(b"avc1", avcc(), samples)
     }
 
     fn sample_at(size: u32) -> Sample {
@@ -305,7 +347,7 @@ mod tests {
     fn h264_sample(picture: usize) -> Vec<u8> {
         let mut out = nal(4, &[0x67, 0x64, 0, 13, 0xac]);
         out.extend_from_slice(&nal(4, &[0x68, 0xeb, 0xe3, 0xcb]));
-        out.extend_from_slice(&nal(4, &carriage::wrap_unit(&unit(), Codec::H264)));
+        out.extend_from_slice(&nal(4, &sei::write_user_data(&unit(), Codec::H264)));
         let mut slice = vec![0x65, 0x88];
         slice.extend(std::iter::repeat_n(0x42u8, picture));
         out.extend_from_slice(&nal(4, &slice));
@@ -317,7 +359,7 @@ mod tests {
         let sample = h264_sample(200_000);
         let size = sample.len() as u32;
         let mut src = Source::new(Cursor::new(sample.clone())).expect("a source");
-        let track = one_track(nals(4), vec![sample_at(size)]);
+        let track = h264_track(vec![sample_at(size)]);
         src.reset_tally();
         let found = units_of(&mut src, &track, &track.samples[0]).expect("units");
         assert_eq!(found.len(), 1);
@@ -333,12 +375,12 @@ mod tests {
         let mut big = Space::new(2, 4, Encoding::F32);
         big.model = "x".repeat(20_000);
         let unit = Unit::new(vec![Message::Space(big)]).encode();
-        let mut sample = nal(4, &carriage::wrap_unit(&unit, Codec::H264));
+        let mut sample = nal(4, &sei::write_user_data(&unit, Codec::H264));
         let slice_at = sample.len();
         sample.extend_from_slice(&nal(4, &[0x65, 0x88, 0x42, 0x42]));
         let size = sample.len() as u32;
         let mut src = Source::new(Cursor::new(sample)).expect("a source");
-        let track = one_track(nals(4), vec![sample_at(size)]);
+        let track = h264_track(vec![sample_at(size)]);
         let found = units_of(&mut src, &track, &track.samples[0]).expect("units");
         assert_eq!(found, vec![unit]);
         assert!(
@@ -357,15 +399,20 @@ mod tests {
         sample.extend(std::iter::repeat_n(0x11u8, 1000));
         let size = sample.len() as u32;
         let mut src = Source::new(Cursor::new(sample)).expect("a source");
-        let track = one_track(Framing::Av1, vec![sample_at(size)]);
+        let track = one_track(b"av01", vec![0x81, 0x05], vec![sample_at(size)]);
         // A prefix that reaches the frame OBU's header says where the
         // lead ends; one that stops short says nothing yet.
         assert_eq!(
-            lead_end(&src.read_at(0, cut + 4).expect("a prefix"), false, &track).expect("a cut"),
+            lead_end(
+                &src.read_at(0, cut + 4).expect("a prefix"),
+                false,
+                Framing::Av1
+            )
+            .expect("a cut"),
             Some(cut)
         );
         assert_eq!(
-            lead_end(&src.read_at(0, 8).expect("a prefix"), false, &track).expect("a cut"),
+            lead_end(&src.read_at(0, 8).expect("a prefix"), false, Framing::Av1).expect("a cut"),
             None
         );
         let found = units_of(&mut src, &track, &track.samples[0]).expect("units");
@@ -375,13 +422,14 @@ mod tests {
     #[test]
     fn random_bytes_in_a_sample_never_panic() {
         let mut seed = 0x1234_5678_9abc_def0u64;
-        for framing in [
-            nals(4),
-            Framing::LengthPrefixed {
-                codec: Codec::H265,
-                length_size: 4,
-            },
-            Framing::Av1,
+        for (kind, config) in [
+            (b"avc1", avcc()),
+            (b"hvc1", {
+                let mut hvcc = vec![1u8; 23];
+                hvcc[21] = 0xf3;
+                hvcc
+            }),
+            (b"av01", vec![0x81, 0x05]),
         ] {
             for _ in 0..500 {
                 let mut bytes = Vec::new();
@@ -392,7 +440,7 @@ mod tests {
                 }
                 let size = bytes.len() as u32;
                 let mut src = Source::new(Cursor::new(bytes)).expect("a source");
-                let track = one_track(framing, vec![sample_at(size)]);
+                let track = one_track(kind, config.clone(), vec![sample_at(size)]);
                 let _ = units_of(&mut src, &track, &track.samples[0]);
             }
         }

@@ -28,11 +28,12 @@
 //!
 //! **What is shared.** The reader is `ffrwd_bmff::source::Source`, the
 //! same counted reader the MP4 side uses, so a keyframe scan's cost is
-//! counted the same way whichever container it read; a block becomes
-//! `ffrwd_bmff::track::Sample`, so one prefix scan serves both; and the
-//! NAL length an `avcC` or `hvcC` declares is read by `ffrwd_nal`.
-//! Nothing about EBML is in either crate, and nothing about Matroska is
-//! here twice.
+//! counted the same way whichever container it read, and what comes
+//! back is a `ffrwd_bmff::track::Track` built with `Track::from_parts`,
+//! the same type the MP4 reader returns, so one prefix scan serves
+//! both. The NAL length an `avcC` or `hvcC` declares is read by
+//! `ffrwd_nal`. Nothing about EBML is in either crate, and nothing
+//! about Matroska is here twice.
 //!
 //! **Unknown sizes.** A live writer does not know how long a `Segment`
 //! or a `Cluster` will be and writes the all-ones length for it.
@@ -45,10 +46,10 @@
 use std::io::{Read, Seek};
 
 use ffrwd_bmff::source::Source;
-use ffrwd_bmff::track::Sample;
+use ffrwd_bmff::track::{Handler, Sample, SampleEntry, Track};
 use ffrwd_index_core::index::MATROSKA_MIME;
 
-use crate::{Error, Result, Scan, Video};
+use crate::{Error, Result, Scan};
 
 pub const ID_EBML: u32 = 0x1A45_DFA3;
 pub const ID_SEGMENT: u32 = 0x1853_8067;
@@ -649,7 +650,7 @@ fn cue_clusters(cues: &[u8], segment_body: u64, track: u64) -> Result<Vec<(u64, 
 /// full walk of every block into one seek per cued cluster. A file with
 /// no cues, which is what a live writer produces, falls back to the
 /// full walk and keeps the keyframes.
-pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<Video> {
+pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<Track> {
     let seg = segment(src)?;
     let map = outline(src, seg)?;
     let tracks = map
@@ -725,20 +726,31 @@ pub fn read<R: Read + Seek>(src: &mut Source<R>, scan: Scan) -> Result<Video> {
     }
     // The blocks stay in the order the file has them, which is decode
     // order, the same order an MP4's sample tables are in and the order
-    // ffprobe lists packets in.
-    for (index, sample) in samples.iter_mut().enumerate() {
-        sample.index = index as u32;
+    // ffprobe lists packets in, which is what `from_parts` asks for. It
+    // renumbers `index` itself, so this loop only scales the times.
+    for sample in samples.iter_mut() {
         sample.pts *= multiplier;
         sample.dts = sample.pts;
     }
 
-    Ok(Video {
-        framing: crate::framing_of(&info.entry, &info.private)?,
+    // What `from_parts` is not given is what Matroska does not have: no
+    // edit list, so no start shift and no movie timescale, and no
+    // `trex`, because there are no movie fragments. The offsets and
+    // sizes above are absolute in `src`, and the times are in the ticks
+    // `timescale` counts, which is what it asks the caller to promise.
+    // The track number is Matroska's own, which is the nearest thing
+    // the format has to a `track_ID`.
+    Ok(Track::from_parts(
+        Handler::Video,
         timescale,
-        config: info.private,
+        SampleEntry {
+            kind: info.entry,
+            config: info.private,
+            ..SampleEntry::default()
+        },
         samples,
-        start_shift: 0,
-    })
+    )
+    .with_track_id(u32::try_from(info.number).unwrap_or(1)))
 }
 
 /// The file index out of a Matroska attachment, if there is one.
@@ -894,8 +906,9 @@ mod tests {
         {
             let mut src = source(file(segment_unknown, cluster_unknown));
             let track = read(&mut src, Scan::All).expect("a track");
+            assert_eq!(&track.entry.kind, b"avc1");
             assert_eq!(
-                track.framing,
+                crate::framing_of(&track.entry.kind, &track.entry.config).expect("a framing"),
                 ffrwd_nal::config::Framing::LengthPrefixed {
                     codec: ffrwd_nal::Codec::H264,
                     length_size: 4
@@ -935,8 +948,8 @@ mod tests {
 
             let mut src = source(bytes);
             let fast = read(&mut src, Scan::Keyframes).expect("a track");
-            let visited: Vec<i64> = fast
-                .scanned(Scan::Keyframes)
+            let visited: Vec<i64> = Scan::Keyframes
+                .samples(&fast)
                 .iter()
                 .map(|sample| sample.pts)
                 .collect();

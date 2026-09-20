@@ -304,7 +304,6 @@ fn seconds(ms: i64) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffrwd_index_core::carriage;
     use ffrwd_index_core::message::Encoding;
     use ffrwd_index_core::placement::{plan, Carrier, Pending, Placement};
     use ffrwd_index_core::quant::Planes;
@@ -330,7 +329,7 @@ mod tests {
         let mut out: Vec<u8> = vec![0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a, 0x96];
         if !messages.is_empty() {
             out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&carriage::wrap_unit(
+            out.extend_from_slice(&ffrwd_nal::sei::write_user_data(
                 &Unit::new(messages).encode(),
                 Codec::H264,
             ));
