@@ -4,8 +4,21 @@
 //! objects of numbers, strings and one array, and a parser for that is
 //! shorter than the argument about which crate to depend on. It is
 //! strict about what it accepts and says where it stopped.
+//!
+//! The reader recurses into objects and arrays, so it is bounded: a row
+//! is somebody else's text and nesting it a few thousand deep would
+//! otherwise walk the stack off the end of a wasm module. [`MAX_DEPTH`]
+//! is where it stops, and it is serde_json's own default, so a row this
+//! refuses is a row every other reader of it refuses too.
 
 use std::fmt::Write as _;
+
+/// How deep a value may nest before a read gives up.
+///
+/// 128, which is serde_json's `Deserializer` default. A row of this
+/// format is a flat object with one array of numbers in it, two deep,
+/// so nothing a writer here produces is anywhere near it.
+pub const MAX_DEPTH: usize = 128;
 
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq)]
@@ -130,7 +143,7 @@ impl Json {
     pub fn parse(text: &str) -> Result<Json, String> {
         let bytes = text.as_bytes();
         let mut at = 0usize;
-        let value = parse_value(bytes, &mut at)?;
+        let value = parse_value(bytes, &mut at, MAX_DEPTH)?;
         skip_space(bytes, &mut at);
         if at != bytes.len() {
             return Err(format!("trailing bytes at {at}"));
@@ -193,12 +206,16 @@ fn skip_space(bytes: &[u8], at: &mut usize) {
     }
 }
 
-fn parse_value(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
+/// One value, with `left` levels of nesting still allowed.
+fn parse_value(bytes: &[u8], at: &mut usize, left: usize) -> Result<Json, String> {
     skip_space(bytes, at);
     match bytes.get(*at) {
         None => Err("the line ends where a value was expected".into()),
-        Some(b'{') => parse_object(bytes, at),
-        Some(b'[') => parse_array(bytes, at),
+        Some(b'{' | b'[') if left == 0 => {
+            Err(format!("more than {MAX_DEPTH} levels of nesting at {at}"))
+        }
+        Some(b'{') => parse_object(bytes, at, left - 1),
+        Some(b'[') => parse_array(bytes, at, left - 1),
         Some(b'"') => Ok(Json::String(parse_string(bytes, at)?)),
         Some(b't') => parse_word(bytes, at, "true", Json::Bool(true)),
         Some(b'f') => parse_word(bytes, at, "false", Json::Bool(false)),
@@ -216,7 +233,7 @@ fn parse_word(bytes: &[u8], at: &mut usize, word: &str, value: Json) -> Result<J
     }
 }
 
-fn parse_object(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
+fn parse_object(bytes: &[u8], at: &mut usize, left: usize) -> Result<Json, String> {
     *at += 1;
     let mut members = Vec::new();
     skip_space(bytes, at);
@@ -232,7 +249,7 @@ fn parse_object(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
             return Err(format!("no colon after a name at {at}"));
         }
         *at += 1;
-        members.push((name, parse_value(bytes, at)?));
+        members.push((name, parse_value(bytes, at, left)?));
         skip_space(bytes, at);
         match bytes.get(*at) {
             Some(b',') => *at += 1,
@@ -245,7 +262,7 @@ fn parse_object(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
     }
 }
 
-fn parse_array(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
+fn parse_array(bytes: &[u8], at: &mut usize, left: usize) -> Result<Json, String> {
     *at += 1;
     let mut values = Vec::new();
     skip_space(bytes, at);
@@ -254,7 +271,7 @@ fn parse_array(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
         return Ok(Json::Array(values));
     }
     loop {
-        values.push(parse_value(bytes, at)?);
+        values.push(parse_value(bytes, at, left)?);
         skip_space(bytes, at);
         match bytes.get(*at) {
             Some(b',') => *at += 1,
@@ -456,6 +473,35 @@ mod tests {
         assert_eq!(Json::parse("{}").expect("an object"), Json::Object(vec![]));
         assert_eq!(Json::parse("[]").expect("an array"), Json::Array(vec![]));
         assert_eq!(Json::parse(" null ").expect("null"), Json::Null);
+    }
+
+    #[test]
+    fn nesting_is_bounded_where_serde_json_bounds_it() {
+        // A row is somebody else's text, and a reader that recurses on
+        // it must stop somewhere before the stack does. Both shapes
+        // nest, so both are bounded.
+        for (open, close) in [("[", "]"), ("{\"a\":", "}")] {
+            let at_limit = format!("{}null{}", open.repeat(MAX_DEPTH), close.repeat(MAX_DEPTH));
+            assert!(
+                Json::parse(&at_limit).is_ok(),
+                "{MAX_DEPTH} levels was refused"
+            );
+
+            let one_past = format!(
+                "{}null{}",
+                open.repeat(MAX_DEPTH + 1),
+                close.repeat(MAX_DEPTH + 1)
+            );
+            let err = Json::parse(&one_past).expect_err("a refusal");
+            assert!(err.contains("nesting"), "{err}");
+
+            // And the shape that would really have cost a stack: deep
+            // enough to overflow one, with no closing brackets at all,
+            // which is what an attacker writes.
+            let flood = open.repeat(200_000);
+            let err = Json::parse(&flood).expect_err("a refusal");
+            assert!(err.contains("nesting"), "{err}");
+        }
     }
 
     #[test]
