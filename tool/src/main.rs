@@ -1013,11 +1013,20 @@ fn install_mp4(file: &str, bytes: &[u8], rewrite: bool) -> Result<(), String> {
 /// The shared crate refuses a box that is not last and says why, with
 /// the byte it found the old one at. It does not know this tool's flags
 /// and says nothing about them, so the sentence naming `--rewrite` is
-/// added here, where the flag lives.
+/// added here, where the flag lives. The offset goes in front of the
+/// crate's own sentence, which ends on the copy it will not make.
 fn refusal(file: &str, err: ffrwd_bmff::Error) -> String {
     match &err {
         ffrwd_bmff::Error::Unsupported(fault) => {
-            format!("{file}: {fault}. Pass --rewrite to copy the file without it")
+            let at = match fault.at {
+                Some(at) => format!("at byte {at}, "),
+                None => String::new(),
+            };
+            format!(
+                "{file}: {at}{}. Pass --rewrite to copy the file without the box it \
+                 already carries",
+                fault.what
+            )
         }
         _ => format!("{file}: {err}"),
     }
