@@ -53,7 +53,7 @@ fn sidecar() -> Option<PathBuf> {
     let Some(named) = std::env::var_os(SIDECAR_ENV) else {
         eprintln!(
             "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A node needs a host \
-             that speaks ffrwd:av@0.19.0, so point {SIDECAR_ENV} at the ffrwd-wasm of ffrwd \
+             that speaks ffrwd:av@0.19.1, so point {SIDECAR_ENV} at the ffrwd-wasm of ffrwd \
              0.29 or later."
         );
         return None;

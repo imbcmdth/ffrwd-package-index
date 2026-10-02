@@ -1,6 +1,6 @@
 [package]
 name = "ffrwd-index"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Weave embedding vectors into a video elementary stream, and read them back"
 license = "Apache-2.0"

@@ -30,8 +30,8 @@ The format is a draft. The package is installable:
 ffrwd install ffrwd/index
 ```
 
-Requires ffrwd 0.29. The three modules are nodes of `ffrwd:av@0.19.0`. They
-ship built, and an install compiles nothing.
+Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1. The three modules are
+nodes of `ffrwd:av@0.19.1`. They ship built, and an install compiles nothing.
 
 The `ffrwd-index` tool is the same format without ffrwd: it weaves rows of
 vectors into H.264, HEVC and AV1 elementary streams, reads them back from a

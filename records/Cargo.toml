@@ -1,6 +1,6 @@
 [package]
 name = "records"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "An ffrwd node read in FROM: one row per record woven into a video stream."
@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 # `ffrwd-index-rows`, which the tool and `weave` read and write the same
 # rows with; serde_json hands those rows on as they were written.
 [dependencies]
-ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.1.0" }
+ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.2.0" }
 ffrwd-index-core = { path = "../core" }
 ffrwd-index-rows = { path = "../rows" }
 ffrwd-nal = { workspace = true }

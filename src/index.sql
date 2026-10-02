@@ -2,7 +2,7 @@
 -- packets, and read back out of them.
 --
 -- Three modules. `weave` writes; `records` and `spaces` read. All three
--- are nodes, `ffrwd:av@0.19.0`, which ffrwd hosts from 0.29 on, so that
+-- are nodes, `ffrwd:av@0.19.1`, which ffrwd hosts from 0.29 on, so that
 -- is the floor.
 
 -- ---------------------------------------------------------------- --

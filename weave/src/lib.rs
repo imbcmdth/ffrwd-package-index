@@ -38,7 +38,8 @@ use ffrwd_index_core::{SELECT, UNIT_SOFT_LIMIT};
 use ffrwd_index_rows::weave::{Config, Reorder, Weaver, MAX_HELD_PACKETS};
 use ffrwd_nal::config::{framing_of, Framing, CODECS};
 use ffrwd_node::{
-    Bound, Format, Init, Input, Node, Out, Output, Packet, Result, Shape, StateRow, Tick, Wants,
+    Bound, Format, Init, Input, Node, Out, Output, Packet, Rational, Result, Shape, StateRow, Tick,
+    Wants,
 };
 use serde_json::value::RawValue;
 
@@ -95,8 +96,11 @@ const MAX_GOP_BYTES: usize = 32 << 20;
 /// node promises downstream: `v` declares it as its latency.
 const MAX_GOP_SECONDS: f64 = 10.0;
 
-/// What a packet held while its presentation order settles may trail its
-/// tick by: a reorder depth of frames, with room to spare.
+/// How many frames a packet held while its presentation order settles may
+/// trail its tick by: the deepest reorder H.264 and HEVC allow.
+const REORDER_FRAMES: u64 = 16;
+
+/// The same in seconds where the call leaves the stream's rate unknown.
 const REORDER_SECONDS: f64 = 1.0;
 
 /// The access unit the writer is holding open under `keyframe`.
@@ -132,11 +136,13 @@ fn read(params: &serde_json::Value) -> Result<Config, String> {
     params::read(&params.to_string())
 }
 
-/// How late a packet may leave `v` under `placement`.
-fn latency(placement: Placement) -> f64 {
+/// How late a packet may leave `v` under `placement`, at the stream's
+/// frame rate where the call says what that is.
+fn latency(placement: Placement, rate: Option<Rational>) -> f64 {
+    let reorder = rate.map_or(REORDER_SECONDS, |rate| rate.duration(REORDER_FRAMES));
     match placement {
-        Placement::Keyframe => MAX_GOP_SECONDS + REORDER_SECONDS,
-        _ => REORDER_SECONDS,
+        Placement::Keyframe => MAX_GOP_SECONDS + reorder,
+        _ => reorder,
     }
 }
 
@@ -147,7 +153,7 @@ impl Node for Weave {
     const ROWS_SCHEMA: &'static str = ROWS_SCHEMA;
     type Params = serde_json::Value;
 
-    fn shape(params: &serde_json::Value, _: &Bound) -> Result<Shape> {
+    fn shape(params: &serde_json::Value, bound: &Bound) -> Result<Shape> {
         let config = read(params)?;
         let mut shape =
             Shape::new().input(Input::packets("v").clock().codecs(CODECS).wants(Wants::All));
@@ -162,7 +168,8 @@ impl Node for Weave {
         }
         // No format of its own: the clock input's, so the packets leave in
         // the codec, time base, geometry and extradata they came in.
-        Ok(shape.output(Output::packets("v").latency(latency(config.placement))))
+        let latency = latency(config.placement, bound.rate_of("v"));
+        Ok(shape.output(Output::packets("v").latency(latency)))
     }
 
     fn init(params: serde_json::Value, init: &Init) -> Result<Weave> {
@@ -471,6 +478,18 @@ mod tests {
         let next = r#"{"spaces":"[{\"name\":\"clip\",\"dims\":4}]","placement":"next"}"#;
         let shape = Runner::<Weave>::shape(next, &["v".to_owned()]).expect("a shape");
         assert_eq!(shape.outputs[0].latency, REORDER_SECONDS);
+    }
+
+    #[test]
+    fn at_a_bound_rate_the_reorder_is_sixteen_frames_of_it() {
+        let at = |params: &str, rate: Rational| {
+            let bound = Bound::new(&["v"]).rate("v", rate);
+            Runner::<Weave>::shape(params, &bound).expect("a shape").outputs[0].latency
+        };
+        let next = r#"{"spaces":"[{\"name\":\"clip\",\"dims\":4}]","placement":"next"}"#;
+        assert_eq!(at(next, Rational::new(25, 1)), 0.64);
+        assert_eq!(at(next, Rational::new(60000, 1001)), 16.0 * 1001.0 / 60000.0);
+        assert_eq!(at(TWO, Rational::new(25, 1)), MAX_GOP_SECONDS + 0.64);
     }
 
     #[test]
