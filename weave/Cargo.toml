@@ -1,22 +1,23 @@
 [package]
 name = "weave"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "The ffrwd/index packet filter: embedding vectors woven into an encoded video stream."
+description = "The ffrwd/index weave node: embedding vectors woven into an encoded video stream."
 
 [lib]
 name = "weave"
 crate-type = ["cdylib"]
 
-# wit-bindgen, the two crates of this workspace, and `ffrwd-nal` for
-# the framing of a coded packet, which is shared with the other ffrwd
-# packages rather than copied here and has no dependencies of its own.
-# There is no serde here: `ffrwd-index-rows` already reads and writes
-# the JSON this module speaks, and a second reader of the same rows is
-# a second thing to keep in step.
+# ffrwd-node, the two crates of this workspace, and `ffrwd-nal` for the
+# framing of a coded packet, which is shared with the other ffrwd packages
+# rather than copied here and has no dependencies of its own. The rows are
+# `ffrwd-index-rows`, which the tool reads and writes the same rows with;
+# serde_json is here for the node's params and to hand those rows on as
+# they were written.
 [dependencies]
-wit-bindgen = "0.57.1"
+ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.1.0" }
 ffrwd-index-core = { path = "../core" }
 ffrwd-index-rows = { path = "../rows" }
 ffrwd-nal = { workspace = true }
+serde_json = { version = "1.0.151", features = ["raw_value"] }

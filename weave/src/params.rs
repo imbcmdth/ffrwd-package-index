@@ -7,14 +7,17 @@
 //! writes name spaces and have no reason to know what a `space_id` is.
 //! The wire ids are handed out in declaration order.
 //!
-//! Every param here is a SCALAR as far as a host is concerned, because
+//! Every param here is a SCALAR as far as a query is concerned, because
 //! a wasm function's value arguments in ffrwd's dialect are text,
 //! number, boolean or vector, and nothing else. `spaces` is the one
-//! that wanted to be an array of objects, so it is declared as text
-//! holding that array's JSON and a query passes a literal. The array
-//! itself is still read where it turns up, for `-params` and
-//! `-params-from` on the sidecar's own command line and for the tests
-//! and tools that write params by hand.
+//! that wanted to be an array of objects, so a query passes text
+//! holding that array's JSON as a literal. The array itself is read
+//! too, and the schema's `type` says so, for `-params-from` on the
+//! sidecar's own command line and for the tests and tools that write
+//! params by hand.
+//!
+//! The spaces are also what the node's inputs are named for: one input
+//! per space, so the shape reads them before anything runs.
 
 use ffrwd_index_core::placement::Placement;
 use ffrwd_index_core::{MAX_ESCAPES, UNIT_SOFT_LIMIT};
@@ -26,12 +29,13 @@ use ffrwd_index_rows::weave::Config;
 /// checked against before this module ever runs, so it says the same
 /// things the reader below does.
 ///
-/// `spaces` is declared as a STRING, and the array of objects it holds
-/// is under `$defs`. A host reads `properties` to decide what a query
-/// may write, and a query writes values: an array of objects is not
-/// one, so a `spaces` declared as an array is a param no SQL could ever
-/// fill. The text is the array's own JSON, which a producer package
-/// passes as a literal.
+/// `spaces` is declared as a STRING or an array, and the array of
+/// objects it holds is under `$defs`. A host reads `properties` to
+/// decide what a query may write, and a query writes values: text is
+/// the one a query fills, with the array's own JSON, which a producer
+/// package passes as a literal. The array is for params written by
+/// hand, which the node's params are checked against before it reads
+/// them.
 ///
 /// Every `enum` here carries an explicit `"type"` beside it. A host
 /// reads a member's `type` to decide what the column or the argument
@@ -45,7 +49,7 @@ pub const PARAMS_SCHEMA: &str = r#"{
   "additionalProperties": false,
   "properties": {
     "spaces": {
-      "type": "string",
+      "type": ["string", "array"],
       "minLength": 1,
       "description": "The embedding spaces this run carries, as the JSON text of an array of 1 to 256 of the objects under $defs/space: '[{\"name\":\"clip\",\"dims\":512}]'. A row names one by its name, or the rows argument it arrived on does; the wire ids are handed out in this order. The array itself is taken too, for a caller writing params by hand rather than from SQL."
     },
@@ -268,7 +272,6 @@ mod tests {
         let schema = Json::parse(PARAMS_SCHEMA).expect("a schema");
         let properties = schema.get("properties").expect("properties");
         for (name, wanted) in [
-            ("spaces", "string"),
             ("placement", "string"),
             ("budget", "integer"),
             ("escapes", "integer"),
@@ -283,6 +286,19 @@ mod tests {
                 "the schema's '{name}'"
             );
         }
+        let spaces: Vec<&str> = properties
+            .get("spaces")
+            .and_then(|member| member.get("type"))
+            .and_then(Json::as_array)
+            .expect("a list of types")
+            .iter()
+            .filter_map(Json::as_str)
+            .collect();
+        assert_eq!(
+            spaces,
+            ["string", "array"],
+            "text from a query, the array by hand"
+        );
     }
 
     #[test]

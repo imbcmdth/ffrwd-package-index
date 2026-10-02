@@ -8,11 +8,12 @@
 //! simulated: the interface under test is a host's, and a mock of it
 //! would only prove that the mock agrees with itself.
 //!
-//! A packet filter needs a host, and the host is `ffrwd-wasm` 0.18.0 or
-//! later. `FFRWD_WASM` names that binary and every test here skips
-//! without it, loudly. `FFRWD_INDEX_WASM` names a prebuilt
-//! `weave.wasm`; without it the module is built once, which needs the
-//! wit that `ffrwd path ffrwd/wasm` or `FFRWD_WIT_DIR` points at.
+//! The node needs a host, and the host is `ffrwd-wasm` from ffrwd 0.29.
+//! `FFRWD_WASM` names that binary and every test here skips without it,
+//! loudly. `FFRWD_INDEX_WASM` names a prebuilt `weave.wasm`; without it
+//! the module is built once. The rows reach the module the way a query
+//! hands them over: a NUT of JSON messages per space, each message at
+//! the time its row says it existed, on the input named for the space.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -24,13 +25,12 @@ use ffrwd_index_core::carriage;
 use ffrwd_index_core::message::{Message, Space, Unit, VectorBody};
 use ffrwd_index_core::quant::Planes;
 use ffrwd_nal::{h26x, obu, Codec};
+use ffrwd_nut::{Muxer, Packet, Stream, TimeBase};
 
-/// Names the sidecar built from the `packet-filter` branch.
+/// Names the sidecar of an ffrwd that hosts nodes.
 const SIDECAR_ENV: &str = "FFRWD_WASM";
 /// Names a `weave.wasm` already built, instead of building one.
 const MODULE_ENV: &str = "FFRWD_INDEX_WASM";
-/// Where the `ffrwd:av` wit comes from when the module is built here.
-const WIT_ENV: &str = "FFRWD_WIT_DIR";
 
 /// Four seconds of testsrc2 at 25 fps, with a keyframe every second.
 const FPS: u32 = 25;
@@ -52,9 +52,9 @@ fn workspace() -> PathBuf {
 fn sidecar() -> Option<PathBuf> {
     let Some(named) = std::env::var_os(SIDECAR_ENV) else {
         eprintln!(
-            "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A packet filter needs a \
-             host that speaks ffrwd:av@0.16.0, so install ffrwd-wasm 0.18.0 or later and point \
-             {SIDECAR_ENV} at it."
+            "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A node needs a host \
+             that speaks ffrwd:av@0.19.0, so point {SIDECAR_ENV} at the ffrwd-wasm of ffrwd \
+             0.29 or later."
         );
         return None;
     };
@@ -98,8 +98,7 @@ fn module() -> PathBuf {
                 .expect("spawn cargo to build weave.wasm");
             assert!(
                 output.status.success(),
-                "building weave.wasm failed. Set {MODULE_ENV} to a prebuilt module, or {WIT_ENV} \
-                 to the sidecar/wit of an ffrwd checkout carrying ffrwd:av@0.16.0.\n{}",
+                "building weave.wasm failed. Set {MODULE_ENV} to a prebuilt module.\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
             target.join("wasm32-wasip2/release/weave.wasm")
@@ -151,7 +150,7 @@ fn text(path: &Path) -> String {
 }
 
 /// One encode of testsrc2, with B-frames where the codec has them, as a
-/// coded NUT: the shape an encoding ffmpeg hands a packet filter.
+/// coded NUT: the shape an encoding ffmpeg hands the node.
 fn encode(dir: &Path, codec: &str) -> PathBuf {
     let out = dir.join(format!("{codec}.nut"));
     let source = format!("testsrc2=size=320x240:rate={FPS}:duration={SECONDS}");
@@ -411,23 +410,35 @@ enum Feed<'a> {
     Packets(&'a [u8]),
 }
 
-/// How params reach the module.
+/// How params reach the module: always `-params-from`, since a spaces
+/// list is JSON with quotes and colons in it, which a filtergraph's
+/// options would have to escape.
 enum Params<'a> {
-    /// On the command line, which is where short ones belong.
+    /// Written by the harness, from the test.
     Inline(&'a str),
-    /// In a file, which is what `-params-from` is for: a spaces list
-    /// with a name, a dimensionality and two model URIs apiece is not a
-    /// thing to keep on a command line.
+    /// In a file the test wrote itself.
     File(&'a str),
 }
 
-/// One run of the sidecar hosting `weave`, with a rows file.
+/// The first space a params object names, which is the input a rows
+/// file with no space of its own is bound to.
+fn first_space(params: &str) -> String {
+    let unescaped = params.replace("\\\"", "\"");
+    let at = unescaped.find("\"name\"").expect("params naming a space");
+    let rest = &unescaped[at + "\"name\"".len()..];
+    let open = rest.find('"').expect("a name");
+    let close = rest[open + 1..].find('"').expect("the end of a name");
+    rest[open + 1..open + 1 + close].to_string()
+}
+
+/// One run of the sidecar hosting `weave`, with a rows file bound to the
+/// first space the params declare.
 fn weave(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
     run_weave(
         dir,
         &text(input),
         Params::Inline(params),
-        &[text(rows)],
+        &[(first_space(params), text(rows))],
         Feed::None,
     )
 }
@@ -440,7 +451,7 @@ fn weave_with_params_file(dir: &Path, input: &Path, params: &str, rows: &Path) -
         dir,
         &text(input),
         Params::File(&text(&path)),
-        &[text(rows)],
+        &[(first_space(params), text(rows))],
         Feed::None,
     )
 }
@@ -453,18 +464,17 @@ fn weave_streaming(dir: &Path, input: &Path, params: &str, rows: &Path) -> Run {
         dir,
         "-",
         Params::Inline(params),
-        &[text(rows)],
+        &[(first_space(params), text(rows))],
         Feed::Packets(&bytes),
     )
 }
 
-/// The same, with one NAMED rows input per rows argument the call
-/// wrote, which is the shape a query compiles to: every row the host
-/// delivers from one of these carries the argument's name.
+/// The same, with each rows file on the input of the space it names,
+/// which is the shape a query compiles to.
 fn weave_arguments(dir: &Path, input: &Path, params: &str, rows: &[(&str, &Path)]) -> Run {
-    let named: Vec<String> = rows
+    let named: Vec<(String, String)> = rows
         .iter()
-        .map(|(name, path)| format!("{name}={}", text(path)))
+        .map(|(name, path)| (name.to_string(), text(path)))
         .collect();
     run_weave(
         dir,
@@ -475,39 +485,97 @@ fn weave_arguments(dir: &Path, input: &Path, params: &str, rows: &[(&str, &Path)
     )
 }
 
+/// Rows as a NUT of JSON messages, which is how a producer's rows reach
+/// a node: each row at the time it existed, `available_t` where it says
+/// one and `start_t` otherwise, in microseconds. A line that is not a
+/// row goes at the time of the one before it.
+fn rows_nut(rows: &str) -> Vec<u8> {
+    let micros = TimeBase {
+        num: 1,
+        den: 1_000_000,
+    };
+    let mut out = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut out, &Stream::json(micros)).expect("a NUT of rows");
+        let mut last = 0i64;
+        for line in rows.lines().filter(|line| !line.trim().is_empty()) {
+            let stamped = ["\"available_t\":", "\"start_t\":"].iter().find_map(|key| {
+                let at = line.find(key)? + key.len();
+                let number: String = line[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+'))
+                    .collect();
+                number
+                    .parse::<f64>()
+                    .ok()
+                    .map(|seconds| (seconds * 1e6).round() as i64)
+            });
+            let pts = stamped.unwrap_or(last).max(last);
+            last = pts;
+            let packet = Packet {
+                pts,
+                dts: Some(pts),
+                keyframe: true,
+            };
+            muxer
+                .write_coded(&packet, line.as_bytes())
+                .expect("a row written");
+        }
+        muxer.finish().expect("the NUT finished");
+    }
+    out
+}
+
+/// `rows_in` names a port and a rows file each, or `-` for the rows
+/// standard input carries.
 fn run_weave(
     dir: &Path,
     input: &str,
     params: Params<'_>,
-    rows_in: &[String],
+    rows_in: &[(String, String)],
     feed: Feed<'_>,
 ) -> Run {
     let out = dir.join("woven.nut");
-    let (flag, value) = match params {
-        Params::Inline(text) => ("-params", text.to_string()),
-        Params::File(path) => ("-params-from", path.to_string()),
+    let params_path = match params {
+        Params::Inline(written) => {
+            let path = dir.join("inline-params.json");
+            std::fs::write(&path, written).expect("write the params");
+            text(&path)
+        }
+        Params::File(path) => path.to_string(),
     };
-    let mut args: Vec<String> = vec![
-        "-f".into(),
-        "nut".into(),
-        "-i".into(),
-        input.to_string(),
-        "-m".into(),
-        text(&module()),
-        flag.into(),
-        value,
-    ];
-    for written in rows_in {
-        args.push("-rows-in".into());
-        args.push(written.clone());
+    let packets_in = if input == "-" { "pipe:0" } else { input };
+    let mut args: Vec<String> = vec!["-f".into(), "nut".into(), "-i".into(), packets_in.into()];
+    let mut pads = String::from("[v=0:v]");
+    for (n, (port, path)) in rows_in.iter().enumerate() {
+        let source = if path == "-" {
+            "pipe:0".to_string()
+        } else {
+            let nut = dir.join(format!("rows-{n}.nut"));
+            let rows = std::fs::read_to_string(path).expect("read the rows");
+            std::fs::write(&nut, rows_nut(&rows)).expect("write the rows as NUT");
+            text(&nut)
+        };
+        args.extend(["-f".into(), "nut".into(), "-i".into(), source]);
+        pads.push_str(&format!("[{port}={}:d]", n + 1));
     }
     args.extend([
-        "-f".to_string(),
-        "nut".to_string(),
+        "-m".into(),
+        format!("weave={}", text(&module())),
+        "-params-from".into(),
+        format!("weave={params_path}"),
+        "-filter_complex".into(),
+        format!("{pads}weave[v=out0][@rows=r0]"),
+        "-map".into(),
+        "[out0]".into(),
+        "-f".into(),
+        "nut".into(),
         text(&out),
-        "-f".to_string(),
-        "ndjson".to_string(),
-        "-".to_string(),
+        "-map".into(),
+        "[r0]".into(),
+        "-f".into(),
+        "ndjson".into(),
+        "-".into(),
     ]);
     let mut child = Command::new(sidecar().expect("a sidecar"))
         .args(&args)
@@ -519,7 +587,8 @@ fn run_weave(
     let mut stdin = child.stdin.take().expect("child stdin");
     let written: Vec<u8> = match feed {
         Feed::None => Vec::new(),
-        Feed::Rows(bytes) | Feed::Packets(bytes) => bytes.to_vec(),
+        Feed::Rows(bytes) => rows_nut(&String::from_utf8_lossy(bytes)),
+        Feed::Packets(bytes) => bytes.to_vec(),
     };
     let paced = matches!(feed, Feed::Packets(_));
     let delayed = matches!(feed, Feed::Rows(_));
@@ -530,9 +599,7 @@ fn run_weave(
         }
         if paced {
             // A piece every few milliseconds, so the run takes calls
-            // rather than one. The rows reader opens its file as soon
-            // as the module does, which puts the rows in hand while
-            // there are still carriers to come.
+            // rather than one.
             let pieces = 24usize;
             let step = written.len().div_ceil(pieces).max(1);
             for piece in written.chunks(step) {
@@ -1152,7 +1219,7 @@ fn rows_arriving_after_the_packets_ride_the_next_carrier_looking_back() {
         &dir,
         &text(&input),
         Params::Inline(&params("clip", dims, "next")),
-        &["-".to_string()],
+        &[("clip".to_string(), "-".to_string())],
         Feed::Rows(&feed),
     );
 
@@ -1545,9 +1612,9 @@ fn a_cut_of_a_woven_file_reads_from_its_first_frame() {
 // ------------------------------------------------------------------ //
 
 #[test]
-fn the_sidecar_describes_the_module_as_a_packet_filter() {
+fn the_sidecar_describes_the_module_as_a_node() {
     let Some(binary) = sidecar() else { return };
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["--describe", &text(&module())])
         .output()
         .expect("spawn ffrwd-wasm");
@@ -1559,20 +1626,10 @@ fn the_sidecar_describes_the_module_as_a_packet_filter() {
     );
     let printed = String::from_utf8_lossy(&output.stdout);
     let described = members(printed.trim());
-    assert_eq!(described["world"], "ffrwd:av@0.16.0");
+    assert_eq!(described["world"], "node-module");
+    assert_eq!(described["node"], "true");
     assert_eq!(described["name"], "weave");
     assert_eq!(described["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(described["packet_filter"], "true");
-    assert_eq!(described["reads_rows"], "true");
-    assert_eq!(described["video_codecs"], "h264,hevc,av1");
-    assert_eq!(described["audio_codecs"], "");
-    assert_eq!(described["video_streams"], "one");
-    assert_eq!(described["audio_streams"], "none");
-    assert_eq!(described["inputs"], "1");
-    // No decoded payload reaches a packet filter, so no frame format is
-    // named and no capability is asked for.
-    assert_eq!(described["pixel_formats"], "");
-    assert_eq!(described["sample_formats"], "");
     for capability in ["nn", "http", "udp"] {
         assert_eq!(described[capability], "false", "{capability} was asked for");
     }
@@ -1581,24 +1638,46 @@ fn the_sidecar_describes_the_module_as_a_packet_filter() {
     let Json::Object(printed) = json(printed.trim()) else {
         panic!("--describe printed something that is not an object");
     };
-    let params = printed
-        .iter()
-        .find(|(name, _)| name == "params_schema")
-        .map(|(_, value)| value)
-        .expect("a params schema");
-    let Json::Object(params) = params else {
-        panic!("the params schema is not an object");
-    };
-    assert!(params.iter().any(|(name, _)| name == "properties"));
-    let rows = printed
-        .iter()
-        .find(|(name, _)| name == "rows_schema")
-        .map(|(_, value)| value)
-        .expect("a rows schema");
-    let Json::Object(rows) = rows else {
-        panic!("the rows schema is not an object");
-    };
-    assert!(rows.iter().any(|(name, _)| name == "properties"));
+    for schema in ["params_schema", "rows_schema"] {
+        let Some((_, Json::Object(members))) = printed.iter().find(|(name, _)| name == schema)
+        else {
+            panic!("no {schema} object");
+        };
+        assert!(
+            members.iter().any(|(name, _)| name == "properties"),
+            "{schema}"
+        );
+    }
+
+    // And its shape: the packets, an input per space, the packets out.
+    let output = Command::new(&binary)
+        .args([
+            "--shape",
+            &text(&module()),
+            "--params",
+            &params_as_text(&["clip", "speech"], 8, "keyframe"),
+            "--bound",
+            "v,speech",
+        ])
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert!(
+        output.status.success(),
+        "--shape exited with {:?}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shape = String::from_utf8_lossy(&output.stdout);
+    for wanted in [
+        r#""name":"v""#,
+        r#""name":"clip""#,
+        r#""name":"speech""#,
+        r#""kind":"packets""#,
+        r#""kind":"interval""#,
+        r#""codecs":["h264","hevc","av1"]"#,
+    ] {
+        assert!(shape.contains(wanted), "{wanted} is not in {shape}");
+    }
 }
 
 #[test]
@@ -1606,17 +1685,23 @@ fn params_that_say_nothing_useful_are_refused_before_a_packet_moves() {
     let Some(binary) = sidecar() else { return };
     let dir = scratch("params");
     let input = encode(&dir, "h264");
-    let rows = dir.join("rows.ndjson");
-    std::fs::write(&rows, "").expect("an empty rows file");
-    for (params, wanted) in [
-        ("{}", "no spaces"),
+    for (n, (params, wanted)) in [
+        ("{}", "`spaces` is required"),
         (r#"{"spaces":[]}"#, "at least one space"),
         (
             r#"{"spaces":[{"name":"c","dims":8}],"placement":"spread"}"#,
             "budget",
         ),
-        (r#"{"spaces":[{"name":"c","dims":8}],"planes":9}"#, "1 to 8"),
-    ] {
+        (
+            r#"{"spaces":[{"name":"c","dims":8}],"planes":9}"#,
+            "at most 8",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = dir.join(format!("params-{n}.json"));
+        std::fs::write(&path, params).expect("write the params");
         let output = Command::new(&binary)
             .args([
                 "-f",
@@ -1624,11 +1709,13 @@ fn params_that_say_nothing_useful_are_refused_before_a_packet_moves() {
                 "-i",
                 &text(&input),
                 "-m",
-                &text(&module()),
-                "-params",
-                params,
-                "-rows-in",
-                &text(&rows),
+                &format!("weave={}", text(&module())),
+                "-params-from",
+                &format!("weave={}", text(&path)),
+                "-filter_complex",
+                "[v=0:v]weave[v=out0]",
+                "-map",
+                "[out0]",
                 "-f",
                 "nut",
                 &text(&dir.join("unwritten.nut")),
@@ -1771,19 +1858,19 @@ fn a_record_past_the_last_keyframe_rides_that_keyframe() {
 }
 
 // ------------------------------------------------------------------ //
-// Two rows arguments, and the space each one names.
+// Two inputs, and the space each one is named for.
 // ------------------------------------------------------------------ //
 
-/// The shape a query compiles to: one `-rows-in <argument>=<file>` per
-/// rows argument the call wrote, and rows that name no space at all.
+/// The shape a query compiles to: one rows input per space the call
+/// binds, and rows that name no space at all.
 ///
-/// The host writes `"_arg": "<argument>"` onto every row it delivers,
-/// so the argument a producer's rows were written into is what puts
-/// them in a space. Nothing here says `space` anywhere: the params
-/// declare `clip` and `speech`, the arguments are called `clip` and
-/// `speech`, and both spaces have to come back out of the file.
+/// A query binds each producer to the input named for its space, so
+/// the input a producer's rows arrive on is what puts them in a space.
+/// Nothing here says `space` anywhere: the params declare `clip` and
+/// `speech`, the inputs are called `clip` and `speech`, and both spaces
+/// have to come back out of the file.
 #[test]
-fn rows_with_no_space_land_in_the_space_their_argument_is_named_for() {
+fn rows_with_no_space_land_in_the_space_their_input_is_named_for() {
     let Some(_) = sidecar() else { return };
     let dir = scratch("rows_arguments");
     let input = encode(&dir, "h264");

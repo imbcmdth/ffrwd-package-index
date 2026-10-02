@@ -1,21 +1,22 @@
 [package]
 name = "spaces"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "An ffrwd packet sink: one row per embedding space a video stream declares."
+description = "An ffrwd node read in FROM: one row per embedding space a video stream declares."
 
 [lib]
 name = "spaces"
 crate-type = ["cdylib"]
 
-# wit-bindgen, the two crates of this workspace, and `ffrwd-nal` for
-# the framing of a coded packet, which is shared with the other ffrwd
-# packages rather than copied here and has no dependencies of its own.
-# The JSON is `ffrwd-index-rows`, which the tool and `weave` already
-# read and write the same rows with.
+# ffrwd-node, the two crates of this workspace, and `ffrwd-nal` for the
+# framing of a coded packet, which is shared with the other ffrwd packages
+# rather than copied here and has no dependencies of its own. The JSON is
+# `ffrwd-index-rows`, which the tool and `weave` read and write the same
+# rows with; serde_json hands those rows on as they were written.
 [dependencies]
-wit-bindgen = "0.57.1"
+ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.1.0" }
 ffrwd-index-core = { path = "../core" }
 ffrwd-index-rows = { path = "../rows" }
 ffrwd-nal = { workspace = true }
+serde_json = { version = "1.0.151", features = ["raw_value"] }

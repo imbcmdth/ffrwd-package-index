@@ -40,15 +40,6 @@ pub const MAX_PENDING_RECORDS: usize = 4096;
 /// growing.
 pub const MAX_HELD_PACKETS: usize = 256;
 
-/// The field an ffrwd host writes onto every row it delivers from a
-/// NAMED rows argument, holding that argument's name.
-///
-/// The host writes it and refuses a producer row that already carries
-/// one, so a row wearing it is the host's word about where the row came
-/// from. Nothing else fills it: the command line tool's own rows name
-/// their space, and a row that names one is read by that name.
-pub const ROWS_ARG_FIELD: &str = "_arg";
-
 /// The most a VECTOR message costs on top of its body: the type byte,
 /// the message length, the space id, the record id and the two offsets,
 /// each varint at its widest.
@@ -171,7 +162,17 @@ impl Weaver {
     /// dropped: a writer upstream that sent one bad row among a
     /// thousand good ones should lose the one.
     pub fn row(&mut self, text: &str) -> Option<String> {
-        match self.submit(text) {
+        self.row_from(None, text)
+    }
+
+    /// One row of JSON that arrived on the input named `port`, which
+    /// names the space of a row that leaves its own out.
+    pub fn row_on(&mut self, port: &str, text: &str) -> Option<String> {
+        self.row_from(Some(port), text)
+    }
+
+    fn row_from(&mut self, port: Option<&str>, text: &str) -> Option<String> {
+        match self.submit(port, text) {
             Ok(()) => None,
             Err(reason) => {
                 self.dropped += 1;
@@ -180,9 +181,9 @@ impl Weaver {
         }
     }
 
-    fn submit(&mut self, text: &str) -> Result<(), String> {
+    fn submit(&mut self, port: Option<&str>, text: &str) -> Result<(), String> {
         let row = Json::parse(text.trim()).map_err(|err| format!("not one JSON object: {err}"))?;
-        let index = self.space_of(&row)?;
+        let index = self.space_of(&row, port)?;
         let (_, space) = &self.config.spaces[index];
         let values = read_values(row.get("vector"), space.dims)?;
         let start_ms = seconds_to_ms(&row, "start_t")?;
@@ -270,33 +271,29 @@ impl Weaver {
     /// is an error rather than a fallback: a writer that named a space
     /// meant that one.
     ///
-    /// Failing that, `_arg`. A host hands a reading call's rows over one
-    /// argument at a time and writes the argument's name onto every row
-    /// it delivers, so a producer whose rows know nothing of this format
-    /// still says which space it is in: the query named the argument.
-    /// An `_arg` naming no declared space is not itself fatal, since a
-    /// query may call its argument anything.
+    /// Failing that, the input it arrived on. The module has an input
+    /// per declared space, named for it, so a producer whose rows know
+    /// nothing of this format is in the space the query bound it to.
     ///
     /// Failing both, a run declaring one space lets a row leave the name
     /// out. A run declaring several does not, because guessing would put
     /// a vector in the wrong space silently.
-    fn space_of(&self, row: &Json) -> Result<usize, String> {
+    fn space_of(&self, row: &Json, port: Option<&str>) -> Result<usize, String> {
         if let Some(name) = row.get("space").and_then(Json::as_str) {
             return self
                 .index_of(name)
                 .ok_or_else(|| format!("no space is declared as '{name}'"));
         }
-        let arg = row.get(ROWS_ARG_FIELD).and_then(Json::as_str);
-        if let Some(index) = arg.and_then(|name| self.index_of(name)) {
+        if let Some(index) = port.and_then(|name| self.index_of(name)) {
             return Ok(index);
         }
         if self.config.spaces.len() == 1 {
             return Ok(0);
         }
-        Err(match arg {
+        Err(match port {
             Some(name) => format!(
-                "a row with no space, delivered for the argument '{name}', which names none of \
-                 the declared spaces: {}",
+                "a row with no space, arriving on '{name}', which names none of the declared \
+                 spaces: {}",
                 self.declared()
             ),
             None => format!(
@@ -1046,13 +1043,12 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_argument_names_the_space_a_row_left_out() {
+    fn the_input_a_row_arrived_on_names_the_space_it_left_out() {
         // The producer's rows are spans and vectors and nothing else:
-        // which space they are in is what the query said when it wrote
-        // them into the `text` argument, and the host wrote that down.
+        // which space they are in is the input the query bound them to.
         let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 4), space("text", 1, 4)]));
         assert_eq!(
-            weaver.row(r#"{"_arg":"text","start_t":0,"end_t":1,"vector":[1,2,3,4]}"#),
+            weaver.row_on("text", r#"{"start_t":0,"end_t":1,"vector":[1,2,3,4]}"#),
             None
         );
         let woven = drained(&mut weaver);
@@ -1061,14 +1057,16 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_space_outranks_the_argument_it_arrived_on() {
-        // An argument a query called one thing carrying rows that name
-        // another space is the writer's business, not the host's: the
-        // row wins, because it is the one that knows.
+    fn a_rows_space_outranks_the_input_it_arrived_on() {
+        // An input a query bound for one space carrying rows that name
+        // another is the writer's business, not the host's: the row wins,
+        // because it is the one that knows.
         let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 4), space("text", 1, 4)]));
         assert_eq!(
-            weaver
-                .row(r#"{"space":"clip","_arg":"text","start_t":0,"end_t":1,"vector":[1,2,3,4]}"#),
+            weaver.row_on(
+                "text",
+                r#"{"space":"clip","start_t":0,"end_t":1,"vector":[1,2,3,4]}"#
+            ),
             None
         );
         let woven = drained(&mut weaver);
@@ -1077,13 +1075,12 @@ mod tests {
     }
 
     #[test]
-    fn an_argument_naming_no_space_falls_to_the_only_one_declared() {
-        // One space is no guess. A query is free to call its argument
-        // whatever reads well, and a run with one space has nowhere else
-        // to put the row.
+    fn an_input_naming_no_space_falls_to_the_only_one_declared() {
+        // One space is no guess: a run with one space has nowhere else to
+        // put the row.
         let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 4)]));
         assert_eq!(
-            weaver.row(r#"{"_arg":"shots","start_t":0,"end_t":1,"vector":[1,2,3,4]}"#),
+            weaver.row_on("shots", r#"{"start_t":0,"end_t":1,"vector":[1,2,3,4]}"#),
             None
         );
         let woven = drained(&mut weaver);
@@ -1092,10 +1089,10 @@ mod tests {
     }
 
     #[test]
-    fn an_argument_naming_no_space_among_several_is_dropped_saying_both() {
+    fn an_input_naming_no_space_among_several_is_dropped_saying_both() {
         let mut weaver = Weaver::new(Config::new(vec![space("clip", 0, 4), space("text", 1, 4)]));
         let reported = weaver
-            .row(r#"{"_arg":"shots","start_t":0,"end_t":1,"vector":[1,2,3,4]}"#)
+            .row_on("shots", r#"{"start_t":0,"end_t":1,"vector":[1,2,3,4]}"#)
             .expect("a dropped row");
         let row = Json::parse(&reported).expect("a row of JSON");
         assert_eq!(row.get("event").and_then(Json::as_str), Some("dropped"));

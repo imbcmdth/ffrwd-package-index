@@ -1,5 +1,5 @@
-//! `spaces`: an ffrwd packet sink that says which embedding spaces a
-//! video stream carries.
+//! `spaces`: an ffrwd node that says which embedding spaces a video
+//! stream carries, a sink: rows alone leave it, on the run's rows.
 //!
 //! One row per distinct SPACE declaration, which is section 3's message
 //! field for field: what the vectors are, how many components they
@@ -27,21 +27,11 @@
 //! bytes are `ffrwd_index_core`, and both are tested on the native
 //! target where a failure says something.
 
-wit_bindgen::generate!({
-    path: "wit",
-    world: "packet-sink-module",
-});
-
-use std::cell::RefCell;
-
-use exports::ffrwd::av::packet_sink::{
-    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed, Wants,
-};
-
-use ffrwd_index_rows::read::{space_row, Spaces};
 use ffrwd_nal::config::{framing_of, Framing, CODECS};
+use ffrwd_node::{Bound, Format, Init, Input, NoParams, Node, Out, Result, Shape, Tick, Wants};
+use serde_json::value::RawValue;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
+use ffrwd_index_rows::read::{space_row, Spaces as Declared};
 
 /// What section 3 declares, one for one, and a `name` that is not in
 /// the format at all: see `ffrwd_index_rows::read::name_of`.
@@ -66,113 +56,97 @@ const ROWS_SCHEMA: &str = r#"{
   }
 }"#;
 
-struct State {
-    spaces: Spaces,
+struct Spaces {
+    v: u32,
+    spaces: Declared,
 }
 
-thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-}
+impl Node for Spaces {
+    const NAME: &'static str = "spaces";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const ROWS_SCHEMA: &'static str = ROWS_SCHEMA;
+    type Params = NoParams;
 
-struct SpacesSink;
-
-impl Guest for SpacesSink {
-    fn describe() -> PacketSinkMeta {
-        PacketSinkMeta {
-            meta: Meta {
-                name: "spaces".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                params_schema: PARAMS_SCHEMA.to_string(),
-                rows_schema: ROWS_SCHEMA.to_string(),
-                // No decoded payload reaches a packet sink, so the
-                // frame formats stay empty and the codecs below are
-                // what this module accepts instead.
-                pixel_formats: vec![],
-                sample_formats: vec![],
-                sample_rates: vec![],
-                channel_counts: vec![],
-                rows_language: vec![],
-            },
-            video_codecs: CODECS.iter().map(|name| name.to_string()).collect(),
-            audio_codecs: vec![],
-            video: Arity::One,
-            audio: Arity::Zero,
-            // Section 3 puts every space on every keyframe from the
-            // first keyframe of the stream, so the first packet of a
-            // file answers this whole sink. It is a request rather
-            // than a promise: a host may hand over more, and one that
-            // does is what finds a space the writer learned of live.
-            wants: Wants::First,
-        }
+    fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
+        // Section 3 puts every space on every keyframe from the first
+        // keyframe of the stream, so the first packet of a file answers
+        // this whole sink. It is a request rather than a promise: a host
+        // may hand over more, and one that does is what finds a space the
+        // writer learned of live.
+        Ok(Shape::new().input(
+            Input::packets("v")
+                .clock()
+                .codecs(CODECS)
+                .wants(Wants::First),
+        ))
     }
 
-    fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
-        let framing = open(&streams, &params, "spaces")?;
-        STATE.with(|state| {
-            *state.borrow_mut() = Some(State {
-                spaces: Spaces::new(framing),
-            });
-        });
-        Ok(())
-    }
-
-    fn set_params(params: String) -> Result<(), String> {
-        no_params(&params, "spaces")
-    }
-
-    fn process(pads: Vec<PadPackets>, last: bool) -> Processed {
-        let _ = last;
-        STATE.with(|cell| {
-            let mut borrowed = cell.borrow_mut();
-            let Some(state) = borrowed.as_mut() else {
-                return Processed {
-                    rows: vec![],
-                    trailing: vec![],
-                };
-            };
-            let mut rows = Vec::new();
-            for pad in &pads {
-                for packet in &pad.packets {
-                    for space in state.spaces.packet(&packet.data) {
-                        rows.push(space_row(&space));
-                    }
-                }
-            }
-            // Nothing is ever held: a space is answered on the packet
-            // that declared it, so the final call has no leftovers and
-            // `trailing` stays empty, which is the only thing a host
-            // lets a call that is not the last one do.
-            Processed {
-                rows,
-                trailing: vec![],
-            }
+    fn init(_: NoParams, init: &Init) -> Result<Spaces> {
+        let (v, framing, _, _) = opened(init, "spaces")?;
+        Ok(Spaces {
+            v,
+            spaces: Declared::new(framing),
         })
     }
+
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
+        // Nothing is ever held: a space is answered on the packet that
+        // declared it, so the final call has no leftovers.
+        for packet in tick.packets(self.v) {
+            for space in self.spaces.packet(&packet.data) {
+                report(out, space_row(&space))?;
+            }
+        }
+        Ok(())
+    }
 }
 
-/// What both sinks check before they read a byte: one video pad, a
-/// codec they know, and no parameters.
-fn open(streams: &[InputStream], params: &str, name: &str) -> Result<Framing, String> {
-    no_params(params, name)?;
-    if streams.len() != 1 {
+/// What a sink checks before it reads a byte: a coded stream on `v`, in a
+/// codec it knows, and its time base.
+fn opened(init: &Init, name: &str) -> Result<(u32, Framing, i64, i64)> {
+    let v = init.stream("v")?;
+    let Some(Format::Packets(coded)) = &v.format else {
+        return Err(format!("{name} reads coded packets, and `v` is not a coded stream").into());
+    };
+    // `ffrwd-nal` refuses a codec it has no framing for without formatting
+    // a string; which module is asking is this module's to say.
+    let framing = framing_of(&coded.codec, &coded.extradata)
+        .map_err(|_| format!("{name} reads {} and not {}", CODECS.join(", "), coded.codec))?;
+    if coded.time_base.den <= 0 || coded.time_base.num <= 0 {
         return Err(format!(
-            "{name} reads one video stream, and it was opened for {}",
-            streams.len()
-        ));
+            "a time base of {}/{} is not a fraction of a second",
+            coded.time_base.num, coded.time_base.den
+        )
+        .into());
     }
-    let coded = &streams[0].coded;
-    // `ffrwd-nal` refuses a codec it has no framing for without
-    // formatting a string; which module is asking is this module's to
-    // say.
-    framing_of(&coded.codec, &coded.extradata)
-        .map_err(|_| format!("{name} reads {} and not {}", CODECS.join(", "), coded.codec))
+    Ok((
+        v.id,
+        framing,
+        i64::from(coded.time_base.num),
+        i64::from(coded.time_base.den),
+    ))
 }
 
-fn no_params(params: &str, name: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("{name} takes no params, and got: {other}")),
-    }
+/// One row the sink wrote, handed on as it was written.
+fn report(out: &mut Out, row: String) -> Result<()> {
+    let raw = RawValue::from_string(row).map_err(|err| format!("a row: {err}"))?;
+    Ok(out.report(&raw)?)
 }
 
-export!(SpacesSink);
+ffrwd_node::export!(Spaces);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffrwd_node::{Kind, Runner};
+
+    #[test]
+    fn the_first_packet_in_and_rows_alone_out() {
+        let shape = Runner::<Spaces>::shape("", &["v".to_owned()]).expect("a shape");
+        let v = shape.find_input("v").expect("the packets");
+        assert_eq!(v.kind, Kind::Packets);
+        assert_eq!(v.accepts.wants, Wants::First);
+        assert!(shape.outputs.is_empty(), "rows leave on the run's rows");
+        assert!(Runner::<Spaces>::shape(r#"{"x":1}"#, &["v".to_owned()]).is_err());
+    }
+}

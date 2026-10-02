@@ -1,5 +1,6 @@
 target/
-wit/
+ffrwd.links
+ffrwd.lock.bak
 *.mp4
 *.mkv
 *.h264

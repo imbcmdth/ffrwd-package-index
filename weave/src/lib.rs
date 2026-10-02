@@ -1,27 +1,30 @@
-//! `weave`: an ffrwd packet filter that puts embedding vectors into a
-//! video's own encoded stream.
+//! `weave`: an ffrwd node that puts embedding vectors into a video's own
+//! encoded stream.
 //!
-//! Encoded packets arrive on one video pad and leave on it, one for
-//! one, with their timestamps untouched; rows of vectors arrive beside
-//! them, whenever the host has some. What the module adds is an SEI NAL
+//! Encoded packets arrive on `v` and leave on `v`, one for one, with their
+//! timestamps untouched; rows of vectors arrive on an input per declared
+//! space, each named for its space. What the module adds is an SEI NAL
 //! (H.264, HEVC) or a metadata OBU (AV1) holding the format's messages,
-//! before the first coded slice of the access units the placement
-//! policy chose. Nothing else in a packet moves, so the pictures a
-//! player decodes are the pictures the encoder wrote.
+//! before the first coded slice of the access units the placement policy
+//! chose. Nothing else in a packet moves, so the pictures a player decodes
+//! are the pictures the encoder wrote.
 //!
 //! The crate is a shim and means to stay one. The decision of which
 //! carrier a record rides is `ffrwd_index_rows::weave`, the bytes are
 //! `ffrwd_index_core`, and both are tested on the native target where a
-//! failure says something. What is here is the wit boundary, the params
+//! failure says something. What is here is the node's shape, the params
 //! ([`params`]) and the framing (`ffrwd_nal::config::Framing`).
 //!
-//! Two things the interface asks for and this module owes it:
+//! Three things the world asks for and this module owes it:
 //!
 //! - **One packet in, one packet out, in decode order.** Packets are
 //!   held while their presentation order settles, because the placement
 //!   policy speaks of presentation time and a stream with B-frames does
 //!   not arrive in it. They are released in the order they arrived, and
 //!   everything held leaves on the final call.
+//! - **A latency it keeps.** Under `keyframe` a keyframe is held with its
+//!   whole GOP so it can still take a record; the hold is bounded in
+//!   packets, bytes and seconds, and the seconds are what `v` declares.
 //! - **No index.** Section 8's file index is not written here and
 //!   cannot be: a module has no filesystem, and it runs before the
 //!   muxer, so the file it would sit in does not exist yet. The rows
@@ -29,24 +32,15 @@
 
 mod params;
 
-wit_bindgen::generate!({
-    path: "wit",
-    world: "packet-filter-module",
-});
-
-use std::cell::RefCell;
-
-use crate::ffrwd::av::types::Packet;
-use exports::ffrwd::av::packet_filter::{
-    Arity, CodedStream, Filtered, Guest, InputStream, Meta, PacketFilterMeta, PadPackets,
-};
-
 use ffrwd_index_core::message::{Message, Unit};
 use ffrwd_index_core::placement::Placement;
 use ffrwd_index_core::{SELECT, UNIT_SOFT_LIMIT};
 use ffrwd_index_rows::weave::{Config, Reorder, Weaver, MAX_HELD_PACKETS};
-
 use ffrwd_nal::config::{framing_of, Framing, CODECS};
+use ffrwd_node::{
+    Bound, Format, Init, Input, Node, Out, Output, Packet, Result, Shape, StateRow, Tick, Wants,
+};
+use serde_json::value::RawValue;
 
 const ROWS_SCHEMA: &str = r#"{
   "type": "object",
@@ -76,6 +70,10 @@ const ROWS_SCHEMA: &str = r#"{
   }
 }"#;
 
+/// What one space's input reads: a span and a vector, and a `space` of its
+/// own where the row names one.
+const VECTORS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"}}},"required":["start_t","end_t","vector"]}"#;
+
 /// How many packets one held GOP may be before the keyframe goes out
 /// with what it has.
 ///
@@ -87,11 +85,19 @@ const ROWS_SCHEMA: &str = r#"{
 /// writing.
 const MAX_GOP_PACKETS: usize = 1024;
 
-/// And how many bytes, which is the bound that actually matters: a
+/// And how many bytes, which is the bound that matters for memory: a
 /// held GOP is held in memory, and a thousand packets of 4K is not the
 /// same thing as a thousand packets of a thumbnail. Thirty-two
 /// mebibytes is about fifteen seconds at 20 Mbps.
 const MAX_GOP_BYTES: usize = 32 << 20;
+
+/// And how many seconds of presentation time, which is the bound the
+/// node promises downstream: `v` declares it as its latency.
+const MAX_GOP_SECONDS: f64 = 10.0;
+
+/// What a packet held while its presentation order settles may trail its
+/// tick by: a reorder depth of frames, with room to spare.
+const REORDER_SECONDS: f64 = 1.0;
 
 /// The access unit the writer is holding open under `keyframe`.
 #[derive(Clone, Copy, Debug)]
@@ -103,8 +109,8 @@ struct OpenCarrier {
     seq: u64,
 }
 
-/// What one open instance holds.
-struct State {
+struct Weave {
+    v: u32,
     weaver: Weaver,
     reorder: Reorder<Packet>,
     framing: Framing,
@@ -113,79 +119,83 @@ struct State {
     den: i64,
     /// The keyframe still open, under `keyframe` placement alone.
     open: Option<OpenCarrier>,
+    /// The newest presentation time a packet has carried, in the stream's
+    /// own base.
+    newest: Option<i64>,
     /// The params in force, kept so `set-params` can say what changed.
     config: Config,
+    /// Rows the weaver wrote about rows folded in before this tick.
+    reported: Vec<String>,
 }
 
-thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+fn read(params: &serde_json::Value) -> Result<Config, String> {
+    params::read(&params.to_string())
 }
 
-struct Weave;
+/// How late a packet may leave `v` under `placement`.
+fn latency(placement: Placement) -> f64 {
+    match placement {
+        Placement::Keyframe => MAX_GOP_SECONDS + REORDER_SECONDS,
+        _ => REORDER_SECONDS,
+    }
+}
 
-impl Guest for Weave {
-    fn describe() -> PacketFilterMeta {
-        PacketFilterMeta {
-            meta: Meta {
-                name: "weave".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                params_schema: params::PARAMS_SCHEMA.to_string(),
-                rows_schema: ROWS_SCHEMA.to_string(),
-                // No decoded payload reaches a packet filter, so the
-                // frame formats stay empty and the codecs below are
-                // what this module accepts instead.
-                pixel_formats: vec![],
-                sample_formats: vec![],
-                sample_rates: vec![],
-                channel_counts: vec![],
-                rows_language: vec![],
-            },
-            video_codecs: CODECS.iter().map(|name| name.to_string()).collect(),
-            audio_codecs: vec![],
-            video: Arity::One,
-            audio: Arity::Zero,
-            // The vectors are the point: a host with no rows to give
-            // has nothing for this module to do.
-            reads_rows: true,
+impl Node for Weave {
+    const NAME: &'static str = "weave";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const PARAMS_SCHEMA: &'static str = params::PARAMS_SCHEMA;
+    const ROWS_SCHEMA: &'static str = ROWS_SCHEMA;
+    type Params = serde_json::Value;
+
+    fn shape(params: &serde_json::Value, _: &Bound) -> Result<Shape> {
+        let config = read(params)?;
+        let mut shape =
+            Shape::new().input(Input::packets("v").clock().codecs(CODECS).wants(Wants::All));
+        for (name, _) in &config.spaces {
+            shape = shape.input(
+                Input::rows(name)
+                    .optional()
+                    .interval()
+                    .state()
+                    .schema_json(VECTORS_SCHEMA),
+            );
         }
+        // No format of its own: the clock input's, so the packets leave in
+        // the codec, time base, geometry and extradata they came in.
+        Ok(shape.output(Output::packets("v").latency(latency(config.placement))))
     }
 
-    fn init(streams: Vec<InputStream>, params: String) -> Result<Vec<CodedStream>, String> {
-        if streams.len() != 1 {
-            return Err(format!(
-                "weave writes one video stream, and it was opened for {}",
-                streams.len()
-            ));
-        }
-        let config = params::read(&params)?;
-        let coded = streams[0].coded.clone();
+    fn init(params: serde_json::Value, init: &Init) -> Result<Weave> {
+        let config = read(&params)?;
+        let v = init.stream("v")?;
+        let Some(Format::Packets(coded)) = &v.format else {
+            return Err("weave writes coded packets, and `v` is not a coded stream".into());
+        };
         let framing = framing_of(&coded.codec, &coded.extradata)
             .map_err(|_| format!("weave writes {} and not {}", CODECS.join(", "), coded.codec))?;
         if coded.time_base.den <= 0 || coded.time_base.num <= 0 {
             return Err(format!(
                 "a time base of {}/{} is not a fraction of a second",
                 coded.time_base.num, coded.time_base.den
-            ));
+            )
+            .into());
         }
-        STATE.with(|state| {
-            *state.borrow_mut() = Some(State {
-                weaver: Weaver::new(config.clone()),
-                // The stream's own reorder depth is the bound on how far
-                // decode order and presentation order differ, and it is
-                // what settles the first packets, whose dts the wire
-                // does not carry.
-                reorder: Reorder::new(MAX_HELD_PACKETS, streams[0].decode_delay),
-                framing,
-                num: i64::from(coded.time_base.num),
-                den: i64::from(coded.time_base.den),
-                open: None,
-                config,
-            });
-        });
-        // Nothing out of band changes. The SPS and PPS the stream
-        // opened with still describe every picture in it, and an SEI is
-        // not something a decoder configuration mentions.
-        Ok(vec![coded])
+        Ok(Weave {
+            v: v.id,
+            weaver: Weaver::new(config.clone()),
+            // The stream's own reorder depth is the bound on how far
+            // decode order and presentation order differ, and it is what
+            // settles the first packets, whose dts the wire does not
+            // carry.
+            reorder: Reorder::new(MAX_HELD_PACKETS, v.decode_delay),
+            framing,
+            num: i64::from(coded.time_base.num),
+            den: i64::from(coded.time_base.den),
+            open: None,
+            newest: None,
+            config,
+            reported: Vec::new(),
+        })
     }
 
     /// Between calls a caller may change what future records cost, and
@@ -195,140 +205,129 @@ impl Guest for Weave {
     /// the reader would rebuild wrongly, and changing the policy would
     /// mean throwing away the carriers already chosen. Either is
     /// refused, which leaves the previous params in force.
-    fn set_params(params: String) -> Result<(), String> {
-        let wanted = params::read(&params)?;
-        STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            let state = state.as_mut().ok_or("set-params before init")?;
-            if wanted.spaces != state.config.spaces {
-                return Err("weave cannot change its spaces mid-stream".to_string());
-            }
-            if wanted.placement != state.config.placement {
-                return Err("weave cannot change its placement mid-stream".to_string());
-            }
-            state.weaver.set_escapes(wanted.escapes, wanted.plane_cap);
-            state.config = wanted;
-            Ok(())
-        })
+    fn set_params(&mut self, params: serde_json::Value) -> Result<()> {
+        let wanted = read(&params)?;
+        if wanted.spaces != self.config.spaces {
+            return Err("weave cannot change its spaces mid-stream".into());
+        }
+        if wanted.placement != self.config.placement {
+            return Err("weave cannot change its placement mid-stream".into());
+        }
+        self.weaver.set_escapes(wanted.escapes, wanted.plane_cap);
+        self.config = wanted;
+        Ok(())
     }
 
-    fn process(pads: Vec<PadPackets>, rows: Vec<String>, last: bool) -> Filtered {
-        STATE.with(|cell| {
-            let mut borrowed = cell.borrow_mut();
-            let Some(state) = borrowed.as_mut() else {
-                return Filtered {
-                    pads: vec![PadPackets { packets: vec![] }; pads.len()],
-                    rows: vec![],
-                    trailing: vec![],
-                };
+    fn fold(&mut self, row: StateRow) -> Result<()> {
+        if let Some(reported) = self.weaver.row_on(row.port, row.json) {
+            self.reported.push(reported);
+        }
+        Ok(())
+    }
+
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
+        // The rows first: they were folded in before the packets of this
+        // tick, which is when they existed.
+        let mut written = std::mem::take(&mut self.reported);
+
+        for packet in tick.packets(self.v) {
+            let pts = packet.pts;
+            let dts = packet.dts;
+            self.weaver.seen(to_ms(pts, self.num, self.den));
+            self.newest = Some(self.newest.map_or(pts, |newest| newest.max(pts)));
+            self.reorder.push(packet, pts, dts);
+        }
+        let last = tick.last();
+        if last {
+            self.reorder.close();
+        }
+
+        // Carriers in presentation order, which is not the order the
+        // packets arrived in.
+        let mut added = Vec::new();
+        while let Some(settled) = self.reorder.settle() {
+            let pts = settled.pts;
+            let seq = settled.seq;
+            let pts_ms = to_ms(pts, self.num, self.den);
+            let carried = self.weaver.carrier(pts, pts_ms, settled.item.keyframe);
+            let open = carried.open;
+            added.push(apply(
+                self.framing,
+                pts,
+                settled.item,
+                carried,
+                &mut written,
+            ));
+            if open {
+                // A keyframe may still be asked to take a record nothing
+                // else will carry, so it stays in hand, and so does every
+                // packet behind it: they cannot overtake it on the way out.
+                // The keyframe before this one is closed by the same stroke.
+                self.reorder.hold_from(seq);
+                self.open = Some(OpenCarrier { pts, seq });
+            }
+        }
+        // Bounded: a GOP is held, not a stream. Past the bound the
+        // keyframe goes out with what it has and takes no more, and a
+        // record that would have ridden it falls to the next keyframe or,
+        // at the end of the stream, is reported late.
+        if self.reorder.barrier().is_some() {
+            let (packets, bytes) = self.reorder.behind_barrier(|packet| packet.data.len());
+            let held = match (self.open, self.newest) {
+                (Some(open), Some(newest)) => {
+                    (newest - open.pts) as f64 * self.num as f64 / self.den as f64
+                }
+                _ => 0.0,
             };
-            // A real `&mut State`, so the weaver and the hold below can
-            // be borrowed at the same time: they are separate fields.
-            let state: &mut State = state;
-            let mut written = Vec::new();
-
-            // The rows first: one that arrived while the packets of
-            // this call were flowing existed before them.
-            for row in &rows {
-                if let Some(reported) = state.weaver.row(row) {
-                    written.push(reported);
-                }
+            if packets > MAX_GOP_PACKETS || bytes > MAX_GOP_BYTES || held > MAX_GOP_SECONDS {
+                self.reorder.lift();
+                self.open = None;
+                self.weaver.note_overrun();
             }
-
-            for pad in pads {
-                for packet in pad.packets {
-                    let pts = packet.pts;
-                    let dts = packet.dts;
-                    state.weaver.seen(to_ms(pts, state.num, state.den));
-                    state.reorder.push(packet, pts, dts);
-                }
-            }
-            if last {
-                state.reorder.close();
-            }
-
-            // Carriers in presentation order, which is not the order the
-            // packets arrived in.
-            let mut added = Vec::new();
-            while let Some(settled) = state.reorder.settle() {
-                let pts = settled.pts;
-                let seq = settled.seq;
-                let pts_ms = to_ms(pts, state.num, state.den);
-                let carried = state.weaver.carrier(pts, pts_ms, settled.item.keyframe);
-                let open = carried.open;
-                added.push(apply(
-                    state.framing,
-                    pts,
-                    settled.item,
-                    carried,
-                    &mut written,
-                ));
-                if open {
-                    // A keyframe may still be asked to take a record
-                    // nothing else will carry, so it stays in hand, and
-                    // so does every packet behind it: they cannot
-                    // overtake it on the way out. The keyframe before
-                    // this one is closed by the same stroke.
-                    state.reorder.hold_from(seq);
-                    state.open = Some(OpenCarrier { pts, seq });
-                }
-            }
-            // Bounded: a GOP is held, not a stream. Past the bound the
-            // keyframe goes out with what it has and takes no more, and
-            // a record that would have ridden it falls to the next
-            // keyframe or, at the end of the stream, is reported late.
-            if state.reorder.barrier().is_some() {
-                let (packets, bytes) = state.reorder.behind_barrier(|packet| packet.data.len());
-                if packets > MAX_GOP_PACKETS || bytes > MAX_GOP_BYTES {
-                    state.reorder.lift();
-                    state.open = None;
-                    state.weaver.note_overrun();
-                }
-            }
-            // The final call carries the last packets. Under `keyframe`
-            // what no carrier the policy would choose came along for
-            // rides the LAST KEYFRAME, which is the access unit held
-            // open for exactly this; under the live policies it rides
-            // the last access unit of all.
-            //
-            // Where neither is in hand - a stream with no keyframe in
-            // it, or one whose last GOP overran the bound - there is no
-            // access unit a keyframe reader would visit, and the
-            // records are reported late rather than written somewhere
-            // nobody will look.
-            if last {
-                state.reorder.lift();
-                let target: Option<(i64, u64)> = match state.config.placement {
-                    Placement::Keyframe => state.open.take().map(|open| (open.pts, open.seq)),
-                    _ => state.reorder.last_held().map(|(pts, seq, _)| (pts, seq)),
-                };
-                if let Some((pts, seq)) = target {
-                    let keyframe = state.reorder.at(seq).is_some_and(|packet| packet.keyframe);
-                    let pts_ms = to_ms(pts, state.num, state.den);
-                    let carried = state.weaver.flush(pts, pts_ms, keyframe);
-                    if let Some(packet) = state.reorder.at(seq) {
-                        added.push(apply(state.framing, pts, packet, carried, &mut written));
-                    }
-                }
-            }
-            for grew in added {
-                state.weaver.note_bytes(grew);
-            }
-
-            let released = state.reorder.release();
-            let trailing = if last {
-                state.weaver.trailing()
-            } else {
-                Vec::new()
+        }
+        // The final call carries the last packets. Under `keyframe` what
+        // no carrier the policy would choose came along for rides the LAST
+        // KEYFRAME, which is the access unit held open for exactly this;
+        // under the live policies it rides the last access unit of all.
+        //
+        // Where neither is in hand (a stream with no keyframe in it, or
+        // one whose last GOP overran the bound) there is no access unit a
+        // keyframe reader would visit, and the records are reported late
+        // rather than written somewhere nobody will look.
+        if last {
+            self.reorder.lift();
+            let target: Option<(i64, u64)> = match self.config.placement {
+                Placement::Keyframe => self.open.take().map(|open| (open.pts, open.seq)),
+                _ => self.reorder.last_held().map(|(pts, seq, _)| (pts, seq)),
             };
-            Filtered {
-                pads: vec![PadPackets { packets: released }],
-                rows: written,
-                trailing,
+            if let Some((pts, seq)) = target {
+                let keyframe = self.reorder.at(seq).is_some_and(|packet| packet.keyframe);
+                let pts_ms = to_ms(pts, self.num, self.den);
+                let carried = self.weaver.flush(pts, pts_ms, keyframe);
+                if let Some(packet) = self.reorder.at(seq) {
+                    added.push(apply(self.framing, pts, packet, carried, &mut written));
+                }
             }
-        })
+        }
+        for grew in added {
+            self.weaver.note_bytes(grew);
+        }
+
+        for packet in self.reorder.release() {
+            out.packet("v", packet)?;
+        }
+        if last {
+            written.extend(self.weaver.trailing());
+        }
+        for row in written {
+            let raw = RawValue::from_string(row).map_err(|err| format!("a row: {err}"))?;
+            out.report(&raw)?;
+        }
+        Ok(())
     }
 }
+
+ffrwd_node::export!(Weave);
 
 /// Puts one carrier's messages into its packet, and says how much the
 /// packet grew. A packet this module cannot read is handed on exactly
@@ -422,4 +421,68 @@ fn refused_row(pts: i64, reason: &str) -> String {
     .write()
 }
 
-export!(Weave);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffrwd_node::{Kind, Pairing, RowsUse, Runner};
+
+    const TWO: &str =
+        r#"{"spaces":"[{\"name\":\"clip\",\"dims\":4},{\"name\":\"speech\",\"dims\":4}]"}"#;
+
+    #[test]
+    fn a_space_is_an_input_named_for_it() {
+        let bound = ["v".to_owned(), "speech".to_owned()];
+        let shape = Runner::<Weave>::shape(TWO, &bound).expect("a shape");
+        assert_eq!(shape.clock_input(), Some("v"));
+        let v = shape.find_input("v").expect("the packets");
+        assert_eq!(v.kind, Kind::Packets);
+        assert_eq!(v.accepts.codecs, CODECS);
+        let names: Vec<&str> = shape
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect();
+        assert_eq!(names, ["v", "clip", "speech"]);
+        for name in ["clip", "speech"] {
+            let input = shape.find_input(name).expect("a space");
+            assert_eq!(input.kind, Kind::Data);
+            assert!(
+                !input.required,
+                "a space a call has no producer for is left unbound"
+            );
+            assert!(matches!(input.pairing, Pairing::Interval(_)));
+            assert_eq!(input.rows, RowsUse::State);
+        }
+    }
+
+    #[test]
+    fn the_packets_leave_like_they_came_and_as_late_as_a_gop_is_held() {
+        let shape = Runner::<Weave>::shape(TWO, &["v".to_owned()]).expect("a shape");
+        assert_eq!(shape.outputs.len(), 1);
+        let v = &shape.outputs[0];
+        assert_eq!((v.name.as_str(), v.kind), ("v", Kind::Packets));
+        assert!(
+            v.format.is_none() && v.like.is_none(),
+            "the clock input's format"
+        );
+        assert_eq!(v.latency, MAX_GOP_SECONDS + REORDER_SECONDS);
+        assert!(!shape.pure);
+
+        let next = r#"{"spaces":"[{\"name\":\"clip\",\"dims\":4}]","placement":"next"}"#;
+        let shape = Runner::<Weave>::shape(next, &["v".to_owned()]).expect("a shape");
+        assert_eq!(shape.outputs[0].latency, REORDER_SECONDS);
+    }
+
+    #[test]
+    fn a_shape_with_no_spaces_is_refused() {
+        let error =
+            Runner::<Weave>::shape(r#"{"spaces":"[]"}"#, &["v".to_owned()]).expect_err("no spaces");
+        assert!(error.contains("at least one space"), "{error}");
+    }
+
+    #[test]
+    fn a_space_named_like_the_packets_is_refused() {
+        let params = r#"{"spaces":"[{\"name\":\"v\",\"dims\":4}]"}"#;
+        assert!(Runner::<Weave>::shape(params, &["v".to_owned()]).is_err());
+    }
+}

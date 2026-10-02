@@ -1,5 +1,5 @@
-//! `records`: an ffrwd packet sink that reads the vectors back out of a
-//! video stream.
+//! `records`: an ffrwd node that reads the vectors back out of a video
+//! stream, a sink: rows alone leave it, on the run's rows.
 //!
 //! One row per complete record: which space it is in, the span it
 //! describes in seconds of the stream's own presentation clock, and the
@@ -30,21 +30,11 @@
 //! bytes are `ffrwd_index_core`, and both are tested on the native
 //! target where a failure says something.
 
-wit_bindgen::generate!({
-    path: "wit",
-    world: "packet-sink-module",
-});
-
-use std::cell::RefCell;
-
-use exports::ffrwd::av::packet_sink::{
-    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed, Wants,
-};
+use ffrwd_nal::config::{framing_of, Framing, CODECS};
+use ffrwd_node::{Bound, Format, Init, Input, NoParams, Node, Out, Result, Shape, Tick, Wants};
+use serde_json::value::RawValue;
 
 use ffrwd_index_rows::read::Reader;
-use ffrwd_nal::config::{framing_of, Framing, CODECS};
-
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 
 /// One record. `vector`'s length is not fixed here and cannot be: how
 /// many components a space has is in the stream's own SPACE message,
@@ -66,135 +56,110 @@ const ROWS_SCHEMA: &str = r#"{
   }
 }"#;
 
-struct State {
+struct Records {
+    v: u32,
     reader: Reader,
 }
 
-thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-}
+impl Node for Records {
+    const NAME: &'static str = "records";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const ROWS_SCHEMA: &'static str = ROWS_SCHEMA;
+    type Params = NoParams;
 
-struct RecordsSink;
-
-impl Guest for RecordsSink {
-    fn describe() -> PacketSinkMeta {
-        PacketSinkMeta {
-            meta: Meta {
-                name: "records".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                params_schema: PARAMS_SCHEMA.to_string(),
-                rows_schema: ROWS_SCHEMA.to_string(),
-                // No decoded payload reaches a packet sink, so the
-                // frame formats stay empty and the codecs below are
-                // what this module accepts instead.
-                pixel_formats: vec![],
-                sample_formats: vec![],
-                sample_rates: vec![],
-                channel_counts: vec![],
-                rows_language: vec![],
-            },
-            video_codecs: CODECS.iter().map(|name| name.to_string()).collect(),
-            audio_codecs: vec![],
-            video: Arity::One,
-            audio: Arity::Zero,
-            // Section 7's `keyframe` policy puts every record of a
-            // file on a sync sample, so the keyframes are all this
-            // needs to answer a file whole. A stream written `next` or
-            // `spread` puts records elsewhere and a host that hands
-            // over more is what finds them; a host may not hand over
-            // less than this asks for.
-            wants: Wants::Keyframes,
-        }
+    fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
+        // Section 7's `keyframe` policy puts every record of a file on a
+        // sync sample, so the keyframes are all this needs to answer a file
+        // whole. A stream written `next` or `spread` puts records elsewhere
+        // and a host that hands over more is what finds them; a host may
+        // not hand over less than this asks for.
+        Ok(Shape::new().input(
+            Input::packets("v")
+                .clock()
+                .codecs(CODECS)
+                .wants(Wants::Keyframes),
+        ))
     }
 
-    fn init(streams: Vec<InputStream>, params: String) -> Result<(), String> {
-        let framing = open(&streams, &params, "records")?;
-        let coded = &streams[0].coded;
-        if coded.time_base.den <= 0 || coded.time_base.num <= 0 {
-            return Err(format!(
-                "a time base of {}/{} is not a fraction of a second",
-                coded.time_base.num, coded.time_base.den
-            ));
-        }
-        let (num, den) = (
-            i64::from(coded.time_base.num),
-            i64::from(coded.time_base.den),
-        );
-        STATE.with(|state| {
-            *state.borrow_mut() = Some(State {
-                reader: Reader::new(framing, num, den),
-            });
-        });
-        Ok(())
-    }
-
-    fn set_params(params: String) -> Result<(), String> {
-        no_params(&params, "records")
-    }
-
-    fn process(pads: Vec<PadPackets>, last: bool) -> Processed {
-        STATE.with(|cell| {
-            let mut borrowed = cell.borrow_mut();
-            let Some(state) = borrowed.as_mut() else {
-                return Processed {
-                    rows: vec![],
-                    trailing: vec![],
-                };
-            };
-            let mut rows = Vec::new();
-            for pad in &pads {
-                for packet in &pad.packets {
-                    state.reader.packet(packet.pts, &packet.data);
-                }
-            }
-            // A record whose every plane has arrived can gain nothing
-            // more, so it goes out now rather than at the end: a
-            // `keyframe` file answers each record on the packet that
-            // carried it.
-            for record in state.reader.finished() {
-                rows.push(state.reader.record_row(&record));
-            }
-            // What is left is what a writer never finished: a record
-            // sent with a cap on its planes, which section 5 allows,
-            // or one whose later planes the stream ended before. Those
-            // are answered on the final call, coarse but true, and
-            // `trailing` is where a host lets them go.
-            let trailing = if last {
-                let left = state.reader.drain();
-                left.iter()
-                    .map(|record| state.reader.record_row(record))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            Processed { rows, trailing }
+    fn init(_: NoParams, init: &Init) -> Result<Records> {
+        let (v, framing, num, den) = opened(init, "records")?;
+        Ok(Records {
+            v,
+            reader: Reader::new(framing, num, den),
         })
     }
+
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
+        for packet in tick.packets(self.v) {
+            self.reader.packet(packet.pts, &packet.data);
+        }
+        // A record whose every plane has arrived can gain nothing more, so
+        // it goes out now rather than at the end: a `keyframe` file answers
+        // each record on the packet that carried it.
+        for record in self.reader.finished() {
+            let row = self.reader.record_row(&record);
+            report(out, row)?;
+        }
+        // What is left is what a writer never finished: a record sent with
+        // a cap on its planes, which section 5 allows, or one whose later
+        // planes the stream ended before. Those are answered on the final
+        // call, coarse but true.
+        if tick.last() {
+            for record in self.reader.drain() {
+                let row = self.reader.record_row(&record);
+                report(out, row)?;
+            }
+        }
+        Ok(())
+    }
 }
 
-/// What both sinks check before they read a byte: one video pad, a
-/// codec they know, and no parameters.
-fn open(streams: &[InputStream], params: &str, name: &str) -> Result<Framing, String> {
-    no_params(params, name)?;
-    if streams.len() != 1 {
+/// What a sink checks before it reads a byte: a coded stream on `v`, in a
+/// codec it knows, and its time base.
+fn opened(init: &Init, name: &str) -> Result<(u32, Framing, i64, i64)> {
+    let v = init.stream("v")?;
+    let Some(Format::Packets(coded)) = &v.format else {
+        return Err(format!("{name} reads coded packets, and `v` is not a coded stream").into());
+    };
+    // `ffrwd-nal` refuses a codec it has no framing for without formatting
+    // a string; which module is asking is this module's to say.
+    let framing = framing_of(&coded.codec, &coded.extradata)
+        .map_err(|_| format!("{name} reads {} and not {}", CODECS.join(", "), coded.codec))?;
+    if coded.time_base.den <= 0 || coded.time_base.num <= 0 {
         return Err(format!(
-            "{name} reads one video stream, and it was opened for {}",
-            streams.len()
-        ));
+            "a time base of {}/{} is not a fraction of a second",
+            coded.time_base.num, coded.time_base.den
+        )
+        .into());
     }
-    let coded = &streams[0].coded;
-    // `ffrwd-nal` refuses a codec it has no framing for without
-    // formatting a string; which module is asking is this module's to
-    // say.
-    framing_of(&coded.codec, &coded.extradata)
-        .map_err(|_| format!("{name} reads {} and not {}", CODECS.join(", "), coded.codec))
+    Ok((
+        v.id,
+        framing,
+        i64::from(coded.time_base.num),
+        i64::from(coded.time_base.den),
+    ))
 }
 
-fn no_params(params: &str, name: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("{name} takes no params, and got: {other}")),
-    }
+/// One row the sink wrote, handed on as it was written.
+fn report(out: &mut Out, row: String) -> Result<()> {
+    let raw = RawValue::from_string(row).map_err(|err| format!("a row: {err}"))?;
+    Ok(out.report(&raw)?)
 }
 
-export!(RecordsSink);
+ffrwd_node::export!(Records);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffrwd_node::{Kind, Runner};
+
+    #[test]
+    fn keyframes_in_and_rows_alone_out() {
+        let shape = Runner::<Records>::shape("", &["v".to_owned()]).expect("a shape");
+        let v = shape.find_input("v").expect("the packets");
+        assert_eq!(v.kind, Kind::Packets);
+        assert_eq!(v.accepts.wants, Wants::Keyframes);
+        assert!(shape.outputs.is_empty(), "rows leave on the run's rows");
+        assert!(Runner::<Records>::shape(r#"{"x":1}"#, &["v".to_owned()]).is_err());
+    }
+}

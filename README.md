@@ -30,8 +30,8 @@ The format is a draft. The package is installable:
 ffrwd install ffrwd/index
 ```
 
-The three modules are `ffrwd:av@0.16.0`, which ffrwd hosts from 0.18.0 on, so
-that is the floor. They ship built, and an install compiles nothing.
+Requires ffrwd 0.29. The three modules are nodes of `ffrwd:av@0.19.0`. They
+ship built, and an install compiles nothing.
 
 The `ffrwd-index` tool is the same format without ffrwd: it weaves rows of
 vectors into H.264, HEVC and AV1 elementary streams, reads them back from a
@@ -47,21 +47,22 @@ own `describe` and `find` recipes run the whole path.
 [examples/describe](examples/describe) is what the encoding costs a ranking,
 measured against those recipes' own vectors.
 
-`weave` writes. It is a packet filter: encoded packets in, the same packets
-out, with the vectors woven into them and every timestamp untouched. Rows can
-arrive while packets flow, so the same module serves a live stream: a vector is
-woven onto the first frame after it exists, and a watcher reading the stream
-hears of it at once. A live stream gets no file index and needs none. A COPY
-whose destination places an encoder is where the call goes, and the compiler
-puts the filter between that encoder and the muxer:
+`weave` writes. It is a node: encoded packets in on `v`, the same packets out,
+with the vectors woven into them and every timestamp untouched, and rows of
+vectors in on an input per space. Each input pairs its rows with the packets by
+time, waiting for its producer, so a record is in hand before the packets of
+its span leave. The same module serves a live stream: a vector is woven onto
+the first frame after it exists, and a watcher reading the stream hears of it
+at once. A live stream gets no file index and needs none. A COPY whose
+destination places an encoder is where the call goes, and the compiler puts
+the node between that encoder and the muxer:
 
 ```sql
 COPY (
   SELECT ffrwd.index.weave(f.video[1],
-                           ffrwd.describe.clips(f.video[1]).shots,
-                           NULL,
-                           NULL,
-                           '[{"name":"clip","dims":512,"modality":"picture"}]') AS v,
+                           clip => ffrwd.describe.clips(f.video[1],
+                                                        ffrwd.shots.simple_detector(f.video[1])),
+                           spaces => '[{"name":"clip","dims":512,"modality":"picture"}]') AS v,
          f.audio[1] AS a
   FROM input('film.mp4') f
 ) TO 'film.indexed.mp4'
@@ -69,9 +70,9 @@ COPY (
 
 The arguments and the params are their own section below.
 
-`records` and `spaces` read. They are packet sinks read in FROM: the compiler
-stream-copies one stream of the file into the module while the query compiles
-and binds what the module wrote as a row table. `records` answers one row per
+`records` and `spaces` read. They are sinks read in FROM, nodes with packets in
+and rows alone out: the compiler stream-copies one stream of the file into the
+module while the query compiles and binds what the module wrote as a row table. `records` answers one row per
 record, with the span in seconds of the stream's own clock and the vector
 itself; `spaces` answers one row per embedding space the stream declares. A
 search is joins and predicates over those rows, decided before ffmpeg is
@@ -98,7 +99,7 @@ the format and mean the same in every file. `records(...) v JOIN spaces(...) s
 ON v.space = s.space` is how a query gets at them, and it is what the
 `ffrwd/describe` recipes do.
 
-Each module says in its meta how much of a stream it has to be handed, which is
+Each module says in its shape how much of a stream it has to be handed, which is
 what makes the read cheap: `records` asks for the keyframes, which is where
 section 7 puts every record of a file, and `spaces` asks for the first packet,
 which section 3 now puts every space declaration on. That is a request and never
@@ -118,46 +119,29 @@ NULL for the float encodings, which arrive whole or not at all. It is an array,
 and `vector` is the one array type the dialect has, so `vector` is what it is
 declared. It is not an embedding and nothing should score it.
 
-The same wasm file declared `RETURNS sink` and written after `TO` is a run-time
-destination instead, with its rows on the sidecar's stdout. That declaration is
-a query's own to write; this package ships the FROM one, because that is the one
-a search needs.
-
 The reading modules and the writing one are the same code: `rows/` holds both
-state machines over `core/`, and the wasm crates are shims.
+state machines over `core/`, and the wasm crates are shims over
+[`ffrwd-node`](https://github.com/imbcmdth/ffrwd-node).
 
 ## What a query hands `weave`
 
-`clip`, `sound` and `speech` are rows arguments, one per producer. An encoder
-stands between a producer and this filter, so rows cannot ride the frames:
-each argument's rows go to a document of their own and reach the module as an
-input of its own, every row carrying `"_arg": "<argument>"`, which the host
-writes and a producer may not.
+The module has an input of rows per space its `spaces` param declares, named
+for the space. `clip`, `sound` and `speech` are the three `src/index.sql`
+declares, for `ffrwd/describe`'s three spaces, each `DEFAULT NULL`: a call binds
+the ones it has a producer for, by name, and leaves the rest off. A declared
+input the call's `spaces` has no space for is fine left unbound.
 
-That field is how a row gets a space. A producer hands over spans and vectors
-and knows nothing of embedding spaces, so the precedence is: the row's own
-`space` field; else `_arg`, when it names a declared space; else the single
-declared space, where a run declares exactly one; else the row is dropped and
-a row says so, naming the argument and the spaces it could have been. Rows the
-`ffrwd-index` tool reads name their own space and are untouched by any of
-this.
+The input a row arrives on is how it gets a space. A producer hands over spans
+and vectors and knows nothing of embedding spaces, so the precedence is: the
+row's own `space` field; else the input it arrived on; else the single declared
+space, where a run declares exactly one; else the row is dropped and a row says
+so. Rows the `ffrwd-index` tool reads name their own space and are untouched by
+any of this.
 
-**All three are written at every call.** Each carries `DEFAULT NULL`, which is
-what a rows column carries whether the declaration writes it or not, and an
-argument written `NULL` hands the filter no rows for it at all. What a call
-cannot do is leave one off: `spaces` is required and comes after the three,
-arguments bind by position, and there is no way to reach `spaces` past an
-argument that was not written. That is the trade worth making, because a run
-with no space table is then refused where the query is compiled rather than
-when the filter opens.
-
-A declaration is fixed arity, and these three are named for `ffrwd/describe`'s
-three spaces. A producer with other spaces, or more of them, writes its own
-`CREATE FUNCTION` over the same wasm file, naming the arguments after its own
-spaces. That has to be a query's declaration rather than another package's: a
-package's lib file may only name modules the package itself ships, so nothing
-outside this repository can declare a function over this `weave.wasm` in a lib
-of its own.
+A producer with other spaces, or more of them, writes its own `CREATE FUNCTION`
+over the same wasm file, naming its inputs after its own spaces. That has to be
+a query's declaration rather than another package's: a package's lib file may
+only name modules the package itself ships.
 
 Every value argument in the dialect is text, number, boolean or vector, so
 every one of the module's params is a scalar:
@@ -184,9 +168,8 @@ own JSON as a literal:
 
 `name` and `dims` are required and the rest have defaults; the fields are
 section 3's, the same ones the tool's own `{"space": {...}}` rows spell. The
-array itself is still read wherever it appears, so `ffrwd-wasm -params` and
-`-params-from` and the native tool go on passing the array, and nothing that
-already worked had to be rewritten.
+array itself is still read wherever it appears, so `ffrwd-wasm -params-from`
+and the native tool go on passing the array.
 
 **The wire ids are this array's own positions, from zero.** The first space
 declared is id 0, the second id 1, and a run that declares a different table
@@ -200,16 +183,16 @@ is the join itself, `records(...) v JOIN spaces(...) s ON v.space = s.space`.
 ## Building the modules
 
 ```
-ffrwd install
 cargo build --release --target wasm32-wasip2 -p weave -p records -p spaces
+cargo test
 ```
 
-`ffrwd install` puts `ffrwd/wasm` 0.16.0 in the cache, and each crate's
-`build.rs` asks `ffrwd path ffrwd/wasm` where its wit is, so `ffrwd` has to be
-on the PATH for the build. `FFRWD_WIT_DIR` names a directory holding `av.wit`
-instead, which is how a module is built against an ffrwd checkout rather than a
-release. Either way the files land in `target/wasm32-wasip2/release/`, the path
-`src/index.sql` names.
+The modules are nodes written with
+[`ffrwd-node`](https://github.com/imbcmdth/ffrwd-node), which carries the
+world they are built against, so nothing is installed first. The files land in
+`target/wasm32-wasip2/release/`, the path `src/index.sql` names. The tests that
+drive the modules through a real host skip without `FFRWD_WASM` naming the
+`ffrwd-wasm` of ffrwd 0.29.
 
 To run a consuming query against the checkout, `ffrwd link` here and `ffrwd
 link ffrwd/index` in that project. The first is recorded in
@@ -253,9 +236,9 @@ two containers' own business.
   that finds the samples carrying vectors without reading the pictures. MP4 is
   `ffrwd-bmff`, and so is putting the index box into a file.
 - `tool/`: `ffrwd-index`, a native command line over all of it.
-- `weave/`: the ffrwd packet filter that writes, a thin `wasm32-wasip2` layer
-  over `rows/`.
-- `records/`, `spaces/`: the two ffrwd packet sinks that read, the same way.
+- `weave/`: the ffrwd node that writes, a thin `wasm32-wasip2` layer over
+  `rows/`.
+- `records/`, `spaces/`: the two ffrwd nodes that read, the same way.
 - `examples/describe/`: what the 8-bit encoding cost one real ranking, against
   the same search over the vectors `ffrwd/describe` produced.
 - `ffrwd.json`, `src/index.sql`: the ffrwd package.

@@ -9,16 +9,11 @@
 # state machines over it: weaving and reading. `container` is what is
 # left of reading a file once `ffrwd-bmff` has the boxes: the Matroska
 # reader and the sample-prefix scan, which needs NAL knowledge.
-# `weave`, `records` and `spaces` are the ffrwd modules, thin
-# wasm32-wasip2 cdylibs over the first two: one packet filter that
-# writes and two packet sinks that read. `tool` is the native command
-# line over all of it, which reads and writes files and so is never
-# part of a wasm build.
-#
-# The three modules build for wasm32-wasip2 alone, so they are excluded
-# from the workspace default members: `cargo test` and `cargo clippy`
-# over the workspace are native, and wit-bindgen's generated code is
-# not.
+# `weave`, `records` and `spaces` are the ffrwd modules, thin nodes on
+# ffrwd-node over the first two: one that writes and two sinks that
+# read. `tool` is the native command line over all of it, which reads
+# and writes files and so is never part of a wasm build. The modules
+# build natively as well, so `cargo test` covers them with the rest.
 members = [
     "container",
     "core",
@@ -27,12 +22,6 @@ members = [
     "spaces",
     "tool",
     "weave",
-]
-default-members = [
-    "container",
-    "core",
-    "rows",
-    "tool",
 ]
 resolver = "2"
 

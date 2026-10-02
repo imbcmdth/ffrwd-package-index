@@ -1,8 +1,8 @@
 //! The two reading sinks, through the real sidecar and real ffmpeg.
 //!
 //! `records` and `spaces` are how ffrwd will read a woven file: the
-//! compiler stream-copies packets into the sidecar hosting the sink and
-//! uses the rows. Nothing here simulates that. Every test weaves a file
+//! compiler stream-copies packets into the sidecar hosting the node and
+//! uses the rows it writes. Nothing here simulates that. Every test weaves a file
 //! with the command line tool, pipes its packets through `ffrwd-wasm`
 //! as coded NUT, and asks whether the rows agree with what the same
 //! tool reads out of the same file.
@@ -11,12 +11,10 @@
 //! second is what a compile-time read will actually do, and section 7
 //! is what makes it complete.
 //!
-//! A packet sink needs a host, and the host is `ffrwd-wasm` 0.18.0 or
-//! later. `FFRWD_WASM` names that binary and every test here skips
-//! without it, loudly. `FFRWD_INDEX_RECORDS` and `FFRWD_INDEX_SPACES`
-//! name prebuilt modules; without them the modules are built once,
-//! which needs the wit that `ffrwd path ffrwd/wasm` or `FFRWD_WIT_DIR`
-//! points at.
+//! A node needs a host, and the host is `ffrwd-wasm` from ffrwd 0.29.
+//! `FFRWD_WASM` names that binary and every test here skips without it,
+//! loudly. `FFRWD_INDEX_RECORDS` and `FFRWD_INDEX_SPACES` name prebuilt
+//! modules; without them the modules are built once.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +22,6 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 const SIDECAR_ENV: &str = "FFRWD_WASM";
-const WIT_ENV: &str = "FFRWD_WIT_DIR";
 
 // ------------------------------------------------------------------ //
 // The harness.
@@ -41,9 +38,9 @@ fn workspace() -> PathBuf {
 fn sidecar() -> Option<PathBuf> {
     let Some(named) = std::env::var_os(SIDECAR_ENV) else {
         eprintln!(
-            "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A packet sink needs a \
-             host that speaks ffrwd:av@0.16.0, so install ffrwd-wasm 0.18.0 or later and point \
-             {SIDECAR_ENV} at it."
+            "SKIPPED: {SIDECAR_ENV} does not name an ffrwd-wasm binary. A node needs a host \
+             that speaks ffrwd:av@0.19.0, so point {SIDECAR_ENV} at the ffrwd-wasm of ffrwd \
+             0.29 or later."
         );
         return None;
     };
@@ -92,8 +89,8 @@ fn module(name: &str) -> PathBuf {
             .expect("spawn cargo to build the sinks");
         assert!(
             output.status.success(),
-            "building the sinks failed. Set {WIT_ENV} to the sidecar/wit of an ffrwd checkout \
-             carrying ffrwd:av@0.16.0.\n{}",
+            "building the sinks failed. Set FFRWD_INDEX_RECORDS and FFRWD_INDEX_SPACES to \
+             prebuilt modules.\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         target
@@ -168,7 +165,11 @@ fn run_sink(name: &str, nut: &Path) -> Run {
             "-i",
             &text(nut),
             "-m",
-            &text(&module(name)),
+            &format!("{name}={}", text(&module(name))),
+            "-filter_complex",
+            &format!("[v=0:v]{name}[@rows=r0]"),
+            "-map",
+            "[r0]",
             "-f",
             "ndjson",
             "-",
@@ -633,15 +634,9 @@ fn spaces_answers_from_the_first_packet_alone() {
 // ------------------------------------------------------------------ //
 
 /// A stream neither sink can read is refused before the module is
-/// opened, by the shape each one publishes: one video stream and no
-/// audio.
-///
-/// The codec list itself cannot be reached over this wire. The
-/// sidecar's NUT carries h264, hevc, av1 and aac and nothing else, and
-/// both sinks accept all three video codecs, so a stream that got as
-/// far as the codec check would have to be one they take. Anything
-/// else is refused a step earlier, either by the wire (`codec tag
-/// VP90`) or by the arity below.
+/// opened: one with no video in it has nothing to bind to `v`, and a
+/// video codec the sinks do not read is refused by the codecs each
+/// one's shape accepts.
 #[test]
 fn a_stream_neither_sink_can_read_is_refused_by_name() {
     let Some(_) = sidecar() else { return };
@@ -661,15 +656,12 @@ fn a_stream_neither_sink_can_read_is_refused_by_name() {
         let run = run_sink(sink, &aac);
         assert!(!run.ok, "{sink} accepted a stream with no video in it");
         assert!(
-            run.stderr.contains(sink) && run.stderr.contains("one video stream"),
-            "{sink}: the refusal does not say what it reads:
-{}",
+            run.stderr.contains("0:v"),
+            "{sink}: the refusal does not name the missing stream:\n{}",
             run.stderr
         );
     }
 
-    // And a video codec the wire does not carry at all is refused
-    // before the module is even asked.
     let vp9 = at("vp9.nut");
     ffmpeg(&[
         "-f",
@@ -691,14 +683,15 @@ fn a_stream_neither_sink_can_read_is_refused_by_name() {
     let run = run_sink("records", &vp9);
     assert!(!run.ok, "records accepted vp9");
     assert!(
-        run.stderr.contains("encoded packets"),
-        "the refusal does not say what went wrong:
-{}",
+        run.stderr.contains("records"),
+        "the refusal does not say which module:\n{}",
         run.stderr
     );
 }
 
-/// What the host reads off each module without running it.
+/// What the host reads off each module without running it: a node, and
+/// a shape of one packets input, asking for as much of the stream as
+/// the module needs, and no outputs but its rows.
 #[test]
 fn the_sidecar_describes_both_sinks() {
     let Some(binary) = sidecar() else { return };
@@ -715,27 +708,34 @@ fn the_sidecar_describes_both_sinks() {
         );
         let printed = String::from_utf8_lossy(&output.stdout);
         let described = members(printed.trim());
-        assert_eq!(described["world"], "ffrwd:av@0.16.0", "{name}");
+        assert_eq!(described["world"], "node-module", "{name}");
+        assert_eq!(described["node"], "true", "{name}");
         assert_eq!(described["name"], name);
-        // There is no positive `packet_sink` key in a describe: what
-        // tells a sink from a filter is that `packet_filter` is false
-        // while the codec and arity fields are filled in.
-        assert_eq!(described["packet_filter"], "false", "{name}");
-        assert_eq!(described["source"], "false", "{name}");
-        assert_eq!(described["rows_module"], "false", "{name}");
-        assert_eq!(
-            described["video_codecs"], r#"["h264","hevc","av1"]"#,
-            "{name}"
-        );
-        assert_eq!(described["video_streams"], "one", "{name}");
-        assert_eq!(described["audio_streams"], "none", "{name}");
-        // The hint that says how much of a stream it has to be handed.
-        assert_eq!(described["wants"], wants, "{name}");
-        // No decoded payload reaches a sink, and neither asks for a
-        // capability.
-        assert_eq!(described["pixel_formats"], "[]", "{name}");
         for capability in ["nn", "http", "udp"] {
             assert_eq!(described[capability], "false", "{name}: {capability}");
+        }
+
+        let output = Command::new(&binary)
+            .args(["--shape", &text(&module(name)), "--bound", "v"])
+            .output()
+            .expect("spawn ffrwd-wasm");
+        assert!(
+            output.status.success(),
+            "--shape {name} exited with {:?}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let shape = String::from_utf8_lossy(&output.stdout);
+        for wanted in [
+            r#""kind":"packets""#.to_string(),
+            r#""codecs":["h264","hevc","av1"]"#.to_string(),
+            format!(r#""wants":"{wants}""#),
+            r#""outputs":[]"#.to_string(),
+        ] {
+            assert!(
+                shape.contains(&wanted),
+                "{name}: {wanted} is not in {shape}"
+            );
         }
     }
 }

@@ -1,9 +1,9 @@
 -- ffrwd/index: embedding vectors put into a video's own encoded
 -- packets, and read back out of them.
 --
--- Three modules. `weave` is a packet filter and writes; `records` and
--- `spaces` are packet sinks and read. All three are `ffrwd:av@0.16.0`,
--- which ffrwd hosts from 0.18.0 on, so that is the floor.
+-- Three modules. `weave` writes; `records` and `spaces` read. All three
+-- are nodes, `ffrwd:av@0.19.0`, which ffrwd hosts from 0.29 on, so that
+-- is the floor.
 
 -- ---------------------------------------------------------------- --
 -- Writing.
@@ -17,47 +17,32 @@
 --
 --   COPY (
 --     SELECT weave(f.video[1],
---                  ffrwd.describe.clips(f.video[1]).shots,
---                  NULL,
---                  NULL,
---                  '[{"name":"clip","dims":512,"modality":"picture"}]')
+--                  clip => ffrwd.describe.clips(f.video[1],
+--                                               ffrwd.shots.simple_detector(f.video[1])),
+--                  spaces => '[{"name":"clip","dims":512,"modality":"picture"}]')
 --     FROM input('in.mp4') f
 --   ) TO 'out.mp4';
 --
--- THE ROWS. `clip`, `sound` and `speech` are rows arguments, one per
--- producer: an encoder stands between a producer and this filter, so
--- the rows cannot ride the frames and each argument is written at the
--- call and read as an input of its own. A producer's rows are spans
--- and vectors and say nothing about embedding spaces, which is why
--- the argument's own name is what names the space: the host writes
--- `"_arg": "<argument>"` onto every row it delivers, and a row with
--- no `space` field of its own is put in the space that name declares.
--- A run declaring one space takes rows that name neither.
+-- THE ROWS. The module has an input of rows per space its `spaces`
+-- param declares, named for the space, so the space a row is in is the
+-- input the call bound it to: a producer's rows are spans and vectors
+-- and say nothing about embedding spaces. A row that names a `space`
+-- of its own goes there instead. Each input pairs its rows with the
+-- packets by time, waiting for its producer's progress, so a record
+-- reaches the module before the packets of its span leave it.
 --
--- All three carry `DEFAULT NULL`, which is what a rows column carries
--- whether it is written or not: an argument a call has no producer for
--- hands the filter no rows at all. A call still writes NULL for each
--- of them rather than stopping short, because `spaces` is required and
--- comes after the three, and a rows column starting no run of defaults
--- is what lets it: arguments bind by position and there is no way to
--- reach `spaces` past an argument that was left off. Requiring it is
--- the trade worth making, since a run with no space table is refused
--- where the query is compiled rather than when the filter opens.
---
--- The three are named for ffrwd/describe's three spaces, which is the
--- producer this package was written against. A DECLARATION IS FIXED
--- ARITY, so a producer with other spaces, or more of them, writes its
--- own CREATE FUNCTION over the same wasm file, naming its arguments
--- after its own spaces. That is a query's to write and not a
--- package's: a package's lib file may only name modules it ships, so
--- no other package can declare a function over this one's
--- weave.wasm.
+-- `clip`, `sound` and `speech` are the inputs ffrwd/describe's three
+-- spaces make, each `DEFAULT NULL`: a call binds the ones it has a
+-- producer for, by name, and leaves the rest off. An input declared
+-- here that the call's `spaces` has no space for is fine left unbound.
+-- A producer with other spaces writes its own CREATE FUNCTION over the
+-- same wasm file, naming its inputs after its own spaces.
 --
 -- THE VALUES. `spaces` is the module's space table, as the JSON text
 -- of an array of objects, because a wasm function's value arguments
 -- in this dialect are text, number, boolean or vector and an array of
 -- objects is none of them. A name in it is what a row's `space`, or
--- its argument, names. `placement`, `budget`, `escapes` and `planes`
+-- its input, names. `placement`, `budget`, `escapes` and `planes`
 -- are the module's own defaults when they are left NULL. README.md
 -- has the whole schema.
 --
@@ -95,9 +80,9 @@ RETURNS packets
 -- and which model turns a search into the same space. `name` is a
 -- label this sink derives, not a field of the format.
 --
--- Both are packet sinks, and a packet sink means two things depending
--- on where it is written. Declared over a stream with an array of
--- records for its RETURNS, as they are here, it is a FROM item: the
+-- Both are sinks: packets in, rows alone out. Declared over a stream
+-- with an array of records for its RETURNS, as they are here, each is
+-- a FROM item: the
 -- compiler stream-copies that one stream of the file into the module
 -- while the query compiles and binds what the module wrote as a row
 -- table, so a search is joins and predicates over rows that exist
@@ -118,13 +103,7 @@ RETURNS packets
 -- format and mean the same thing in every file. A query that hard-codes
 -- `v.space = 1` is reading a position it did not write.
 --
--- The same module declared RETURNS sink and written after TO is the
--- run-time destination it has always been, with its rows on the
--- hosting sidecar's own stdout. That is a second declaration a query
--- writes for itself; this package ships the FROM one, because that is
--- the one a search needs.
---
--- Each says in its meta how much of a stream it has to be handed:
+-- Each says in its shape how much of a stream it has to be handed:
 -- `records` asks for `keyframes`, since section 7's `keyframe` policy
 -- puts every record of a file on a sync sample, and `spaces` asks for
 -- `first`, since section 3 puts every space declaration on every
